@@ -134,7 +134,7 @@
     "visual:app:upload": "node scripts/visual/check-app-archives.mjs && CHROMATIC_ARCHIVE_LOCATION=.playwright/visual-results chromatic --playwright --exit-zero-on-changes"
   },
   "dependencies": {
-    "@ai-sdk/amazon-bedrock": "^5.0.113",
+    "@ai-sdk/amazon-bedrock": "^5.0.135",
     "@ai-sdk/anthropic": "^4.0.78",
     "@ai-sdk/azure": "^4.0.99",
     "@ai-sdk/deepseek": "^3.0.63",
@@ -145,9 +145,9 @@
     "@ai-sdk/harness-opencode": "1.0.119",
     "@ai-sdk/mistral": "^4.0.62",
     "@ai-sdk/openai": "^4.0.91",
-    "@ai-sdk/provider-utils": "^5.0.54",
+    "@ai-sdk/provider-utils": "^5.0.76",
     "@ai-sdk/react": "^4.0.140",
-    "@ai-sdk/xai": "^5.0.20",
+    "@ai-sdk/xai": "^5.0.40",
     "@axiomhq/js": "^2.0.0",
     "@cfworker/json-schema": "^4.1.1",
     "@codemirror/commands": "^6.11.1",
