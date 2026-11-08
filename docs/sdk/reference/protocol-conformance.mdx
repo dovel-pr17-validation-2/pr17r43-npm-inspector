@@ -1,0 +1,270 @@
+---
+title: "Protocol Conformance SDK"
+description: "Programmatic MCP protocol conformance testing with MCPConformanceTest and MCPConformanceSuite"
+icon: "shield"
+---
+
+The Protocol Conformance SDK lets you run the same checks as the CLI `protocol conformance` commands, but inside your own Jest or Vitest suites.
+
+Use it when you want MCP protocol regressions to fail CI directly, or when you need JUnit XML and JSON artifacts from code rather than shell scripts.
+
+<Note>
+  Protocol conformance is currently HTTP-only. For local stdio-only servers, use
+  [MCP Apps Conformance](/sdk/reference/apps-conformance),
+  [unit tests](/sdk/reference/mcp-client-manager), or run your server through an
+  HTTP bridge in CI.
+</Note>
+
+## Import
+
+```typescript
+import {
+  MCPConformanceSuite,
+  MCPConformanceTest,
+  renderConformanceReportJUnitXml,
+  renderConformanceReportJson,
+  toConformanceReport,
+} from "@mcpjam/sdk";
+```
+
+## Single run
+
+```typescript
+const test = new MCPConformanceTest({
+  serverUrl: "https://your-server.com/mcp",
+  checkTimeout: 15_000,
+  checkIds: [
+    "server-initialize",
+    "ping",
+    "tools-list",
+    "prompts-list",
+    "resources-list",
+  ],
+});
+
+const result = await test.run();
+
+console.log(result.passed);
+console.log(result.summary);
+console.log(result.checks);
+```
+
+## Logging on MCP 2026-07-28
+
+Modern servers use per-request `_meta` log levels. The legacy
+`logging-set-level` check is skipped on this revision.
+
+```typescript
+import { runConformance } from "@mcpjam/sdk";
+
+const report = await runConformance({
+  server: { url: "https://your-server.com/mcp" },
+  suites: ["protocol"],
+  protocolVersion: "2026-07-28", // Omit to detect the server's version.
+  protocol: {
+    checkIds: ["modern-logs-require-log-level"],
+    logProbe: { toolName: "emit-logs", arguments: {}, level: "warning" },
+  },
+});
+```
+
+Supply only a tool that is safe to call repeatedly and produces logs when
+requested. The check calls it without a log level and with `debug`. The
+`readiness-log-level-filtering` advice calls it once more with `level`
+(default `warning`). You can also pass `logProbe` directly to
+`MCPConformanceTest`.
+
+Logs on the request without a level fail `modern-logs-require-log-level`.
+A successful supplied tool call that returns no requested logs fails with
+"the supplied tool produced no logs." A missing `logProbe` or an unsuccessful
+probe call reports `could-not-run` instead. The runner never picks tools to call
+on your behalf.
+
+From the CLI, pass `--log-probe-tool <name>`, plus `--log-probe-args <json>` and
+`--log-probe-level <level>` when needed. To give the advice its own tool
+(`logLevelFilteringProbe`), pass `--log-filter-tool <name>`, plus
+`--log-filter-args <json>` and `--log-filter-level <level>` when needed.
+
+## Suite
+
+```typescript
+import { writeFileSync } from "node:fs";
+
+const suite = new MCPConformanceSuite({
+  name: "Protocol CI",
+  serverUrl: "https://your-server.com/mcp",
+  defaults: {
+    checkTimeout: 15_000,
+  },
+  runs: [
+    {
+      label: "core-surface",
+      checkIds: [
+        "server-initialize",
+        "ping",
+        "tools-list",
+        "prompts-list",
+        "resources-list",
+      ],
+    },
+    {
+      label: "security",
+      checkIds: [
+        "localhost-host-rebinding-rejected",
+        "localhost-host-valid-accepted",
+      ],
+    },
+  ],
+});
+
+const result = await suite.run();
+const report = toConformanceReport(result);
+
+writeFileSync(
+  "protocol-conformance.junit.xml",
+  renderConformanceReportJUnitXml(report),
+);
+writeFileSync(
+  "protocol-conformance.report.json",
+  JSON.stringify(renderConformanceReportJson(report), null, 2),
+);
+```
+
+`MCPConformanceSuiteConfig` keeps the existing `serverUrl + defaults + runs` shape:
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `name` | `string` | No | Suite label shown in summaries and JUnit XML |
+| `serverUrl` | `string` | Yes | Shared MCP HTTP server URL |
+| `defaults` | `Partial<Omit<MCPConformanceConfig, "serverUrl">>` | No | Shared defaults applied to every run |
+| `runs` | `Array<Partial<Omit<MCPConformanceConfig, "serverUrl">> & { label?: string }>` | Yes | Individual run labels and check selections |
+
+## MCPConformanceConfig
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `serverUrl` | `string` | Yes | | MCP server URL |
+| `accessToken` | `string` | No | | Bearer access token |
+| `customHeaders` | `Record<string, string>` | No | | Extra HTTP headers |
+| `checkTimeout` | `number` | No | `15000` | Per-check timeout in ms |
+| `categories` | `MCPCheckCategory[]` | No | all categories | Restrict checks to categories |
+| `checkIds` | `MCPCheckId[]` | No | all checks | Restrict checks to specific ids |
+| `fetchFn` | `typeof fetch` | No | `fetch` | Custom fetch implementation |
+| `clientName` | `string` | No | SDK default | Custom MCP client name |
+
+## Available categories and check ids
+
+Categories:
+
+- `core`
+- `protocol`
+- `tools`
+- `prompts`
+- `resources`
+- `security`
+- `transport`
+
+Check ids:
+
+- `server-initialize`
+- `ping`
+- `logging-set-level` (legacy revisions only)
+- `modern-logs-require-log-level` (2026-07-28 only)
+- `completion-complete`
+- `capabilities-consistent`
+- `tools-list`
+- `tools-input-schemas-valid`
+- `tools-x-mcp-header-declarations-valid` (2026-07-28 only)
+- `prompts-list`
+- `resources-list`
+- `protocol-invalid-method-error`
+- `localhost-host-rebinding-rejected` — requires HTTP 403 when the run explicitly pins `protocolVersion` to `2025-11-25` or later; accepts any 4xx on earlier pins or when no version is pinned
+- `localhost-host-valid-accepted`
+- `server-sse-polling-session`
+- `server-accepts-multiple-post-streams`
+- `server-sse-streams-functional`
+- `notification-post-accepted` (2025 revisions only)
+- `get-stream-or-405` (2025 revisions only)
+- `session-id-visible-ascii` (2025 revisions only)
+- `post-response-content-type`
+
+## Result types
+
+`MCPConformanceTest.run()` returns an `MCPConformanceResult`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `passed` | `boolean` | True only when `outcome` is `"passed"`. A check that could not run keeps this `false`. |
+| `outcome` | `"passed" \| "failed" \| "incomplete"` | `"failed"` on any violation; `"incomplete"` when nothing failed but a selected check never ran. |
+| `incompleteReason` | `string \| undefined` | Present when `outcome` is `"incomplete"`: which checks did not run and what to change. |
+| `serverUrl` | `string` | Server under test |
+| `checks` | `MCPCheckResult[]` | Individual check results |
+| `summary` | `string` | Human-readable summary (`N/M checks passed, X failed, Y could not run, Z not applicable`) |
+| `durationMs` | `number` | Total duration |
+| `categorySummary` | `Record<MCPCheckCategory, ...>` | Per-category `total`, `passed`, `failed`, `skipped`, and `couldNotRun` counts |
+| `readiness` | `MCPReadinessWarning[]` | Advisory observations that do not affect the verdict (see [Readiness advice](#readiness-advice)). |
+
+Each `MCPCheckResult` includes a `skipReason` field whenever `status` is `"skipped"`:
+
+- `"not-applicable"` — the check cannot apply to this server (era-gated check on the wrong protocol version, unadvertised capability, localhost-only requirement against a remote server). These never hold a run back.
+- `"could-not-run"` — the check applies but was never exercised (broken session, missing `inputRequiredProbe`, subscription stream unavailable). These make the run `incomplete`.
+
+`MCPConformanceSuite.run()` returns an `MCPConformanceSuiteResult`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `name` | `string` | Suite name |
+| `serverUrl` | `string` | Shared server URL |
+| `passed` | `boolean` | `true` iff every run passed |
+| `results` | `Array<MCPConformanceResult & { label: string }>` | Per-run results |
+| `summary` | `string` | Human-readable suite summary |
+| `durationMs` | `number` | Total suite duration |
+
+## Outcomes: passed, failed, incomplete
+
+A run reports one of three outcomes, and `passed` is `true` only for the first:
+
+| `outcome` | CLI exit code | Meaning |
+|---|---|---|
+| `passed` | `0` | Every selected check either ran and passed, or does not apply to this server. |
+| `failed` | `1` | At least one check found a violation. |
+| `incomplete` | `3` | Nothing failed, but at least one selected check could not be run, so the run does not establish conformance. |
+
+An incomplete run carries a root `incompleteReason` naming the checks that did not run and what to change; non-quiet CLI runs also print it to stderr. For a suite, the exit code is the worst of all runs (failure outranks incomplete).
+
+## Readiness advice
+
+Every run also collects a `readiness` channel: advisory observations about server behavior that the spec does not mandate but that indicate potential issues. Readiness items never affect `outcome`, `passed`, or exit codes — they are informational only.
+
+Each `MCPReadinessWarning` has:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `id` | `string` | Stable identifier (e.g. `readiness-session-termination`). |
+| `title` | `string` | Short human-readable label. |
+| `specStrength` | `"SHOULD" \| "MAY" \| "Deprecation Notice"` | The spec strength of the underlying guidance. `"Deprecation Notice"` marks a field the spec deprecates without a SHOULD or MAY. |
+| `message` | `string` | Description of what was observed and why it matters. |
+| `details` | `Record<string, unknown>` | Structured details (status codes, headers, etc.). |
+
+The CLI prints readiness items as an `Advice` section on stderr after each `protocol conformance` or `conformance-suite` run. The section is suppressed by `--quiet` and does not appear in JSON or JUnit XML output.
+
+Current readiness checks:
+
+- `readiness-session-termination` — on 2025-era runs, fires when a session-termination `DELETE` returns anything other than a 2xx or HTTP 405. On 2026-era runs, fires when `GET` or `DELETE` traffic from an older client is not answered with HTTP 405 (the 2026 backward-compat `SHOULD`).
+- `readiness-log-level-filtering` — 2026-07-28 runs with a `logProbe` only. Calls the tool asking for logs at `logProbe.level` (default `warning`). Fires when no logs come back, or when any log comes back below that level or with an unknown level. The spec says a server `MAY` send logs at or above the requested level, so this costs no points.
+
+## CI reporting
+
+All three conformance domains share the same report helpers:
+
+- `toConformanceReport(result)`
+- `renderConformanceReportJUnitXml(report)`
+- `renderConformanceReportJson(report)`
+
+The CLI uses the same helpers internally, so `protocol conformance --format junit-xml` and `protocol conformance-suite --format junit-xml` emit the same XML that the SDK helpers produce for the same result.
+
+## Related
+
+- [CLI CI / CD](/cli/ci)
+- [MCP Apps Conformance SDK](/sdk/reference/apps-conformance)
+- [OAuth Conformance SDK](/sdk/reference/oauth-conformance)

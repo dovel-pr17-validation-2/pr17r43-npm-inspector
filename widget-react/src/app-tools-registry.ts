@@ -1,0 +1,795 @@
+/**
+ * App-Provided Tools registry (SEP-1865).
+ *
+ * Each mounted MCP app iframe gets one entry here, keyed by a per-instance
+ * `BridgeId`. Entries hold:
+ *   - The `AppBridge` ref used to dispatch `tools/call` into the iframe.
+ *   - The tools the app advertised via `tools/list` after `ui/initialize`.
+ *   - Opaque aliases (`app_<8hex>`) that act as the model-facing tool names.
+ *
+ * The registry serves two callers:
+ *   - `snapshotForChatBody()` — drained at chat POST time so the server can
+ *     register no-execute AI SDK tools that the model can pick.
+ *   - `resolve(alias)` — looked up by `useChat.onToolCall` to find the right
+ *     bridge to dispatch into.
+ *
+ * App-provided tools are exposed exactly as the app lists them. MCPJam keeps
+ * the readonly bit for attribution and future policy, but does not force its
+ * server-tool approval flow onto app-provided tools.
+ */
+
+import { useCallback, useContext } from "react";
+import { WidgetWorkspaceContext } from "./widget-workspace-context";
+import { create, useStore, type StoreApi } from "zustand";
+import { useShallow } from "zustand/react/shallow";
+import type { AppBridge } from "@modelcontextprotocol/ext-apps/app-bridge";
+import type { CallToolResult } from "@modelcontextprotocol/client";
+// Traffic logging is injected by the caller (the inspector chat/playground
+// dispatch hooks) rather than reached for via `@/stores`, so this registry
+// carries no inspector telemetry into the widget package (Tier-B).
+import type { WidgetDebugSink } from "./widget-host";
+import { updateAppPresentation, type AppToolPresentation } from "./app-tool-presentation";
+import {
+  listAppToolCatalog,
+  MAX_SNAPSHOT_ENTRIES,
+  modelChatSessionId,
+} from "./app-tools-catalog";
+
+/** Injected traffic-log sink — `WidgetDebugSink["addTrafficLog"]`. */
+export type AddTrafficLog = WidgetDebugSink["addTrafficLog"];
+
+/** Per-AppBridge instance identifier (independent of parentToolCallId). */
+export type BridgeId = string;
+
+export type AppToolDescriptor = NonNullable<
+  Awaited<ReturnType<AppBridge["listTools"]>>["tools"]
+>[number];
+
+export interface AppInstance {
+  presentation?: AppToolPresentation;
+  bridgeId: BridgeId;
+  /** Chat session/lane that owns this rendered iframe. */
+  chatSessionId?: string;
+  /** Retained workspace Apps target this conversation without changing ownership. */
+  getModelChatSessionId?: () => string | undefined;
+  /** The host tool call whose render mounted this iframe. */
+  parentToolCallId: string;
+  serverId: string;
+  appName: string;
+  appVersion?: string;
+  surface: "inline" | "modal";
+  bridge: AppBridge;
+  tools: AppToolDescriptor[];
+  registeredAtMs: number;
+  toolSource?: "mcp-apps" | "webmcp";
+  /**
+   * Accessor for the iframe DOM node that hosts this app instance. Lets
+   * callers (e.g. `onToolCall`) scroll the iframe into view before
+   * dispatching `tools/call`. Optional because legacy callers and tests
+   * may not set it.
+   */
+  getIframeElement?: () => HTMLIFrameElement | null;
+}
+
+export interface AppToolAlias {
+  alias: string;
+  bridgeId: BridgeId;
+  rawName: string;
+  /** Cached from `annotations.readOnlyHint === true`. */
+  readOnly: boolean;
+}
+
+/** What the snapshot ships to the server in the chat POST body. */
+export interface AppToolSnapshotEntry {
+  /** Exact bridge generation; older clients omit it and cannot use native app tools. */
+  bridgeId?: string;
+  alias: string;
+  appName: string;
+  appVersion?: string;
+  serverId: string;
+  parentToolCallId: string;
+  rawName: string;
+  description?: string;
+  inputSchema?: Record<string, unknown>;
+  readOnly: boolean;
+}
+
+const ALIAS_REGEX = /^app_[a-z0-9]{8}$/i;
+
+export interface AppToolAttribution {
+  rawName: string;
+  appName: string;
+}
+
+export interface AppToolsRegistryState {
+  updatePresentation: (bridgeId: string, presentation: AppToolPresentation) => void;
+  enabled: boolean;
+  instancesByBridgeId: Map<BridgeId, AppInstance>;
+  aliases: Map<string, AppToolAlias>;
+  /** Active app-tool provider per chat-scoped host tool call. */
+  activeBridgeByParent: Map<string, BridgeId>;
+  /**
+   * AbortControllers for in-flight `bridge.callTool(...)` dispatches, keyed
+   * by the dispatching bridge's id. `unregisterInstance` aborts every
+   * controller in the matching set so a torn-down iframe never leaves a
+   * paused server stream waiting forever. Each set is also the source of
+   * truth for the per-iframe busy indicator.
+   */
+  pendingControllers: Map<BridgeId, Set<AbortController>>;
+
+  registerInstance: (inst: AppInstance) => Promise<void>;
+  dispose: () => void;
+  setEnabled: (enabled: boolean) => void;
+  unregisterInstance: (bridgeId: BridgeId) => void;
+  pushActive: (
+    parentToolCallId: string,
+    bridgeId: BridgeId,
+    chatSessionId?: string
+  ) => void;
+  popActive: (
+    parentToolCallId: string,
+    bridgeId: BridgeId,
+    chatSessionId?: string
+  ) => void;
+
+  /** Adds `controller` to the bridge's pending set and bumps the busy count. */
+  registerPendingCall: (
+    bridgeId: BridgeId,
+    controller: AbortController
+  ) => void;
+  /** Removes `controller` from the bridge's pending set (no-op if absent). */
+  unregisterPendingCall: (
+    bridgeId: BridgeId,
+    controller: AbortController
+  ) => void;
+
+  snapshotForChatBody: (chatSessionId?: string) => AppToolSnapshotEntry[];
+  resolve: (
+    alias: string,
+    chatSessionId?: string
+  ) => {
+    bridge: AppBridge;
+    rawName: string;
+    readOnly: boolean;
+    instance: AppInstance;
+  } | null;
+}
+
+/**
+ * Produce an opaque alias for a rendered app tool. SHA-256 hashed over stable
+ * identity-bearing inputs and truncated to 8 hex chars so the wire
+ * name is always 12 chars: well under Anthropic's 64-char tool-name limit
+ * and never collides with the `getInvalidAnthropicToolNames` charset.
+ *
+ * Deliberately exclude `bridgeId`: a live app can reconnect/re-register its
+ * bridge without changing the rendered host tool call or raw app-tool name.
+ * The alias must stay stable across that churn so the model does not see the
+ * same app tool under a fresh name.
+ *
+ * Collision retry: if a generated alias is already in use, the caller
+ * (`registerInstance`) re-rolls with a numeric salt appended to the
+ * preimage. In practice 8 hex chars over the joined inputs has negligible
+ * collision risk; the retry is a belt-and-suspenders guard.
+ */
+async function generateAlias(
+  chatSessionId: string | undefined,
+  serverId: string,
+  parentToolCallId: string,
+  surface: AppInstance["surface"],
+  rawName: string,
+  salt = 0
+): Promise<string> {
+  const preimage = `${
+    chatSessionId ?? ""
+  }\0${serverId}\0${parentToolCallId}\0${surface}\0${rawName}\0${salt}`;
+  const bytes = new TextEncoder().encode(preimage);
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return `app_${hex.slice(0, 8)}`;
+}
+
+function isReadOnly(tool: AppToolDescriptor): boolean {
+  return tool.annotations?.readOnlyHint === true;
+}
+
+function getActiveParentKey(
+  parentToolCallId: string,
+  chatSessionId?: string
+): string {
+  return chatSessionId
+    ? `${chatSessionId}\0${parentToolCallId}`
+    : parentToolCallId;
+}
+
+function isSameAppSlot(a: AppInstance, b: AppInstance): boolean {
+  return (
+    a.parentToolCallId === b.parentToolCallId &&
+    a.surface === b.surface &&
+    a.chatSessionId === b.chatSessionId
+  );
+}
+
+export function createAppToolsRegistry(
+  options: {
+    /** Most LIVE app instances at once (closed ones free their slot). */
+    maxInstances?: number;
+    /** Most registrations hashing at once. */
+    maxIdentities?: number;
+  } = {}
+) {
+  let disposed = false;
+  let enabled = true;
+  // In-flight registrations only. An entry lives from `registerInstance`'s
+  // first line until it settles; `unregisterInstance` deletes it, which is
+  // what invalidates a registration still hashing. Keeping a counter per
+  // bridge for the registry's whole lifetime (as this once did) grew by one
+  // entry per App call on every chat, workspace or not.
+  const pendingRegistrations = new Map<BridgeId, symbol>();
+  const slotRegistrations = new Map<string, symbol>();
+  // Everything after the bookkeeping in `registerInstance`: hash aliases,
+  // then commit unless a close or a newer registration got there first.
+  const completeRegistration = async (
+    set: StoreApi<AppToolsRegistryState>["setState"],
+    get: StoreApi<AppToolsRegistryState>["getState"],
+    inst: AppInstance,
+    slot: string,
+    slotRegistration: symbol,
+    registration: symbol
+  ): Promise<void> => {
+    // Identify bridges this registration supersedes: same chat session,
+    // same parent + same surface, different bridgeId. We mirror this set
+    // across instance purge, alias purge, and pendingControllers cleanup so
+    // the three stay in lockstep. A modal opening over a still-mounted
+    // inline app (different surfaces) does NOT supersede the inline bridge —
+    // its instance, aliases, and pending controllers all survive.
+    const supersededBridgeIds = new Set<BridgeId>();
+    for (const [bridgeId, oldInst] of get().instancesByBridgeId) {
+      if (bridgeId !== inst.bridgeId && isSameAppSlot(oldInst, inst)) {
+        supersededBridgeIds.add(bridgeId);
+      }
+    }
+
+    // Generate aliases for every tool the app listed. `readOnly` is cached
+    // from annotations, but it is not an inclusion gate.
+    const aliasesForInst: AppToolAlias[] = [];
+    const existing = new Set(
+      [...get().aliases.entries()]
+        .filter(([, alias]) => {
+          if (alias.bridgeId === inst.bridgeId) return false;
+          return !supersededBridgeIds.has(alias.bridgeId);
+        })
+        .map(([alias]) => alias)
+    );
+    for (const tool of inst.tools) {
+      let salt = 0;
+      let alias = await generateAlias(
+        inst.chatSessionId,
+        inst.serverId,
+        inst.parentToolCallId,
+        inst.surface,
+        tool.name,
+        salt
+      );
+      while (existing.has(alias)) {
+        salt += 1;
+        alias = await generateAlias(
+          inst.chatSessionId,
+          inst.serverId,
+          inst.parentToolCallId,
+          inst.surface,
+          tool.name,
+          salt
+        );
+      }
+      existing.add(alias);
+      aliasesForInst.push({
+        alias,
+        bridgeId: inst.bridgeId,
+        rawName: tool.name,
+        readOnly: isReadOnly(tool),
+      });
+    }
+    // Hashing is asynchronous: close or a newer registration invalidates it.
+    if (
+      disposed ||
+      !enabled ||
+      pendingRegistrations.get(inst.bridgeId) !== registration ||
+      slotRegistrations.get(slot) !== slotRegistration
+    )
+      return;
+    // Recompute supersession after hashing: another bridge may have completed.
+    for (const [bridgeId, oldInst] of get().instancesByBridgeId)
+      if (bridgeId !== inst.bridgeId && isSameAppSlot(oldInst, inst))
+        supersededBridgeIds.add(bridgeId);
+    if (
+      !get().instancesByBridgeId.has(inst.bridgeId) &&
+      options.maxInstances !== undefined &&
+      get().instancesByBridgeId.size - supersededBridgeIds.size >=
+        options.maxInstances
+    )
+      throw new Error(
+        `Widget registry instance limit reached: too many Apps are open (${options.maxInstances}). Close an App to use this one's tools.`
+      );
+    // Abort in-flight bridge.callTool dispatches against any superseded
+    // bridge BEFORE we drop its instance entry. Same reasoning as
+    // `unregisterInstance`: a fresh bridgeId taking over the same
+    // (parent, surface) slot is an implicit teardown of the prior one,
+    // and the chat stream will hang on the dead iframe if we skip this.
+    for (const bridgeId of supersededBridgeIds) {
+      const pending = get().pendingControllers.get(bridgeId);
+      if (!pending) continue;
+      for (const controller of pending) {
+        try {
+          controller.abort();
+        } catch {
+          // Ignore — abort() should never throw, but defensively continue.
+        }
+      }
+    }
+    set((s) => {
+      const instancesByBridgeId = new Map(s.instancesByBridgeId);
+      for (const bridgeId of supersededBridgeIds) {
+        instancesByBridgeId.delete(bridgeId);
+      }
+      instancesByBridgeId.set(inst.bridgeId, inst);
+      const aliases = new Map(s.aliases);
+      for (const [alias, a] of s.aliases) {
+        // Only drop aliases for the new bridge itself (replacement) or
+        // for bridges actually being instance-removed. Crucially, we do
+        // NOT drop aliases owned by a sibling instance under the same
+        // parent but on a different surface (e.g. inline aliases when a
+        // modal opens) — that bug left inline tools unresolvable until
+        // re-initialization even after the modal closed.
+        if (
+          a.bridgeId === inst.bridgeId ||
+          supersededBridgeIds.has(a.bridgeId)
+        ) {
+          aliases.delete(alias);
+        }
+      }
+      for (const a of aliasesForInst) aliases.set(a.alias, a);
+      const activeBridgeByParent = new Map(s.activeBridgeByParent);
+      activeBridgeByParent.set(
+        getActiveParentKey(inst.parentToolCallId, inst.chatSessionId),
+        inst.bridgeId
+      );
+      let pendingControllers = s.pendingControllers;
+      if (supersededBridgeIds.size > 0) {
+        pendingControllers = new Map(s.pendingControllers);
+        for (const bridgeId of supersededBridgeIds) {
+          pendingControllers.delete(bridgeId);
+        }
+      }
+      return {
+        instancesByBridgeId,
+        aliases,
+        activeBridgeByParent,
+        pendingControllers,
+      };
+    });
+  };
+  return create<AppToolsRegistryState>((set, get) => ({
+    enabled: true,
+    instancesByBridgeId: new Map(),
+    aliases: new Map(),
+    activeBridgeByParent: new Map(),
+    pendingControllers: new Map(),
+
+    // Returns a Promise so callers (and tests) can await the alias-hash
+    // round-trip. The renderer uses `void registerInstance(...)` because
+    // there's nothing to do until the next chat POST. Tests await so
+    // resolved microtasks don't bleed into the next test's reset store.
+    registerInstance: async (inst) => {
+      if (disposed || !enabled) return;
+      if (
+        !pendingRegistrations.has(inst.bridgeId) &&
+        options.maxIdentities !== undefined &&
+        pendingRegistrations.size >= options.maxIdentities
+      )
+        throw new Error(
+          "Widget registry identity limit reached: too many Apps are registering tools at once. Try again in a moment."
+        );
+      const slot = JSON.stringify([
+        inst.chatSessionId ?? null,
+        inst.parentToolCallId,
+        inst.surface,
+      ]);
+      const slotRegistration = Symbol();
+      slotRegistrations.set(slot, slotRegistration);
+      const registration = Symbol();
+      pendingRegistrations.set(inst.bridgeId, registration);
+      try {
+        await completeRegistration(
+          set,
+          get,
+          inst,
+          slot,
+          slotRegistration,
+          registration
+        );
+      } finally {
+        if (pendingRegistrations.get(inst.bridgeId) === registration)
+          pendingRegistrations.delete(inst.bridgeId);
+        if (slotRegistrations.get(slot) === slotRegistration)
+          slotRegistrations.delete(slot);
+      }
+    },
+    unregisterInstance: (bridgeId) => {
+      // Invalidates a registration of this bridge that is still hashing.
+      pendingRegistrations.delete(bridgeId);
+      // Abort any in-flight `bridge.callTool` dispatches against this bridge
+      // BEFORE we drop the instance entry. The catch branch in
+      // `useChat.onToolCall` picks up the abort and resolves the tool call
+      // with `isError: true`, which is what lets the paused server stream
+      // continue. Skipping this leaves the chat hanging when an iframe is
+      // torn down mid-dispatch.
+      const pending = get().pendingControllers.get(bridgeId);
+      if (pending) {
+        for (const controller of pending) {
+          try {
+            controller.abort();
+          } catch {
+            // Ignore — abort() should never throw, but defensively continue.
+          }
+        }
+      }
+      set((s) => {
+        const inst = s.instancesByBridgeId.get(bridgeId);
+        if (!inst) return {};
+        const instancesByBridgeId = new Map(s.instancesByBridgeId);
+        instancesByBridgeId.delete(bridgeId);
+        const aliases = new Map(s.aliases);
+        for (const [alias, a] of s.aliases) {
+          if (a.bridgeId === bridgeId) aliases.delete(alias);
+        }
+        const activeBridgeByParent = new Map(s.activeBridgeByParent);
+        const activeParentKey = getActiveParentKey(
+          inst.parentToolCallId,
+          inst.chatSessionId
+        );
+        if (activeBridgeByParent.get(activeParentKey) === bridgeId) {
+          // Promote any other still-mounted instance under this parent so
+          // its aliases stay resolvable and visible to the model. Without
+          // this fallback, closing a modal that opened over a still-
+          // mounted inline app leaves the inline app's tools unreachable
+          // (both `resolve()` and `snapshotForChatBody()` gate on the
+          // active bridge match). Mirrors the fallback search in
+          // `popActive`.
+          let fallback: BridgeId | undefined;
+          for (const other of instancesByBridgeId.values()) {
+            if (
+              other.parentToolCallId === inst.parentToolCallId &&
+              other.chatSessionId === inst.chatSessionId
+            ) {
+              fallback = other.bridgeId;
+              break;
+            }
+          }
+          if (fallback) {
+            activeBridgeByParent.set(activeParentKey, fallback);
+          } else {
+            activeBridgeByParent.delete(activeParentKey);
+          }
+        }
+        const pendingControllers = new Map(s.pendingControllers);
+        pendingControllers.delete(bridgeId);
+        return {
+          instancesByBridgeId,
+          aliases,
+          activeBridgeByParent,
+          pendingControllers,
+        };
+      });
+    },
+
+    registerPendingCall: (bridgeId, controller) => {
+      if (disposed || !enabled || !get().instancesByBridgeId.has(bridgeId)) {
+        controller.abort();
+        return;
+      }
+      set((s) => {
+        const pendingControllers = new Map(s.pendingControllers);
+        const next = new Set(pendingControllers.get(bridgeId));
+        next.add(controller);
+        pendingControllers.set(bridgeId, next);
+        return { pendingControllers };
+      });
+    },
+
+    unregisterPendingCall: (bridgeId, controller) => {
+      set((s) => {
+        const existing = s.pendingControllers.get(bridgeId);
+        if (!existing || !existing.has(controller)) return {};
+        const pendingControllers = new Map(s.pendingControllers);
+        if (existing.size === 1) {
+          pendingControllers.delete(bridgeId);
+        } else {
+          const next = new Set(existing);
+          next.delete(controller);
+          pendingControllers.set(bridgeId, next);
+        }
+        return { pendingControllers };
+      });
+    },
+
+    pushActive: (parentToolCallId, bridgeId, chatSessionId) => {
+      set((s) => {
+        const next = new Map(s.activeBridgeByParent);
+        next.set(getActiveParentKey(parentToolCallId, chatSessionId), bridgeId);
+        return { activeBridgeByParent: next };
+      });
+    },
+
+    popActive: (parentToolCallId, bridgeId, chatSessionId) => {
+      set((s) => {
+        const activeParentKey = getActiveParentKey(
+          parentToolCallId,
+          chatSessionId
+        );
+        const current = s.activeBridgeByParent.get(activeParentKey);
+        if (current !== bridgeId) return {};
+        const next = new Map(s.activeBridgeByParent);
+        // Fall back to any other registered instance under this parent.
+        let fallback: BridgeId | undefined;
+        for (const inst of s.instancesByBridgeId.values()) {
+          if (
+            inst.parentToolCallId === parentToolCallId &&
+            inst.chatSessionId === chatSessionId &&
+            inst.bridgeId !== bridgeId
+          ) {
+            fallback = inst.bridgeId;
+            break;
+          }
+        }
+        if (fallback) next.set(activeParentKey, fallback);
+        else next.delete(activeParentKey);
+        return { activeBridgeByParent: next };
+      });
+    },
+
+    updatePresentation: (bridgeId, presentation) => set((state) => {
+      const instancesByBridgeId = updateAppPresentation(state.instancesByBridgeId, bridgeId, presentation);
+      return instancesByBridgeId === state.instancesByBridgeId ? state : { instancesByBridgeId };
+    }),
+    snapshotForChatBody: (chatSessionId) => {
+      const catalog = listAppToolCatalog(get(), chatSessionId);
+      const capped = catalog.dropped.filter(
+        (entry) => entry.reason === "entry_cap",
+      );
+      if (capped.length > 0) {
+        console.warn(
+          `[app-tools] snapshot capped at ${MAX_SNAPSHOT_ENTRIES} entries; dropped ${capped.length}.`,
+        );
+      }
+      return catalog.offered.map(
+        ({ alias, instance, rawName, description, inputSchema, readOnly }) => ({
+          alias,
+          appName: instance.appName,
+          bridgeId: instance.bridgeId,
+          appVersion: instance.appVersion,
+          serverId: instance.serverId,
+          parentToolCallId: instance.parentToolCallId,
+          rawName,
+          description,
+          inputSchema,
+          readOnly,
+        })
+      );
+    },
+
+    setEnabled: (value) => {
+      enabled = value;
+      set({ enabled: value });
+      if (!value)
+        for (const pending of get().pendingControllers.values())
+          for (const controller of pending) controller.abort();
+    },
+    dispose: () => {
+      disposed = true;
+      enabled = false;
+      set({ enabled: false });
+      for (const bridgeId of get().instancesByBridgeId.keys())
+        get().unregisterInstance(bridgeId);
+    },
+
+    resolve: (alias, chatSessionId) => {
+      if (disposed || !enabled) return null;
+      const a = get().aliases.get(alias);
+      if (!a) return null;
+      const inst = get().instancesByBridgeId.get(a.bridgeId);
+      if (!inst) return null;
+      if (chatSessionId && modelChatSessionId(inst) !== chatSessionId) return null;
+      if (
+        get().activeBridgeByParent.get(
+          getActiveParentKey(inst.parentToolCallId, inst.chatSessionId)
+        ) !== inst.bridgeId
+      ) {
+        return null;
+      }
+      return {
+        bridge: inst.bridge,
+        rawName: a.rawName,
+        readOnly: a.readOnly,
+        instance: inst,
+      };
+    },
+  }));
+}
+
+export type AppToolsRegistry = ReturnType<typeof createAppToolsRegistry>;
+const legacyAppToolsRegistry = createAppToolsRegistry();
+export function useAppToolsRegistryApi(): AppToolsRegistry {
+  return useContext(WidgetWorkspaceContext)?.registry ?? legacyAppToolsRegistry;
+}
+/** Static methods address the legacy registry; scoped callbacks use the API hook. */
+export const useAppToolsRegistry = Object.assign(
+  <T = AppToolsRegistryState>(
+    selector: (state: AppToolsRegistryState) => T = (state) =>
+      state as unknown as T
+  ) => useStore(useAppToolsRegistryApi(), selector),
+  legacyAppToolsRegistry
+);
+
+/**
+ * Side-channel log of every app-tool invocation for debugging and future UI.
+ * Mirrors the widget-html debug store pattern. The full untouched
+ * `CallToolResult` is stored here so the UI can later display
+ * `structuredContent` / `_meta` that were intentionally stripped from model
+ * context.
+ */
+export interface AppToolInvocationRecord {
+  initiatedBy?: "user";
+  alias: string;
+  rawName: string;
+  appName: string;
+  serverId: string;
+  parentToolCallId: string;
+  bridgeId: BridgeId;
+  input: unknown;
+  raw: CallToolResult;
+  invokedAtMs: number;
+}
+
+export interface AppToolInvocationLogState {
+  records: AppToolInvocationRecord[];
+  append: (r: AppToolInvocationRecord) => void;
+  clear: () => void;
+  setEnabled: (enabled: boolean) => void;
+  dispose: () => void;
+}
+
+const MAX_INVOCATION_RECORDS = 200;
+
+export function createAppToolInvocationLog() {
+  let enabled = true;
+  let disposed = false;
+  return create<AppToolInvocationLogState>((set) => ({
+    records: [],
+    append: (r) => {
+      if (disposed || !enabled) return;
+      set((s) => {
+        const next = s.records.concat(r);
+        if (next.length > MAX_INVOCATION_RECORDS) {
+          next.splice(0, next.length - MAX_INVOCATION_RECORDS);
+        }
+        return { records: next };
+      });
+    },
+    clear: () => set({ records: [] }),
+    setEnabled: (value) => {
+      enabled = value;
+    },
+    dispose: () => {
+      disposed = true;
+      set({ records: [] });
+    },
+  }));
+}
+export type AppToolInvocationLog = ReturnType<
+  typeof createAppToolInvocationLog
+>;
+const legacyInvocationLog = createAppToolInvocationLog();
+export function useAppToolInvocationLogApi(): AppToolInvocationLog {
+  return useContext(WidgetWorkspaceContext)?.invocations ?? legacyInvocationLog;
+}
+export const useAppToolInvocationLog = Object.assign(
+  <T = AppToolInvocationLogState>(
+    selector: (state: AppToolInvocationLogState) => T = (state) =>
+      state as unknown as T
+  ) => useStore(useAppToolInvocationLogApi(), selector),
+  legacyInvocationLog
+);
+
+export function recordAppToolInvocation(
+  args: Omit<AppToolInvocationRecord, "invokedAtMs">,
+  addTrafficLog?: AddTrafficLog,
+  invocationLog: AppToolInvocationLog = legacyInvocationLog
+): void {
+  invocationLog.getState().append({
+    ...args,
+    invokedAtMs: Date.now(),
+  });
+  // Mirror the invocation into the shared traffic-log via the injected sink so
+  // it surfaces in `LoggerView` alongside the rest of the iframe ↔ host
+  // traffic. `direction: "host-to-ui"` because the host dispatched the
+  // call into the iframe via `bridge.callTool`. `widgetId` matches the
+  // parent host tool call so existing logger filters scope correctly.
+  // Only the model-safe scrubbed payload is shipped here — the full
+  // `CallToolResult` (including `structuredContent` and `_meta`) lives
+  // in `useAppToolInvocationLog` for richer debug UIs. When no sink is
+  // injected (non-inspector host), the invocation log still records.
+  if (!addTrafficLog) return;
+  try {
+    addTrafficLog({
+      widgetId: args.parentToolCallId,
+      serverId: args.serverId,
+      direction: "host-to-ui",
+      protocol: "mcp-apps",
+      method: "tools/call",
+      message: {
+        alias: args.alias,
+        toolName: args.rawName,
+        appName: args.appName,
+        ...(args.initiatedBy ? { initiatedBy: args.initiatedBy } : {}),
+        arguments: args.input,
+        result: {
+          content: args.raw.content,
+          ...(args.raw.isError ? { isError: true } : {}),
+        },
+      },
+    });
+  } catch {
+    // Defensive: the traffic-log sink is best-effort observability;
+    // never let a logger failure bubble into the dispatch path.
+  }
+}
+
+export function useAppToolAttributionResolver(chatSessionId?: string) {
+  const registrySnapshot = useAppToolsRegistry(
+    useShallow((s) => ({
+      activeBridgeByParent: s.activeBridgeByParent,
+      aliases: s.aliases,
+      instancesByBridgeId: s.instancesByBridgeId,
+    }))
+  );
+  const resolve = useAppToolsRegistry((s) => s.resolve);
+  const invocationRecords = useAppToolInvocationLog((s) => s.records);
+
+  return useCallback(
+    (label: string): AppToolAttribution | null => {
+      if (!ALIAS_REGEX.test(label)) return null;
+
+      const resolved = resolve(label, chatSessionId);
+      if (resolved) {
+        return {
+          rawName: resolved.rawName,
+          appName: resolved.instance.appName,
+        };
+      }
+
+      for (let i = invocationRecords.length - 1; i >= 0; i -= 1) {
+        const record = invocationRecords[i];
+        if (record.alias === label) {
+          return { rawName: record.rawName, appName: record.appName };
+        }
+      }
+
+      return null;
+    },
+    [chatSessionId, invocationRecords, registrySnapshot, resolve]
+  );
+}
+
+export function useAppToolAttribution(
+  label: string,
+  chatSessionId?: string
+): AppToolAttribution | null {
+  const resolveAppToolAttribution =
+    useAppToolAttributionResolver(chatSessionId);
+  return resolveAppToolAttribution(label);
+}
+
+// Exports for tests.
+export const __internal = { generateAlias, isReadOnly, ALIAS_REGEX };

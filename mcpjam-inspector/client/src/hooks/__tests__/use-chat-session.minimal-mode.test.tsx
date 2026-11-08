@@ -1,0 +1,1798 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { useChatSession } from "../use-chat-session";
+import { useMCPJamLimitDialogStore } from "@/stores/mcpjam-limit-dialog-store";
+import { DEFAULT_SYSTEM_PROMPT } from "@/components/chat-v2/shared/chat-helpers";
+import { GUEST_LOCKED_MODEL_REASON } from "@/components/chat-v2/shared/available-models";
+import { useStdioCommandApprovalStore } from "@/lib/stdio-command-approval";
+import { STDIO_COMMAND_APPROVAL_REQUIRED_REASON } from "@/shared/stdio-command-approval";
+
+const mockGetToolsMetadata = vi.fn();
+const mockCountTextTokens = vi.fn();
+const mockSetMessages = vi.fn();
+const mockStop = vi.fn();
+const mockAddToolApprovalResponse = vi.fn();
+const mockAuthFetch = vi.fn();
+const mockWindowFetch = vi.fn();
+const mockGetSessionAuthHeaders = vi.fn(() => ({}));
+const mockGetAccessToken = vi.fn(async () => null);
+const mockGetGuestBearerToken = vi.fn(async () => "guest-token");
+const mockHasToken = vi.fn(() => false);
+const mockGetToken = vi.fn(() => "");
+const mockGetOpenRouterSelectedModels = vi.fn(() => []);
+const mockGetOllamaBaseUrl = vi.fn(() => "http://127.0.0.1:11434");
+const mockGetAzureBaseUrl = vi.fn(() => "");
+const mockGetCustomProviderByName = vi.fn();
+const mockConvexAuth = {
+  isAuthenticated: true,
+  isLoading: false,
+};
+const mockTransportInstances: Array<{
+  options: any;
+  sendMessages: ReturnType<typeof vi.fn>;
+  requests: any[];
+}> = [];
+const mockUseChatErrorHandlers: Array<(error: Error) => void> = [];
+
+const baseModel = {
+  id: "gpt-4",
+  name: "GPT-4",
+  provider: "openai" as const,
+};
+const orgAnthropicModel = {
+  id: "claude-sonnet-4-6",
+  name: "Claude Sonnet 4.6",
+  provider: "anthropic" as const,
+};
+const mcpJamModel = {
+  id: "openai/gpt-5-mini",
+  name: "GPT-5 Mini",
+  provider: "openai" as const,
+};
+const gatedMcpJamModel = {
+  id: "openai/gpt-5.4-pro",
+  name: "GPT-5.4 Pro",
+  provider: "openai" as const,
+};
+const guestAllowedMcpJamModel = {
+  id: "anthropic/claude-haiku-4.5",
+  name: "Claude Haiku 4.5",
+  provider: "anthropic" as const,
+};
+const mockModelState = {
+  availableModels: [baseModel],
+  selectedModelId: "gpt-4",
+};
+// The raw persistence setter behind `usePersistedModel`. It ends in
+// `saveSelectedModelId`, so reaching it means the global lead model key gets
+// written. See BACK2-628.
+const mockPersistSelectedModelIds = vi.fn();
+const mockAiProviderKeysState = {
+  hasToken: mockHasToken,
+  getToken: mockGetToken,
+  getOpenRouterSelectedModels: mockGetOpenRouterSelectedModels,
+  getOllamaBaseUrl: mockGetOllamaBaseUrl,
+  getAzureBaseUrl: mockGetAzureBaseUrl,
+};
+const mockCustomProvidersState = {
+  customProviders: [],
+  getCustomProviderByName: mockGetCustomProviderByName,
+};
+const mockSharedAppState: any = {
+  projects: {},
+  activeProjectId: "local-project",
+  servers: {},
+  selectedServer: "",
+  selectedMultipleServers: [],
+  isMultiSelectMode: false,
+};
+
+async function resolveConfig<T>(value: T | (() => T | Promise<T>)) {
+  return typeof value === "function"
+    ? await (value as () => T | Promise<T>)()
+    : value;
+}
+
+function getUsedTransport() {
+  const transport = [...mockTransportInstances]
+    .reverse()
+    .find((instance) => instance.sendMessages.mock.calls.length > 0);
+  expect(transport).toBeDefined();
+  return transport!;
+}
+
+function getTransportRequests() {
+  return mockTransportInstances.flatMap((instance) => instance.requests);
+}
+
+vi.mock("@/lib/config", () => ({
+  HOSTED_MODE: false,
+}));
+
+vi.mock("@/hooks/use-hosted-model-catalog", () => ({
+  useHostedModelCatalog: () => ({ hostedCatalog: [], status: "fallback" }),
+}));
+
+vi.mock("@/components/chat-v2/shared/model-helpers", () => ({
+  buildAvailableModels: vi.fn(() => mockModelState.availableModels),
+  buildAvailableModelsFromOrgConfig: vi.fn((orgConfig: any) => {
+    if (
+      orgConfig?.providers?.some(
+        (provider: any) =>
+          provider.providerKey === "anthropic" &&
+          provider.enabled &&
+          provider.hasSecret
+      )
+    ) {
+      return [mcpJamModel, orgAnthropicModel];
+    }
+    return [mcpJamModel];
+  }),
+  getDefaultModel: vi.fn(() => baseModel),
+  isMCPJamProvidedModelMenuItem: vi.fn((model: { id: string }) =>
+    String(model.id).includes("/")
+  ),
+}));
+
+vi.mock("@/hooks/use-ai-provider-keys", () => ({
+  useAiProviderKeys: () => mockAiProviderKeysState,
+}));
+
+vi.mock("@/hooks/use-custom-providers", () => ({
+  useCustomProviders: () => mockCustomProvidersState,
+}));
+
+vi.mock("@/hooks/use-persisted-model", () => ({
+  usePersistedModel: () => ({
+    selectedModelId: mockModelState.selectedModelId,
+    setSelectedModelId: vi.fn(),
+    selectedModelIds: [mockModelState.selectedModelId],
+    setSelectedModelIds: mockPersistSelectedModelIds,
+    multiModelEnabled: false,
+    setMultiModelEnabled: vi.fn(),
+  }),
+}));
+
+vi.mock("@/state/app-state-context", () => ({
+  useOptionalSharedAppState: () => mockSharedAppState,
+  useSharedAppState: () => mockSharedAppState,
+}));
+
+vi.mock("@/lib/ollama-utils", () => ({
+  detectOllamaModels: vi.fn(async () => ({
+    isRunning: false,
+    availableModels: [],
+  })),
+  detectOllamaToolCapableModels: vi.fn(async () => []),
+}));
+
+vi.mock("@/lib/apis/mcp-tools-api", () => ({
+  getToolsMetadata: (...args: unknown[]) => mockGetToolsMetadata(...args),
+}));
+
+vi.mock("@/lib/apis/mcp-tokenizer-api", () => ({
+  countTextTokens: (...args: unknown[]) => mockCountTextTokens(...args),
+}));
+
+vi.mock("@/lib/session-token", () => ({
+  authFetch: (...args: unknown[]) => mockAuthFetch(...args),
+  getAuthHeaders: () => mockGetSessionAuthHeaders(),
+}));
+
+vi.mock("@/lib/guest-session", () => ({
+  getGuestBearerToken: (...args: unknown[]) => mockGetGuestBearerToken(...args),
+  getCachedGuestSession: vi.fn(() => null),
+}));
+
+vi.mock("@/hooks/useSharedChatWidgetCapture", () => ({
+  useSharedChatWidgetCapture: vi.fn(),
+}));
+
+vi.mock("@workos-inc/authkit-react", () => ({
+  useAuth: () => ({
+    getAccessToken: mockGetAccessToken,
+  }),
+}));
+
+// Soft reads (billing, credits, quota, notifications) go through useQueries;
+// withUseQueries answers them from this mock's useQuery.
+vi.mock("convex/react", async () =>
+  (await import("@/test/mocks/convex-use-queries")).withUseQueries({
+  // useChatSession resolves the Convex client to submit elicitation answers
+  // straight to the rendezvous table (the blocked replica isn't addressable).
+  useConvex: () => ({ mutation: vi.fn().mockResolvedValue({ ok: true }) }),
+  useConvexAuth: () => mockConvexAuth,
+  // useChatSession reads the credit balance (to lock free models at 0
+  // credits); no balance in these tests → outOfCredits resolves false.
+  useQuery: () => undefined,
+}));
+
+vi.mock("@ai-sdk/react", async () => {
+  const React = await import("react");
+
+  return {
+    useChat: vi.fn(
+      ({
+        id,
+        transport,
+        onError,
+      }: {
+        id: string;
+        transport: {
+          sendMessages: (options: any) => Promise<unknown>;
+        };
+        onError?: (error: Error) => void;
+      }) => {
+        const latchedIdRef = React.useRef(id);
+        const latchedTransportRef = React.useRef(transport);
+
+        if (onError) {
+          mockUseChatErrorHandlers.push(onError);
+        }
+
+        if (latchedIdRef.current !== id) {
+          latchedIdRef.current = id;
+          latchedTransportRef.current = transport;
+        }
+
+        return {
+          messages: [],
+          sendMessage: async (message: any) => {
+            await latchedTransportRef.current.sendMessages({
+              chatId: latchedIdRef.current,
+              messages: [
+                {
+                  id: "user-1",
+                  role: "user",
+                  parts:
+                    "text" in message
+                      ? [{ type: "text", text: message.text }]
+                      : [],
+                },
+              ],
+              abortSignal: new AbortController().signal,
+              metadata: undefined,
+              headers: undefined,
+              body: undefined,
+              trigger: "submit-message",
+              messageId: undefined,
+            });
+          },
+          stop: mockStop,
+          status: "ready",
+          error: undefined,
+          setMessages: mockSetMessages,
+          addToolApprovalResponse: mockAddToolApprovalResponse,
+        };
+      }
+    ),
+  };
+});
+
+vi.mock("ai", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("ai")>()),
+  DefaultChatTransport: class MockTransport {
+    options: any;
+    sendMessages: ReturnType<typeof vi.fn>;
+    requests: any[];
+
+    constructor(options: any) {
+      this.options = options;
+      this.requests = [];
+      this.sendMessages = vi.fn(async (requestOptions: any) => {
+        const resolvedBody = await resolveConfig(this.options.body);
+        const resolvedHeaders = await resolveConfig(this.options.headers);
+        const requestBody = {
+          ...resolvedBody,
+          id: requestOptions.chatId,
+          messages: requestOptions.messages,
+          trigger: requestOptions.trigger,
+          messageId: requestOptions.messageId,
+        };
+        this.requests.push(requestBody);
+        await this.options.fetch?.(this.options.api, {
+          method: "POST",
+          headers: resolvedHeaders,
+          body: JSON.stringify(requestBody),
+        });
+        return new ReadableStream();
+      });
+      mockTransportInstances.push(this);
+    }
+  },
+  generateId: vi.fn(() => "chat-session-id"),
+  lastAssistantMessageIsCompleteWithApprovalResponses: vi.fn(),
+}));
+
+describe("useChatSession minimal mode parity", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockConvexAuth.isAuthenticated = true;
+    mockConvexAuth.isLoading = false;
+    mockModelState.availableModels = [baseModel];
+    mockModelState.selectedModelId = "gpt-4";
+    mockSharedAppState.projects = {};
+    mockSharedAppState.activeProjectId = "local-project";
+    mockSharedAppState.servers = {};
+    mockGetSessionAuthHeaders.mockReturnValue({});
+    mockGetAccessToken.mockResolvedValue(null);
+    mockGetGuestBearerToken.mockReset();
+    mockGetGuestBearerToken.mockResolvedValue("guest-token");
+    mockWindowFetch.mockReset();
+    mockWindowFetch.mockResolvedValue(new Response(null, { status: 200 }));
+    mockAuthFetch.mockReset();
+    mockAuthFetch.mockImplementation(
+      (input: RequestInfo | URL, init?: RequestInit) =>
+        mockWindowFetch(input, init)
+    );
+    vi.stubGlobal("fetch", mockWindowFetch);
+    useMCPJamLimitDialogStore.setState({
+      authStatus: "guest",
+      hasPendingLimit: false,
+      outOfCreditsHit: false,
+      outOfCreditsOrganizationId: null,
+      isOpen: false,
+      intent: null,
+      organizationId: null,
+      pendingInput: null,
+    });
+    mockTransportInstances.length = 0;
+    mockUseChatErrorHandlers.length = 0;
+    mockGetToolsMetadata.mockResolvedValue({
+      metadata: { create_view: { title: "Create view" } },
+      toolServerMap: { create_view: "server-1" },
+      tokenCounts: { "server-1": 17 },
+    });
+    mockCountTextTokens.mockResolvedValue(123);
+  });
+
+  it("still prefetches tools metadata when minimalMode is true", async () => {
+    const selectedServers = ["server-1"];
+    renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "You are a helpful assistant.",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockGetToolsMetadata).toHaveBeenCalled();
+    });
+    expect(mockGetToolsMetadata).toHaveBeenCalledWith(
+      ["server-1"],
+      "openai/gpt-4"
+    );
+  });
+
+  it("still counts system prompt tokens when minimalMode is true", async () => {
+    const selectedServers = ["server-1"];
+    renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Custom prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockCountTextTokens).toHaveBeenCalledWith(
+        "Custom prompt",
+        "openai/gpt-4"
+      );
+    });
+  });
+
+  it("uses the default system prompt when execution config has a blank prompt", async () => {
+    const selectedServers = ["server-1"];
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "",
+          temperature: 0.7,
+          requireToolApproval: false,
+        },
+      })
+    );
+
+    expect(result.current.systemPrompt).toBe(DEFAULT_SYSTEM_PROMPT);
+
+    await waitFor(() => {
+      expect(mockCountTextTokens).toHaveBeenCalledWith(
+        DEFAULT_SYSTEM_PROMPT,
+        "openai/gpt-4"
+      );
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          systemPrompt: DEFAULT_SYSTEM_PROMPT,
+        })
+      );
+    });
+  });
+
+  it("sends host-level respectToolVisibility overrides from uncontrolled callers", async () => {
+    const selectedServers = ["server-1"];
+    const { result, rerender } = renderHook(
+      ({ respectToolVisibility }: { respectToolVisibility: boolean }) =>
+        useChatSession({
+          selectedServers,
+          minimalMode: true,
+          respectToolVisibility,
+        }),
+      { initialProps: { respectToolVisibility: false } }
+    );
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          respectToolVisibility: false,
+        })
+      );
+    });
+
+    rerender({ respectToolVisibility: true });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello again" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          respectToolVisibility: true,
+        })
+      );
+    });
+  });
+
+  it("sends host-level MCP image visibility overrides from uncontrolled callers", async () => {
+    const selectedServers = ["server-1"];
+    const { result, rerender } = renderHook(
+      ({
+        modelVisibleMcpToolResults,
+      }: {
+        modelVisibleMcpToolResults: {
+          directContent: { image: boolean };
+          embeddedResources: { blob: { image: boolean } };
+          linkedResources: { blob: { image: boolean } };
+        };
+      }) =>
+        useChatSession({
+          selectedServers,
+          minimalMode: true,
+          modelVisibleMcpToolResults,
+        }),
+      {
+        initialProps: {
+          modelVisibleMcpToolResults: {
+            directContent: { image: false },
+            embeddedResources: { blob: { image: false } },
+            linkedResources: { blob: { image: false } },
+          },
+        },
+      }
+    );
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          modelVisibleMcpToolResults: {
+            directContent: { image: false },
+            embeddedResources: { blob: { image: false } },
+            linkedResources: { blob: { image: false } },
+          },
+        })
+      );
+    });
+
+    rerender({
+      modelVisibleMcpToolResults: {
+        directContent: { image: true },
+        embeddedResources: { blob: { image: true } },
+        linkedResources: { blob: { image: true } },
+      },
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello again" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          modelVisibleMcpToolResults: {
+            directContent: { image: true },
+            embeddedResources: { blob: { image: true } },
+            linkedResources: { blob: { image: true } },
+          },
+        })
+      );
+    });
+  });
+
+  it("uses saved MCP image policies when continuing a resumed session", async () => {
+    const selectedServers = ["server-1"];
+    const currentHostPolicy = {
+      directContent: { image: true },
+      embeddedResources: { blob: { image: true } },
+      linkedResources: { blob: { image: true } },
+    };
+    const resumedPolicy = {
+      directContent: { image: false },
+      embeddedResources: { blob: { image: false } },
+      linkedResources: { blob: { image: false } },
+    };
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        modelVisibleMcpToolResults: currentHostPolicy,
+        mcpToolResultImageRendering: { placement: "inline" },
+      })
+    );
+
+    act(() => {
+      void result.current.loadChatSession({
+        chatSessionId: "restored-session",
+        messagesBlobUrl: null,
+        resumeConfig: {
+          respectToolVisibility: false,
+          modelVisibleMcpToolResults: resumedPolicy,
+          mcpToolResultImageRendering: { placement: "none" },
+        },
+        version: 3,
+      });
+    });
+
+    await waitFor(() => {
+      expect(result.current.chatSessionId).toBe("restored-session");
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "continue" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toContainEqual(
+        expect.objectContaining({
+          respectToolVisibility: false,
+          modelVisibleMcpToolResults: resumedPolicy,
+          mcpToolResultImageRendering: { placement: "none" },
+        })
+      );
+    });
+  });
+
+  it("soft-fails shared metadata auth denial without noisy warning", async () => {
+    mockGetToolsMetadata.mockRejectedValue({
+      status: 403,
+      message: "Forbidden",
+    });
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const selectedServers = ["server-1"];
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        hostedContext: {
+          scenarioId: "cbx_test",
+          accessVersion: 1,
+        },
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockGetToolsMetadata).toHaveBeenCalled();
+    });
+    await waitFor(() => {
+      expect(result.current.mcpToolsTokenCountLoading).toBe(false);
+    });
+
+    expect(result.current.toolsMetadata).toEqual({});
+    expect(result.current.toolServerMap).toEqual({});
+    expect(result.current.mcpToolsTokenCount).toBeNull();
+    expect(warnSpy).not.toHaveBeenCalled();
+    warnSpy.mockRestore();
+  });
+
+  it("uses request-time authFetch for non-hosted chat", async () => {
+    const selectedServers = ["server-1"];
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(0);
+    });
+
+    const latestTransport = mockTransportInstances.at(-1)!;
+    expect(latestTransport.options.api).toBe("/api/mcp/chat-v2");
+    expect(latestTransport.options.fetch).toEqual(expect.any(Function));
+    expect(
+      await resolveConfig(latestTransport.options.headers)
+    ).toBeUndefined();
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(
+        mockTransportInstances.some(
+          (instance) => instance.sendMessages.mock.calls.length === 1
+        )
+      ).toBe(true);
+    });
+    expect(getUsedTransport().options.api).toBe("/api/mcp/chat-v2");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/mcp/chat-v2",
+      expect.objectContaining({
+        method: "POST",
+      })
+    );
+    const requestInit = mockAuthFetch.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(new Headers(requestInit.headers).has("Authorization")).toBe(false);
+  });
+
+  it("attaches widget model context to the next request only", async () => {
+    const selectedServers = ["server-1"];
+    const widgetModelContext = [
+      {
+        toolCallId: "call-1",
+        context: {
+          content: [{ type: "text", text: "board: X________" }],
+          structuredContent: { board: ["X", "", "", "", "", "", "", "", ""] },
+        },
+      },
+    ];
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    act(() => {
+      result.current.sendMessage({
+        text: "hello",
+        widgetModelContext,
+      });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toHaveLength(1);
+    });
+
+    expect(getTransportRequests().at(-1)).toMatchObject({
+      widgetModelContext,
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello again" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toHaveLength(2);
+    });
+
+    expect(getTransportRequests().at(-1)).not.toHaveProperty(
+      "widgetModelContext"
+    );
+  });
+
+  it("opens the mcpjam-limit dialog for non-hosted chat-v2 limit responses", async () => {
+    mockWindowFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "user_rate_limit",
+          error:
+            "Daily MCPJam model limit reached. Use BYOK or try again tomorrow.",
+          isRetryable: true,
+          retryAfter: 86400000,
+          details: "Try again in 1440 minutes.",
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    );
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(0);
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(true);
+    });
+    expect(mockAuthFetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the mcpjam-limit dialog for chat-v2 stream limit errors", async () => {
+    renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockUseChatErrorHandlers.length).toBeGreaterThan(0);
+    });
+
+    act(() => {
+      mockUseChatErrorHandlers.at(-1)?.(
+        new Error(
+          "Daily MCPJam model limit reached. Use BYOK or try again tomorrow."
+        )
+      );
+    });
+
+    expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(true);
+  });
+
+  describe("a chat-v2 stream error after a declined card", () => {
+    const DECLINE =
+      "Your card was declined, so auto-reload is paused and this organization is out of MCPJam credits.";
+
+    async function failStream(message: string) {
+      renderHook(() =>
+        useChatSession({
+          selectedServers: ["server-1"],
+          minimalMode: true,
+          executionConfig: { systemPrompt: "Prompt" },
+        })
+      );
+      await waitFor(() => {
+        expect(mockUseChatErrorHandlers.length).toBeGreaterThan(0);
+      });
+      act(() => {
+        mockUseChatErrorHandlers.at(-1)?.(new Error(message));
+      });
+    }
+
+    it("leaves the dialog shut when the banner names the card", async () => {
+      await failStream(DECLINE);
+      expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(false);
+    });
+
+    it("opens the dialog when the error only quotes a decline", async () => {
+      await failStream(
+        `Provider request failed after an earlier refusal: ${DECLINE}`
+      );
+      expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(true);
+    });
+  });
+
+  describe("a chat turn refused for an unapproved stdio command", () => {
+    // The chat route's 403 body, as the transport hands it to onError.
+    const refusedTurn = () =>
+      new Error(
+        JSON.stringify({
+          code: "STDIO_COMMAND_APPROVAL_REQUIRED",
+          message: "needs approval",
+          details: {
+            reason: STDIO_COMMAND_APPROVAL_REQUIRED_REASON,
+            serverId: "srv-1",
+            serverName: "Files",
+            approval: {
+              serverId: "srv-1",
+              fingerprint: "ab".repeat(32),
+              command: "node",
+              args: ["server.js"],
+              envNames: [],
+              previouslyApproved: false,
+            },
+          },
+        }),
+      );
+
+    async function failTurn(
+      error: Error,
+      hostedContext?: { projectId: string; selectedServerIds: string[] },
+    ) {
+      renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          minimalMode: true,
+          executionConfig: { systemPrompt: "Prompt" },
+          ...(hostedContext ? { hostedContext } : {}),
+        }),
+      );
+      await waitFor(() => {
+        expect(mockUseChatErrorHandlers.length).toBeGreaterThan(0);
+      });
+      act(() => {
+        mockUseChatErrorHandlers.at(-1)?.(error);
+      });
+    }
+
+    beforeEach(() => {
+      useStdioCommandApprovalStore.setState({ queue: [] });
+    });
+
+    afterEach(() => {
+      useStdioCommandApprovalStore.getState().settle(false);
+    });
+
+    it("asks for the refused command in the chat's project", async () => {
+      await failTurn(refusedTurn(), {
+        projectId: "project-1",
+        selectedServerIds: [],
+      });
+      await waitFor(() => {
+        expect(useStdioCommandApprovalStore.getState().queue).toHaveLength(1);
+      });
+      expect(useStdioCommandApprovalStore.getState().queue[0]).toMatchObject({
+        projectId: "project-1",
+        serverName: "Files",
+      });
+    });
+
+    it("does not ask for any other failure", async () => {
+      await failTurn(new Error("Model provider timed out"), {
+        projectId: "project-1",
+        selectedServerIds: [],
+      });
+      await Promise.resolve();
+      expect(useStdioCommandApprovalStore.getState().queue).toEqual([]);
+    });
+
+    it("does not ask without a project to approve it in", async () => {
+      await failTurn(refusedTurn());
+      await Promise.resolve();
+      expect(useStdioCommandApprovalStore.getState().queue).toEqual([]);
+    });
+  });
+
+  it("opens the topup variant for signed-in user_rate_limit responses", async () => {
+    useMCPJamLimitDialogStore.setState({
+      authStatus: "signedIn",
+      hasPendingLimit: false,
+      outOfCreditsHit: false,
+      outOfCreditsOrganizationId: null,
+      isOpen: false,
+      intent: null,
+      organizationId: null,
+      pendingInput: null,
+    });
+    mockWindowFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "user_rate_limit",
+          error: "Daily credit limit reached.",
+          limitKind: "total",
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    );
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(0);
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(useMCPJamLimitDialogStore.getState().intent).toBe("topup");
+    });
+    expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(true);
+  });
+
+  it("does not open the modal for signed-in concurrency-throttle responses", async () => {
+    useMCPJamLimitDialogStore.setState({
+      authStatus: "signedIn",
+      hasPendingLimit: false,
+      outOfCreditsHit: false,
+      outOfCreditsOrganizationId: null,
+      isOpen: false,
+      intent: null,
+      organizationId: null,
+      pendingInput: null,
+    });
+    mockWindowFetch.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "user_rate_limit",
+          error: "Another credit-funded chat is finishing.",
+          limitKind: "concurrency",
+        }),
+        {
+          status: 429,
+          headers: { "Content-Type": "application/json" },
+        }
+      )
+    );
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(0);
+    });
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    // Give the error path a chance to run.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(useMCPJamLimitDialogStore.getState().isOpen).toBe(false);
+    expect(useMCPJamLimitDialogStore.getState().intent).toBeNull();
+  });
+
+  it("leaves all MCPJam models enabled on the unauthenticated non-hosted path (guests un-gated)", async () => {
+    mockModelState.availableModels = [
+      baseModel,
+      gatedMcpJamModel,
+      mcpJamModel,
+      guestAllowedMcpJamModel,
+    ];
+    mockModelState.selectedModelId = mcpJamModel.id;
+
+    mockConvexAuth.isAuthenticated = false;
+    mockGetAccessToken.mockResolvedValue(null);
+    const selectedServers = ["server-1"];
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers,
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+
+    const latestTransport = mockTransportInstances.at(-1)!;
+    expect(latestTransport.options.api).toBe("/api/mcp/chat-v2");
+    expect(
+      await resolveConfig(latestTransport.options.headers)
+    ).toBeUndefined();
+    expect(result.current.disableForAuthentication).toBe(false);
+    expect(result.current.availableModels.map((model) => model.id)).toEqual([
+      "gpt-4",
+      "openai/gpt-5.4-pro",
+      "openai/gpt-5-mini",
+      "anthropic/claude-haiku-4.5",
+    ]);
+    // Guests un-gated: no MCPJam model carries the "Sign in" lock anymore.
+    for (const model of result.current.availableModels) {
+      expect(model.disabled).toBeUndefined();
+    }
+    expect(result.current.selectedModel.id).toBe("openai/gpt-5-mini");
+    expect(mockAuthFetch).not.toHaveBeenCalled();
+  });
+
+  // A caller that pins a model through `executionConfig.modelId` gets it
+  // resolved against the list THIS hook builds. An org-key model is only in
+  // that list when the org config is passed in; otherwise the pinned id is
+  // missing, `createLockedInitialModel` guesses the provider from the bare id
+  // as `ollama`, and that is what the server then asks the org to resolve.
+  it("resolves a pinned org-key model only when the org config is forwarded", async () => {
+    const orgConfig = {
+      providers: [
+        {
+          providerKey: "anthropic",
+          enabled: true,
+          hasSecret: true,
+        },
+      ],
+    };
+    const pinned = {
+      selectedServers: [] as string[],
+      executionConfig: { modelId: orgAnthropicModel.id },
+      hostedContext: { projectId: "project-1", selectedServerIds: [] },
+    };
+
+    const { result: withoutConfig } = renderHook(() =>
+      useChatSession(pinned)
+    );
+    expect(withoutConfig.current.selectedModel).toMatchObject({
+      id: orgAnthropicModel.id,
+      provider: "ollama",
+      disabled: true,
+    });
+
+    const { result: withConfig } = renderHook(() =>
+      useChatSession({ ...pinned, hostedOrgModelConfig: orgConfig })
+    );
+    expect(withConfig.current.selectedModel).toEqual(orgAnthropicModel);
+    expect(withConfig.current.selectedModel.provider).toBe("anthropic");
+  });
+
+  it("uses org config and the local MCP route for BYOK in non-hosted local dev", async () => {
+    mockModelState.selectedModelId = orgAnthropicModel.id;
+    mockGetAccessToken.mockResolvedValue(null);
+    mockSharedAppState.servers = {
+      "server-1": {
+        config: { url: "https://mcp.example.com/sse" },
+      },
+    };
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        hostedOrgModelConfig: {
+          providers: [
+            {
+              id: "connection-anthropic",
+              providerKey: "anthropic",
+              enabled: true,
+              hasSecret: true,
+            },
+          ],
+        },
+        hostedContext: {
+          projectId: "project-1",
+          selectedServerIds: ["server-id-1"],
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+
+    expect(result.current.availableModels.map((model) => model.id)).toEqual([
+      mcpJamModel.id,
+      orgAnthropicModel.id,
+    ]);
+    expect(result.current.selectedModel.id).toBe(orgAnthropicModel.id);
+
+    await act(async () => {
+      await result.current.sendMessage({ text: "hello" });
+    });
+
+    // The local route, by server NAME: the tool result then names its server
+    // the way the widget endpoints look it up (they'd reject a Convex id with
+    // "Unknown MCP server"). The ids still ride along for hostConfig.
+    const transport = getUsedTransport();
+    expect(transport.options.api).toBe("/api/mcp/chat-v2");
+    expect(transport.requests[0]).toMatchObject({
+      model: orgAnthropicModel,
+      projectId: "project-1",
+      selectedServerNames: ["server-1"],
+      selectedServerIds: ["server-id-1"],
+    });
+    expect(transport.requests[0]).not.toHaveProperty("apiKey");
+    // A remote server needs no local runtime: the route resolves the org
+    // connection as usual (the key stays in Convex).
+    expect(transport.requests[0]).not.toHaveProperty("localMcpRuntimeRequired");
+    expect(transport.requests[0]).toHaveProperty("accessScope", "chat_v2");
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/mcp/chat-v2",
+      expect.objectContaining({ method: "POST" })
+    );
+    const requestInit = mockAuthFetch.mock.calls.at(-1)?.[1] as RequestInit;
+    expect(new Headers(requestInit.headers).has("Authorization")).toBe(false);
+  });
+
+  it("holds managed local sends until selected server IDs resolve", async () => {
+    mockModelState.selectedModelId = orgAnthropicModel.id;
+    mockGetAccessToken.mockResolvedValue(null);
+    mockSharedAppState.servers = {
+      "server-1": {
+        config: { url: "https://mcp.example.com/sse" },
+      },
+    };
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        hostedOrgModelConfig: {
+          providers: [
+            { providerKey: "anthropic", enabled: true, hasSecret: true },
+          ],
+        },
+        // The project resolved, the server's Convex id did not (and there is
+        // no send-time resolver).
+        hostedContext: { projectId: "project-1", selectedServerIds: [] },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+    expect(result.current.submitBlocked).toBe(true);
+    let sent: boolean | undefined;
+    await act(async () => { sent = await result.current.sendMessage({ text: "hello" }); });
+    expect(sent).toBe(false);
+    expect(mockTransportInstances.every((transport) => transport.requests.length === 0)).toBe(true);
+  });
+
+  it("uses the local MCP route for org BYOK when a selected server is local-only", async () => {
+    const ensureServerIds = vi.fn(async () => [
+      { serverId: "hosted-server-id" },
+    ]);
+    mockModelState.selectedModelId = orgAnthropicModel.id;
+    mockGetAccessToken.mockResolvedValue(null);
+    mockSharedAppState.servers = {
+      "server-1": {
+        config: { command: "npx", args: ["local-mcp-server"] },
+      },
+    };
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        hostedOrgModelConfig: {
+          providers: [
+            {
+              providerKey: "anthropic",
+              enabled: true,
+              hasSecret: true,
+            },
+          ],
+        },
+        hostedContext: {
+          projectId: "project-1",
+          selectedServerIds: [],
+          ensureServerIds,
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+
+    expect(result.current.selectedModel.id).toBe(orgAnthropicModel.id);
+
+    await act(async () => {
+      await result.current.sendMessage({ text: "hello" });
+    });
+
+    const transport = getUsedTransport();
+    expect(transport.options.api).toBe("/api/mcp/chat-v2");
+    expect(transport.requests[0]).toMatchObject({
+      model: orgAnthropicModel,
+      projectId: "project-1",
+      selectedServerNames: ["server-1"],
+      selectedServerIds: ["hosted-server-id"],
+      localMcpRuntimeRequired: true,
+    });
+    expect(transport.requests[0]).not.toHaveProperty("apiKey");
+    expect(transport.requests[0].selectedServerIds).toEqual(["hosted-server-id"]);
+    expect(mockAuthFetch).toHaveBeenCalledWith(
+      "/api/mcp/chat-v2",
+      expect.objectContaining({ method: "POST" })
+    );
+    expect(ensureServerIds).toHaveBeenCalledWith(["server-1"]);
+  });
+
+  it("fails closed to the local MCP route when a selected server's config is unresolved", async () => {
+    mockModelState.selectedModelId = orgAnthropicModel.id;
+    mockGetAccessToken.mockResolvedValue(null);
+    // "server-1" is selected but absent from app state (not yet loaded / name
+    // mismatch). Routing to the cloud here would reproduce the "STDIO servers
+    // are not supported" failure if it turns out to be a stdio server.
+    mockSharedAppState.servers = {};
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        hostedOrgModelConfig: {
+          providers: [
+            {
+              providerKey: "anthropic",
+              enabled: true,
+              hasSecret: true,
+            },
+          ],
+        },
+        hostedContext: {
+          projectId: "project-1",
+          selectedServerIds: [],
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+
+    await act(async () => {
+      await result.current.sendMessage({ text: "hello" });
+    });
+
+    expect(mockTransportInstances.every((transport) => transport.requests.length === 0)).toBe(true);
+  });
+
+  it("falls back to local provider keys when non-hosted org config is empty", async () => {
+    mockModelState.availableModels = [baseModel];
+    mockModelState.selectedModelId = baseModel.id;
+    mockGetToken.mockReturnValue("sk-local");
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        hostedOrgModelConfig: { providers: [] },
+        hostedContext: {
+          projectId: "project-1",
+          selectedServerIds: ["server-id-1"],
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.isAuthReady).toBe(true);
+    });
+
+    await act(async () => {
+      await result.current.sendMessage({ text: "hello" });
+    });
+
+    const transport = getUsedTransport();
+    expect(transport.options.api).toBe("/api/mcp/chat-v2");
+    expect(transport.requests[0]).toMatchObject({
+      model: baseModel,
+      apiKey: "sk-local",
+      projectId: "project-1",
+      selectedServerIds: ["server-id-1"],
+    });
+  });
+
+  it("keeps an initialModelId authoritative (now guest-allowed, no lock or auth gate)", async () => {
+    mockModelState.availableModels = [
+      baseModel,
+      gatedMcpJamModel,
+      mcpJamModel,
+      guestAllowedMcpJamModel,
+    ];
+    mockModelState.selectedModelId = mcpJamModel.id;
+    mockConvexAuth.isAuthenticated = false;
+    mockGetAccessToken.mockResolvedValue(null);
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+          modelId: gatedMcpJamModel.id,
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedModel.id).toBe("openai/gpt-5.4-pro");
+    });
+
+    // The pinned model resolves from availableModels and is no longer locked;
+    // being guest-allowed, it needs no sign-in on the non-hosted path.
+    expect(result.current.selectedModel.disabled).toBeUndefined();
+    expect(result.current.isAuthReady).toBe(true);
+    expect(result.current.disableForAuthentication).toBe(false);
+  });
+
+  it("creates a locked placeholder when initialModelId is missing from availableModels", async () => {
+    mockModelState.availableModels = [
+      baseModel,
+      mcpJamModel,
+      guestAllowedMcpJamModel,
+    ];
+    mockModelState.selectedModelId = mcpJamModel.id;
+    mockConvexAuth.isAuthenticated = false;
+    mockGetAccessToken.mockResolvedValue(null);
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+          modelId: gatedMcpJamModel.id,
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedModel.id).toBe("openai/gpt-5.4-pro");
+    });
+
+    // A pinned model absent from availableModels still resolves to a
+    // placeholder so the id is honored; but as a guest-allowed model it no
+    // longer gates the chat behind sign-in.
+    expect(result.current.selectedModel).toMatchObject({
+      id: "openai/gpt-5.4-pro",
+      name: "openai/gpt-5.4-pro",
+      provider: "openai",
+    });
+    expect(result.current.isAuthReady).toBe(true);
+    expect(result.current.disableForAuthentication).toBe(false);
+  });
+
+  /**
+   * A RUNTIME-CHOSEN SENTINEL is locked for a different reason than everything
+   * else the placeholder builder produces, and the copy has to say so.
+   *
+   * `cursor/auto` is never in `availableModels` — it is not a selectable entry
+   * — so a Cursor host's pinned model ALWAYS lands on this fallback. Rendering
+   * it the ordinary way got both halves wrong at once: the label showed a raw
+   * id naming a model nothing ran, under a sign-in wall that signing in would
+   * not lift.
+   */
+  it("renders a runtime-chosen sentinel as its display name, locked for the real reason", async () => {
+    mockModelState.availableModels = [baseModel, mcpJamModel];
+    mockModelState.selectedModelId = mcpJamModel.id;
+    mockConvexAuth.isAuthenticated = false;
+    mockGetAccessToken.mockResolvedValue(null);
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: { systemPrompt: "Prompt", modelId: "cursor/auto" },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedModel.id).toBe("cursor/auto");
+    });
+
+    expect(result.current.selectedModel).toMatchObject({
+      // The id is NEVER rewritten — it is what the trace and eval metadata
+      // record, and the point of the sentinel is that the model is unknown.
+      id: "cursor/auto",
+      name: "Cursor Auto",
+      disabled: true,
+      disabledReason:
+        "This host's runtime chooses its own model on your own account.",
+    });
+  });
+
+  it("keeps the ordinary sign-in copy for a non-sentinel locked model", async () => {
+    // The control: the sentinel branch is an exception, not a replacement. An
+    // ordinary pinned id absent from `availableModels` still gets the raw id as
+    // its label and the guest sign-in reason.
+    mockModelState.availableModels = [baseModel, mcpJamModel];
+    mockModelState.selectedModelId = mcpJamModel.id;
+    mockConvexAuth.isAuthenticated = false;
+    mockGetAccessToken.mockResolvedValue(null);
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: {
+          systemPrompt: "Prompt",
+          modelId: "anthropic/claude-sonnet-4.5",
+        },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedModel.id).toBe(
+        "anthropic/claude-sonnet-4.5"
+      );
+    });
+
+    expect(result.current.selectedModel).toMatchObject({
+      name: "anthropic/claude-sonnet-4.5",
+      disabled: true,
+      disabledReason: GUEST_LOCKED_MODEL_REASON,
+    });
+  });
+
+  // BACK2-628. `setSelectedModel` already refuses to write when a surface
+  // pins its model; `setSelectedModelIds` writes the same global lead key
+  // (via `saveSelectedModelId`) and used not to. The sanitize effect in
+  // ChatTabV2 calls it on mount, so opening a hosted scenario / share link
+  // overwrote the model the user had selected in their own chats. The
+  // `isSelectedModelResolved` gate cannot catch this route — it short-circuits
+  // to true whenever `initialModelId` is set.
+  it("does not persist the model selection from a surface with a pinned model", async () => {
+    mockModelState.availableModels = [baseModel, gatedMcpJamModel];
+    mockModelState.selectedModelId = baseModel.id;
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+        executionConfig: { modelId: gatedMcpJamModel.id },
+      })
+    );
+
+    await waitFor(() => {
+      expect(result.current.selectedModel.id).toBe(gatedMcpJamModel.id);
+    });
+
+    act(() => {
+      result.current.setSelectedModelIds([gatedMcpJamModel.id]);
+    });
+
+    expect(mockPersistSelectedModelIds).not.toHaveBeenCalled();
+    // The pin still governs what this surface runs — only the write-back to
+    // shared storage is suppressed.
+    expect(result.current.selectedModel.id).toBe(gatedMcpJamModel.id);
+  });
+
+  it("persists the model selection when no model is pinned", async () => {
+    mockModelState.availableModels = [baseModel, gatedMcpJamModel];
+    mockModelState.selectedModelId = baseModel.id;
+
+    const { result } = renderHook(() =>
+      useChatSession({
+        selectedServers: ["server-1"],
+        minimalMode: true,
+      })
+    );
+
+    act(() => {
+      result.current.setSelectedModelIds([gatedMcpJamModel.id]);
+    });
+
+    expect(mockPersistSelectedModelIds).toHaveBeenCalledWith([
+      gatedMcpJamModel.id,
+    ]);
+  });
+
+  it("uses the latest selectedServers on the next non-hosted send without changing chatSessionId", async () => {
+    const { result, rerender } = renderHook(
+      ({ selectedServers }: { selectedServers: string[] }) =>
+        useChatSession({
+          selectedServers,
+          minimalMode: true,
+          executionConfig: {
+            systemPrompt: "Prompt",
+          },
+        }),
+      {
+        initialProps: {
+          selectedServers: ["server-1"],
+        },
+      }
+    );
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(0);
+    });
+
+    const initialChatSessionId = result.current.chatSessionId;
+
+    act(() => {
+      result.current.sendMessage({ text: "hello" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toHaveLength(1);
+    });
+
+    expect(getTransportRequests().at(-1)).toMatchObject({
+      selectedServers: ["server-1"],
+      chatSessionId: initialChatSessionId,
+    });
+
+    rerender({
+      selectedServers: ["server-2"],
+    });
+
+    await waitFor(() => {
+      expect(mockTransportInstances.length).toBeGreaterThan(1);
+    });
+
+    expect(result.current.chatSessionId).toBe(initialChatSessionId);
+    const requestsBeforeSecondSend = getTransportRequests().length;
+
+    act(() => {
+      result.current.sendMessage({ text: "hello again" });
+    });
+
+    await waitFor(() => {
+      expect(getTransportRequests()).toHaveLength(requestsBeforeSecondSend + 1);
+    });
+
+    expect(getTransportRequests().at(-1)).toMatchObject({
+      selectedServers: ["server-2"],
+      chatSessionId: initialChatSessionId,
+    });
+  });
+  describe("reasoning effort", () => {
+    const effortModel = {
+      ...mcpJamModel,
+      hosted: true,
+      supportedReasoningEfforts: ["low", "high"],
+    };
+
+    beforeEach(() => {
+      window.localStorage.clear();
+      mockModelState.availableModels = [effortModel];
+      mockModelState.selectedModelId = String(effortModel.id);
+    });
+
+    it("sends a picked effort as a top-level field and omits temperature", async () => {
+      const { result } = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      expect(result.current.reasoningEffortLevels).toEqual(["low", "high"]);
+
+      act(() => {
+        result.current.setReasoningEffort("high");
+      });
+      expect(result.current.reasoningEffort).toBe("high");
+
+      act(() => {
+        result.current.sendMessage({ text: "hi" });
+      });
+      await waitFor(() => {
+        expect(getTransportRequests().length).toBeGreaterThan(0);
+      });
+      const body = getTransportRequests().at(-1);
+      expect(body.reasoningEffort).toBe("high");
+      expect(body).not.toHaveProperty("temperature");
+    });
+
+    it("a compare card sends its own fixed effort, not the remembered pick", async () => {
+      window.localStorage.setItem(
+        "mcp-inspector-reasoning-efforts",
+        JSON.stringify({ [`hosted:${String(effortModel.id)}`]: "high" })
+      );
+      const low = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          executionConfig: { modelId: String(effortModel.id) },
+          pinnedModelProvider: String(effortModel.provider),
+          reasoningEffortEnabled: true,
+          fixedReasoningEffort: "low",
+        })
+      );
+      expect(low.result.current.reasoningEffort).toBe("low");
+      act(() => {
+        low.result.current.sendMessage({ text: "hi" });
+      });
+      await waitFor(() => {
+        expect(getTransportRequests().length).toBeGreaterThan(0);
+      });
+      expect(getTransportRequests().at(-1).reasoningEffort).toBe("low");
+
+      // Default (`null`) sends nothing even though "high" is remembered.
+      const defaultCard = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          executionConfig: { modelId: String(effortModel.id) },
+          reasoningEffortEnabled: true,
+          fixedReasoningEffort: null,
+        })
+      );
+      expect(defaultCard.result.current.reasoningEffort).toBeUndefined();
+    });
+
+    it("sends temperature and no effort when none is set", async () => {
+      const { result } = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      act(() => {
+        result.current.sendMessage({ text: "hi" });
+      });
+      await waitFor(() => {
+        expect(getTransportRequests().length).toBeGreaterThan(0);
+      });
+      const body = getTransportRequests().at(-1);
+      expect(body).not.toHaveProperty("reasoningEffort");
+      expect(body.temperature).toBe(0.7);
+    });
+
+    it("remembers the pick per model and restores it on a new session", () => {
+      const first = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      act(() => {
+        first.result.current.setReasoningEffort("low");
+      });
+      first.unmount();
+
+      const second = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      expect(second.result.current.reasoningEffort).toBe("low");
+    });
+
+    it("never reports an effort the model does not offer, or when disabled", () => {
+      window.localStorage.setItem(
+        "mcp-inspector-reasoning-efforts",
+        JSON.stringify({ "hosted:openai/gpt-5-mini": "max" })
+      );
+      const supported = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      expect(supported.result.current.reasoningEffort).toBeUndefined();
+
+      const off = renderHook(() => useChatSession({ selectedServers: [] }));
+      expect(off.result.current.reasoningEffortLevels).toEqual([]);
+      expect(off.result.current.reasoningEffort).toBeUndefined();
+    });
+
+    it("seeds a restored session's pinned effort for its model, not the current pick", async () => {
+      const restoredModel = {
+        ...effortModel,
+        id: "openai/gpt-5-restored",
+        name: "Restored",
+      };
+      const { result } = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      act(() => {
+        void result.current.loadChatSession(
+          {
+            chatSessionId: "pinned-session",
+            messagesBlobUrl: null,
+            resumeConfig: { reasoningEffort: "high" },
+            version: 1,
+          },
+          { restoredModel: restoredModel as any }
+        );
+      });
+      await waitFor(() => {
+        expect(result.current.chatSessionId).toBe("pinned-session");
+      });
+      // The picker is still on `effortModel`: the pin is not seeded onto it.
+      expect(result.current.reasoningEffort).toBeUndefined();
+    });
+
+    it("a reopened chat with no saved effort ignores the remembered pick", async () => {
+      const { result } = renderHook(() =>
+        useChatSession({ selectedServers: [], reasoningEffortEnabled: true })
+      );
+      act(() => {
+        result.current.setReasoningEffort("low");
+      });
+      expect(result.current.reasoningEffort).toBe("low");
+      act(() => {
+        void result.current.loadChatSession(
+          {
+            chatSessionId: "unpinned-session",
+            messagesBlobUrl: null,
+            resumeConfig: {},
+            version: 1,
+          },
+          { restoredModel: effortModel as any }
+        );
+      });
+      await waitFor(() => {
+        expect(result.current.chatSessionId).toBe("unpinned-session");
+      });
+      expect(result.current.reasoningEffort).toBeUndefined();
+    });
+
+    it("a restored chat's effort does not leak into the next new chat", async () => {
+      const { result } = renderHook(() =>
+        useChatSession({ selectedServers: [], reasoningEffortEnabled: true })
+      );
+      act(() => {
+        result.current.setReasoningEffort("low");
+      });
+      act(() => {
+        void result.current.loadChatSession(
+          {
+            chatSessionId: "pinned-high",
+            messagesBlobUrl: null,
+            resumeConfig: { reasoningEffort: "high" },
+            version: 1,
+          },
+          { restoredModel: effortModel as any }
+        );
+      });
+      await waitFor(() => {
+        expect(result.current.reasoningEffort).toBe("high");
+      });
+      act(() => {
+        result.current.resetChat();
+      });
+      expect(result.current.reasoningEffort).toBe("low");
+    });
+
+    it("seeds a host default without remembering it", () => {
+      const { result } = renderHook(() =>
+        useChatSession({
+          selectedServers: [],
+          reasoningEffortEnabled: true,
+        })
+      );
+      act(() => {
+        result.current.seedReasoningEffort(effortModel as any, "high");
+      });
+      expect(result.current.reasoningEffort).toBe("high");
+      expect(window.localStorage.getItem("mcp-inspector-reasoning-efforts")).toBeNull();
+    });
+  });
+});

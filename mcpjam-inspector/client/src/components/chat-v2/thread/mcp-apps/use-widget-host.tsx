@@ -1,0 +1,525 @@
+// Tier B — `useWidgetHost`, the inspector-side adapter for the `WidgetHost`
+// dependency-inversion contract (see ./widget-host.ts). It reads the ambient
+// stores/contexts the widget renderer used to reach into directly and exposes
+// them as `environment` (raw ENV inputs), `resolvers` (bound config/style fns),
+// `services`, `surface`, and `debug`.
+//
+// It is a COMPOSITE HOOK, not a context provider: the renderer is always already
+// mounted inside whatever provider hierarchy its surface needs (chat /
+// playground / scenario / trace), so calling the same hooks the renderer calls
+// works on every surface with zero new mount points.
+//
+// This module — the boundary adapter — is allowed to import @/stores, @/contexts
+// and the api/config layer; `mcp-apps-renderer.tsx` is not (enforced by
+// check-renderer-tier-b-imports.mjs). Phase 1b routes the renderer's ambient
+// reads through `environment`/`resolvers` while keeping its derivation in place;
+// pre-resolving them into `WidgetHost.resolveEnvironment` is the Phase-3 target.
+
+import { useCallback, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { toast } from "sonner";
+import { ClientCspToastGroup } from "@/lib/client-csp-toast";
+import {
+  HOSTED_MODE,
+  SANDBOX_ORIGIN,
+  VIEW_MOUNT_MODE,
+  VIEW_SUBDOMAINS_ENABLED,
+} from "@/lib/config";
+import { authFetch } from "@/lib/session-token";
+import { artifactStableKey, fetchArtifact } from "@/lib/artifact-urls";
+import { useIsScenarioSurface } from "@/contexts/scenario-surface-context";
+import { useWebManagedServers } from "@/contexts/web-managed-servers-context";
+import { useWidgetSurface } from "@/contexts/widget-surface-context";
+import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
+import {
+  useScenarioHostStyle,
+  useScenarioHostTheme,
+} from "@/contexts/scenario-client-style-context";
+import { useScenarioHostCapabilitiesOverride } from "@/contexts/scenario-client-capabilities-override-context";
+import { useActiveMcpProfile } from "@/contexts/active-mcp-profile-context";
+import { useSavedClient, useEffectiveHostContext } from "@/contexts/saved-client-context";
+import { useUIPlaygroundStore } from "@/stores/ui-playground-store";
+import { useTrafficLogStore } from "@/stores/traffic-log-store";
+import { useWidgetDebugStore } from "@/stores/widget-debug-store";
+import type { CspViolation } from "@/stores/widget-debug-store";
+import { compareCspPolicies } from "../csp-workbench/csp-header";
+import {
+  CspViolationTelemetryLimiter,
+  reportCspViolationToSentry,
+  intentionalClientCspBlocks,
+} from "@/lib/csp-violation-telemetry";
+import {
+  resolveEffectiveCompatRuntime,
+  resolveEffectiveHostCapabilities,
+  resolveEffectiveMcpAppsCapabilities,
+  resolveHostInfo,
+} from "@/lib/client-config-v2";
+import { DEFAULT_HOST_STYLE, getHostStyleOrDefault } from "@/lib/client-styles";
+import {
+  clampDisplayModeToAvailableModes,
+  extractHostDisplayMode,
+  extractHostDisplayModes,
+  extractHostTheme,
+  extractHostLocale,
+  extractHostTimeZone,
+  extractHostDeviceCapabilities,
+  extractHostSafeAreaInsets,
+  stableStringifyJson,
+} from "@/lib/client-config";
+import { listResources, readResource } from "@/lib/apis/mcp-resources-api";
+import { listPrompts } from "@/lib/apis/mcp-prompts-api";
+import { listResourceTemplates } from "@/lib/apis/mcp-resource-templates-api";
+import { fetchMcpAppsWidgetContent } from "./fetch-widget-content";
+import { createSandboxViewServices } from "./sandbox-view-services";
+import { CheckoutDialogV2 } from "./checkout-dialog-v2";
+import type { CheckoutSession } from "@/shared/acp-types";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+} from "@mcpjam/design-system/dialog";
+import {
+  WidgetHostProvider,
+  usePersistentWidgetSurfaceHost,
+} from "@mcpjam/widget-react";
+import type {
+  WidgetHost,
+  WidgetHostEnvironmentInputs,
+  WidgetHostResolvers,
+  WidgetHostServices,
+  WidgetHostComponents,
+  WidgetModalProps,
+  WidgetCheckoutProps,
+  WidgetSurfaceInfo,
+  WidgetDebugSink,
+  WidgetSurfaceKind,
+} from "@mcpjam/widget-react";
+
+// --- Injected chrome adapters ------------------------------------------------
+//
+// The package owns the widget lifecycle + bridge but not the inspector's UI; it
+// asks for modal + checkout chrome through `components.{Modal,Checkout}`. These
+// adapters bridge the package's structural props to the inspector's
+// design-system <Dialog> and <CheckoutDialogV2>.
+
+/** WidgetModalProps → the inspector design-system <Dialog> (widget-modal sizing). */
+function WidgetModalChrome({
+  open,
+  onClose,
+  title,
+  children,
+}: WidgetModalProps) {
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(next) => {
+        if (!next) onClose();
+      }}
+    >
+      <DialogContent className="w-fit max-w-[90vw] h-fit max-h-[70vh] flex flex-col">
+        <DialogHeader>
+          <DialogTitle>{title}</DialogTitle>
+        </DialogHeader>
+        {children}
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+/**
+ * WidgetCheckoutProps → the inspector <CheckoutDialogV2>. The package hands the
+ * checkout session opaquely (`unknown`); narrow it to the inspector's ACP
+ * `CheckoutSession` here.
+ */
+function WidgetCheckoutChrome({ session, ...rest }: WidgetCheckoutProps) {
+  return <CheckoutDialogV2 session={session as CheckoutSession} {...rest} />;
+}
+
+// Stable module-level identity so it never invalidates a renderer memo/dep.
+const WIDGET_HOST_COMPONENTS: WidgetHostComponents = {
+  Modal: WidgetModalChrome,
+  Checkout: WidgetCheckoutChrome,
+};
+
+/** The slices of `WidgetHost` implemented in this adapter. */
+type WidgetHostImpl = Required<
+  Pick<
+    WidgetHost,
+    | "environment"
+    | "resolvers"
+    | "services"
+    | "surface"
+    | "debug"
+    | "components"
+  >
+>;
+
+export function useWidgetHost(): WidgetHostImpl {
+  // --- surface inputs --------------------------------------------------------
+  const isScenarioSurface = useIsScenarioSurface();
+  const widgetSurface = useWidgetSurface();
+  const webManagedServers = useWebManagedServers();
+  // Mirrored into the surface bundle for completeness, but the
+  // `MCPAppsRenderer` wrapper still reads `usePersistentWidgetSurfaceHost()`
+  // directly — it gates persistent-vs-ephemeral routing *before*
+  // `MCPAppsRendererSurface` (the `useWidgetHost()` caller) mounts. Fully
+  // centralizing this read is intentionally deferred to the renderer-relocation
+  // PR to avoid widening the wrapper's subscription set (it would then re-render
+  // on every host input). It's a relative-import context, so it does not block
+  // the Tier-B `@/stores`/`@/contexts` guard regardless.
+  const persistentSurfaceHost = usePersistentWidgetSurfaceHost();
+  const savedClient = useSavedClient();
+  const ambientCspMode = useUIPlaygroundStore((s) => s.mcpAppsCspMode);
+  const playgroundCspMode = savedClient
+    ? savedClient.mcpProfile?.apps?.sandbox?.csp?.mode === "declared" ? "widget-declared" : "permissive"
+    : ambientCspMode;
+
+  // `isScenarioSurface` / `widgetSurface` are read ONLY for the renderer's CSP
+  // mode derivation; collapsing them to one `kind` preserves it exactly
+  // (scenario wins over playground, see mcp-apps-renderer.tsx:741-746).
+  const kind: WidgetSurfaceKind = isScenarioSurface
+    ? "scenario"
+    : widgetSurface === "playground"
+    ? "playground"
+    : "chat";
+
+  // Read into a ref so the memoized `services` object stays stable while the
+  // listResourceTemplates routing still observes the live value (mirrors the
+  // renderer's existing webManagedServersRef pattern).
+  const webManagedServersRef = useRef(webManagedServers);
+  webManagedServersRef.current = webManagedServers;
+
+  const services = useMemo<WidgetHostServices>(
+    () => ({
+      ...createSandboxViewServices(() => webManagedServersRef.current),
+      fetchWidgetContent: fetchMcpAppsWidgetContent,
+      readResource,
+      listResources,
+      listPrompts,
+      listResourceTemplates: (serverId: string) =>
+        listResourceTemplates(serverId, { forceHosted: webManagedServersRef.current }),
+      authFetch,
+      // Cached widget HTML arrives as a short-lived artifact link; these let
+      // the renderer renew an expired one and ignore a re-minted one.
+      fetchArtifact: (url: string) => fetchArtifact(url),
+      artifactCacheKey: artifactStableKey,
+    }),
+    [],
+  );
+
+  const surface = useMemo<WidgetSurfaceInfo>(
+    () => ({
+      kind,
+      persistentSurfaceHost,
+      webManagedServers,
+      hostedMode: HOSTED_MODE,
+      sandboxOrigin: SANDBOX_ORIGIN ?? "",
+      viewMountMode: VIEW_MOUNT_MODE,
+      viewSubdomainsEnabled: VIEW_SUBDOMAINS_ENABLED,
+      playgroundCspMode,
+    }),
+    [kind, persistentSurfaceHost, webManagedServers, playgroundCspMode],
+  );
+
+  // --- environment inputs (Phase 1b raw ambient reads) -----------------------
+  //
+  // These are the exact fine-grained selectors / context hooks the renderer
+  // used to call inline. Subscribing here (rather than in the renderer)
+  // relocates the read site without changing reactivity — each selector still
+  // re-renders only on its own field's change. The renderer keeps ALL of its
+  // derivation (memos, ternaries, deps) and just reads `host.environment.*`.
+  const themeMode = usePreferencesStore((s) => s.themeMode);
+  const sharedHostStyle = usePreferencesStore((s) => s.hostStyle);
+  const scenarioHostStyle = useScenarioHostStyle();
+  const ambientHostTheme = useScenarioHostTheme();
+  const scenarioHostTheme = savedClient
+    ? extractHostTheme(savedClient.hostContext) ?? null
+    : ambientHostTheme;
+  const hostCapabilitiesOverride = useScenarioHostCapabilitiesOverride();
+  const activeMcpProfile = useActiveMcpProfile();
+  // The profile is bound into the resolvers below (3d-iii) — it no longer leaves
+  // the inspector as a typed object. Read into a ref so the resolver fns keep a
+  // stable identity (never invalidating a renderer memo) while still resolving
+  // against the live profile; the renderer recomputes via `environment.profileKey`.
+  const activeMcpProfileRef = useRef(activeMcpProfile);
+  activeMcpProfileRef.current = activeMcpProfile;
+  const draftHostContext = useEffectiveHostContext();
+  const isPlaygroundActive = useUIPlaygroundStore((s) => s.isPlaygroundActive);
+  const playgroundLocale = useUIPlaygroundStore((s) => s.globals.locale);
+  const playgroundTimeZone = useUIPlaygroundStore((s) => s.globals.timeZone);
+  const playgroundDisplayMode = useUIPlaygroundStore((s) => s.displayMode);
+  const playgroundCapabilities = useUIPlaygroundStore((s) => s.capabilities);
+  const playgroundSafeAreaInsets = useUIPlaygroundStore(
+    (s) => s.safeAreaInsets,
+  );
+  const playgroundDeviceType = useUIPlaygroundStore((s) => s.deviceType);
+
+  const environment = useMemo<WidgetHostEnvironmentInputs>(
+    () => ({
+      themeMode,
+      sharedHostStyle: savedClient?.hostStyle ?? sharedHostStyle,
+      scenarioHostStyle,
+      scenarioHostTheme,
+      hostCapabilitiesOverride,
+      // Profile is bound in `resolvers`; expose only the reactivity hash + the
+      // minimal projections the renderer inspects (no `HostConfigMcpProfileV1`).
+      profileKey: stableStringifyJson(activeMcpProfile ?? null),
+      profileSandbox: activeMcpProfile?.apps?.sandbox,
+      profileHostInfo: activeMcpProfile?.apps?.uiInitialize?.hostInfo,
+      draftHostContext,
+      isPlaygroundActive,
+      playgroundLocale: savedClient ? extractHostLocale(draftHostContext) : playgroundLocale,
+      playgroundTimeZone: savedClient ? extractHostTimeZone(draftHostContext) : playgroundTimeZone,
+      playgroundDisplayMode: savedClient ? extractHostDisplayMode(draftHostContext) ?? "inline" : playgroundDisplayMode,
+      playgroundCapabilities: savedClient ? extractHostDeviceCapabilities(draftHostContext) : playgroundCapabilities,
+      playgroundSafeAreaInsets: savedClient ? extractHostSafeAreaInsets(draftHostContext) : playgroundSafeAreaInsets,
+      playgroundDeviceType,
+    }),
+    [
+      themeMode,
+      sharedHostStyle,
+      scenarioHostStyle,
+      scenarioHostTheme,
+      hostCapabilitiesOverride,
+      activeMcpProfile,
+      savedClient,
+      draftHostContext,
+      isPlaygroundActive,
+      playgroundLocale,
+      playgroundTimeZone,
+      playgroundDisplayMode,
+      playgroundCapabilities,
+      playgroundSafeAreaInsets,
+      playgroundDeviceType,
+    ],
+  );
+
+  // --- resolvers (Phase 1b bound util/resolver fns) --------------------------
+  // Stable identity (frozen for the adapter's lifetime) so it never invalidates
+  // a renderer memo/dep. The profile-dependent resolvers BIND the active MCP
+  // profile here (read live via the ref) so `HostConfigMcpProfileV1` stays out
+  // of the public `WidgetHostResolvers` surface (3d-iii).
+  const resolvers = useMemo<WidgetHostResolvers>(
+    () => ({
+      resolveEffectiveCompatRuntime: ({ hostStyle }) =>
+        resolveEffectiveCompatRuntime({
+          profile: activeMcpProfileRef.current,
+          hostStyle,
+        }),
+      resolveEffectiveMcpAppsCapabilities: ({ hostStyle }) =>
+        resolveEffectiveMcpAppsCapabilities({
+          profile: activeMcpProfileRef.current,
+          hostStyle,
+        }),
+      resolveEffectiveHostCapabilities: ({
+        hostStyle,
+        hostCapabilitiesOverride,
+      }) =>
+        resolveEffectiveHostCapabilities({
+          hostStyle,
+          profile: activeMcpProfileRef.current,
+          hostCapabilitiesOverride,
+        }),
+      resolveHostInfo: () => resolveHostInfo(activeMcpProfileRef.current),
+      getHostStyleOrDefault,
+      DEFAULT_HOST_STYLE,
+      extractHostTheme,
+      extractHostDisplayMode,
+      extractHostDisplayModes,
+      clampDisplayModeToAvailableModes,
+      stableStringifyJson,
+    }),
+    [],
+  );
+
+  // --- debug sink (1:1 with the stores) --------------------------------------
+  const recordMount = useWidgetDebugStore((s) => s.recordMount);
+  const setWidgetDebugInfo = useWidgetDebugStore((s) => s.setWidgetDebugInfo);
+  const setWidgetState = useWidgetDebugStore((s) => s.setWidgetState);
+  const setWidgetGlobals = useWidgetDebugStore((s) => s.setWidgetGlobals);
+  const setWidgetCsp = useWidgetDebugStore((s) => s.setWidgetCsp);
+  const setWidgetAppliedCsp = useWidgetDebugStore((s) => s.setWidgetAppliedCsp);
+  const addCspViolation = useWidgetDebugStore((s) => s.addCspViolation);
+  const clearCspViolations = useWidgetDebugStore((s) => s.clearCspViolations);
+  const setWidgetModelContext = useWidgetDebugStore(
+    (s) => s.setWidgetModelContext,
+  );
+  const setWidgetHtml = useWidgetDebugStore((s) => s.setWidgetHtml);
+  const setSandboxApplied = useWidgetDebugStore((s) => s.setSandboxApplied);
+  const appendLifecycle = useWidgetDebugStore((s) => s.appendLifecycle);
+  const addTrafficLog = useTrafficLogStore((s) => s.addLog);
+  const cspTelemetryLimiterRef = useRef(new CspViolationTelemetryLimiter());
+  const cspToastGroupRef = useRef(
+    new ClientCspToastGroup(
+      (id, clientName, blocks) =>
+        toast.info(`This was blocked by ${clientName}’s CSP limits.`, {
+          id,
+          duration: 8000,
+          description: (
+            <ul>
+              {blocks.map((block) => (
+                <li key={block.capability}>
+                  {block.capability} is unsupported: {block.rule}.
+                </li>
+              ))}
+            </ul>
+          ),
+        }),
+      (id) => {
+        toast.dismiss(id);
+      },
+    ),
+  );
+  useEffect(() => {
+    const group = cspToastGroupRef.current;
+    return () => group.dispose();
+  }, []);
+  const recordAppliedCsp = useCallback<WidgetDebugSink["setWidgetAppliedCsp"]>(
+    (toolCallId, applied) => {
+      if (cspToastGroupRef.current.isStale(toolCallId, applied.mountId)) return;
+      cspToastGroupRef.current.activate(
+        toolCallId,
+        applied.mountId,
+        applied.intent?.clientContext?.surface,
+      );
+      setWidgetAppliedCsp(toolCallId, applied);
+    },
+    [setWidgetAppliedCsp],
+  );
+  const reportCspViolation = useCallback(
+    (toolCallId: string, serverId: string, violation: CspViolation) => {
+      const applied =
+        violation.mountId === undefined
+          ? undefined
+          : useWidgetDebugStore.getState().widgets.get(toolCallId)?.csp
+              ?.appliedPoliciesByMount?.[String(violation.mountId)];
+      if (
+        violation.mountId !== undefined &&
+        cspToastGroupRef.current.isStale(toolCallId, violation.mountId)
+      )
+        return;
+      const blocks = intentionalClientCspBlocks({
+        violation,
+        appliedPolicy: applied?.headerString,
+        intent: applied?.intent,
+      });
+      if (violation.mountId !== undefined && applied?.intent?.clientContext) {
+        cspToastGroupRef.current.report(
+          toolCallId,
+          violation.mountId,
+          applied.intent.clientContext.clientName,
+          blocks,
+        );
+      }
+      if (
+        !cspTelemetryLimiterRef.current.shouldReport(
+          toolCallId,
+          serverId,
+          violation,
+        )
+      )
+        return;
+      reportCspViolationToSentry({
+        toolCallId,
+        serverId,
+        violation,
+        appliedPolicy: applied?.headerString,
+        appliedMode: applied?.mode,
+        intent: applied?.intent,
+        comparison: compareCspPolicies(
+          applied?.headerString,
+          violation.originalPolicy,
+        ),
+      });
+    },
+    [],
+  );
+  const clearCspViolationsAndTelemetry = useCallback(
+    (toolCallId: string) => {
+      cspToastGroupRef.current.clearToolCall(toolCallId);
+      cspTelemetryLimiterRef.current.clearToolCall(toolCallId);
+      clearCspViolations(toolCallId);
+    },
+    [clearCspViolations],
+  );
+
+  const clearCspMount = useCallback(
+    (toolCallId: string, mountId: string | number) => {
+      cspToastGroupRef.current.clearMount(toolCallId, mountId);
+    },
+    [],
+  );
+
+  const debug = useMemo<WidgetDebugSink>(
+    () => ({
+      recordMount,
+      setWidgetDebugInfo,
+      setWidgetState,
+      setWidgetGlobals,
+      setWidgetCsp,
+      setWidgetAppliedCsp: recordAppliedCsp,
+      addCspViolation,
+      reportCspViolation,
+      clearCspViolations: clearCspViolationsAndTelemetry,
+      clearCspMount,
+      setWidgetModelContext,
+      setWidgetHtml,
+      setSandboxApplied,
+      appendLifecycle,
+      addTrafficLog,
+    }),
+    [
+      recordMount,
+      setWidgetDebugInfo,
+      setWidgetState,
+      setWidgetGlobals,
+      setWidgetCsp,
+      recordAppliedCsp,
+      addCspViolation,
+      reportCspViolation,
+      clearCspViolationsAndTelemetry,
+      clearCspMount,
+      setWidgetModelContext,
+      setWidgetHtml,
+      setSandboxApplied,
+      appendLifecycle,
+      addTrafficLog,
+    ],
+  );
+
+  return useMemo(
+    () => ({
+      environment,
+      resolvers,
+      services,
+      surface,
+      debug,
+      components: WIDGET_HOST_COMPONENTS,
+    }),
+    [environment, resolvers, services, surface, debug],
+  );
+}
+
+/**
+ * Inspector-side provider boundary for the package renderer. Builds the concrete
+ * `WidgetHost` from the surrounding stores/contexts (via {@link useWidgetHost})
+ * and feeds it through the package's `<WidgetHostProvider>` so the relocated
+ * `@mcpjam/widget-react` renderer can read it through `useWidgetHost()` (the
+ * package context hook).
+ *
+ * Mount it as close to each renderer surface as the renderer itself was — it
+ * subscribes to the same ~14 stores/contexts, so it must sit inside the same
+ * provider hierarchy (chat / playground / scenario / trace) and only where a
+ * widget actually mounts (to avoid widening that subscription set).
+ */
+export function InspectorWidgetHostProvider({
+  children,
+  bindResources,
+}: {
+  children: ReactNode;
+  bindResources?: (host: WidgetHost) => WidgetHost;
+}) {
+  const host = useWidgetHost();
+  const bound = useMemo(() => bindResources ? bindResources(host) : host, [host, bindResources]);
+  return <WidgetHostProvider value={bound}>{children}</WidgetHostProvider>;
+}

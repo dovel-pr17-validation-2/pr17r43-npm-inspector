@@ -1,0 +1,231 @@
+import {
+  PluginContextWorkspace,
+  type PluginContextRemoveAll,
+  type PluginContextUpdate,
+} from "./context.js";
+import { pluginContextMemory } from "./context-memory.js";
+import type { PluginContextLimits } from "../../../shared/plugin-model-context.js";
+import { randomBytes, randomUUID } from "node:crypto";
+import { PLUGIN_MODEL_APP_META } from "../../../shared/plugin-model-app.js";
+import { pluginInstances, type PluginFormOwner, type PluginInstanceIdentity } from "./instances.js";
+import { pluginResourceUri } from "./bindings.js";
+import { PluginInvocationError } from "./invocation.js";
+import { RequestOwnedToolInvoker } from "./request-invoker.js";
+const denied = () => new PluginInvocationError("MODEL_APP_UNAVAILABLE");
+const identity = (owner: PluginFormOwner) => ({
+  ...owner.owner,
+  subject: owner.subject,
+});
+function matches(owner: PluginFormOwner, actor: PluginInstanceIdentity) {
+  const expected = identity(owner);
+  return (
+    expected.actorId === actor.actorId &&
+    expected.projectId === actor.projectId &&
+    expected.workspaceId === actor.workspaceId &&
+    expected.subject === actor.subject
+  );
+}
+export class ModelAppRegistry {
+  private readonly entries = new Map<
+    string,
+    {
+      context: PluginContextWorkspace;
+      messages: Map<string, string>;
+      owner: PluginFormOwner;
+      toolName: string;
+      revision: string;
+      resourceUri: string;
+      invoker: RequestOwnedToolInvoker;
+      abort: AbortController;
+      formOwner: ReturnType<typeof pluginInstances.retainModelOwner>;
+      expiry: ReturnType<typeof setTimeout>;
+      expiresAt: number;
+    }
+  >();
+  constructor(
+    private readonly ttlMs = 30 * 60_000,
+    private readonly memory = pluginContextMemory,
+  ) {}
+  /** Publish inside the invocation's execute/resume callback only. Its receipt
+   * retains this token, so replay never publishes a replacement for a closed App. */
+  publish(
+    result: unknown,
+    source: PluginFormOwner,
+    toolName: string,
+    revision: string,
+    toolMeta: unknown,
+  ) {
+    if (
+      !result ||
+      typeof result !== "object" ||
+      Array.isArray(result) ||
+      (result as any).isError === true
+    )
+      return result;
+    let resourceUri: string;
+    try {
+      resourceUri = pluginResourceUri(
+        toolMeta && typeof toolMeta === "object" && !Array.isArray(toolMeta)
+          ? (toolMeta as Record<string, unknown>)
+          : undefined,
+      );
+    } catch {
+      return result;
+    }
+    {
+      if (this.entries.size >= 512)
+        return {
+          ...result,
+          _meta: { [PLUGIN_MODEL_APP_META]: { unavailable: true } },
+        };
+      const token = randomBytes(32).toString("base64url");
+      const owner: PluginFormOwner = {
+        ...structuredClone(source),
+        owner: { ...source.owner, instanceId: randomUUID() },
+      };
+      const actor = identity(owner);
+      const abort = new AbortController();
+      let formOwner: ReturnType<typeof pluginInstances.retainModelOwner>;
+      try {
+        formOwner = pluginInstances.retainModelOwner(owner, abort.signal);
+      } catch (error) {
+        if (!(error instanceof PluginInvocationError) || error.code !== "INSTANCE_LIMIT") throw error;
+        return { ...result, _meta: { [PLUGIN_MODEL_APP_META]: { unavailable: true } } };
+      }
+      const key = token;
+      const invoker = new RequestOwnedToolInvoker(owner.owner, () =>
+        this.get(key, actor),
+      );
+      const expiry = setTimeout(() => this.close(key, actor), this.ttlMs);
+      expiry.unref();
+      const context = new PluginContextWorkspace(owner.owner.workspaceId);
+      context.attach(owner.owner.instanceId, owner.owner.generation, {
+        workspaceId: owner.owner.workspaceId,
+        scope: {
+          kind: "thread",
+          threadId: owner.owner.workspaceId,
+        },
+        pluginVersionId: owner.owner.bindingId,
+        serverId: owner.owner.serverId,
+        bindingId: owner.owner.bindingId,
+        origin: { kind: "thread", id: toolName },
+        resourceUri,
+      });
+      this.entries.set(key, {
+        context,
+        messages: new Map(),
+        owner,
+        toolName,
+        revision,
+        resourceUri,
+        invoker,
+        abort,
+        formOwner,
+        expiry,
+        expiresAt: Date.now() + this.ttlMs,
+      });
+      return this.resultWithToken(result, source, token);
+    }
+  }
+  private resultWithToken(result: object, source: PluginFormOwner, token: string) {
+    const meta = (result as any)._meta;
+    return {
+      ...result,
+      _meta: {
+        ...(meta && typeof meta === "object" && !Array.isArray(meta)
+          ? meta
+          : {}),
+        [PLUGIN_MODEL_APP_META]: {
+          instanceToken: token,
+          projectId: source.owner.projectId,
+          workspaceId: source.owner.workspaceId,
+          hostId: source.hostId,
+          serverId: source.owner.serverId,
+        },
+      },
+    };
+  }
+  has(token: string) {
+    return this.entries.has(token);
+  }
+  prepareMessage(
+    token: string,
+    actor: PluginInstanceIdentity,
+    id: string,
+    fingerprint: string,
+  ) {
+    const record = this.get(token, actor);
+    const previous = record.messages.get(id);
+    if (previous && previous !== fingerprint)
+      throw new PluginInvocationError("INSTANCE_MESSAGE_CHANGED");
+    record.messages.set(id, fingerprint);
+    // Bounded recent window; a long-lived App never runs out of messages.
+    for (const key of record.messages.keys()) {
+      if (record.messages.size <= 2048) break;
+      record.messages.delete(key);
+    }
+  }
+  /** Extend a retained model App's lifetime; the same App and its effect
+   * history continue. Closed or expired Apps cannot be renewed. */
+  renew(token: string, actor: PluginInstanceIdentity) {
+    const entry = this.get(token, actor);
+    entry.formOwner.renew();
+    clearTimeout(entry.expiry);
+    entry.expiry = setTimeout(() => this.close(token, actor), this.ttlMs);
+    entry.expiry.unref();
+    entry.expiresAt = Date.now() + this.ttlMs;
+    return entry.expiresAt;
+  }
+  get(token: string, actor: PluginInstanceIdentity) {
+    const entry = this.entries.get(token);
+    if (!entry || entry.abort.signal.aborted || !matches(entry.owner, actor))
+      throw denied();
+    return entry;
+  }
+  /** A model App has no durable copy, so its context counts against this
+   * process's memory for as long as it is open. */
+  updateContext(
+    token: string,
+    actor: PluginInstanceIdentity,
+    request: PluginContextUpdate,
+    limits?: PluginContextLimits,
+  ) {
+    const { context, owner } = this.get(token, actor);
+    const { instanceId, generation } = owner.owner;
+    // A retry of the update already applied changes nothing, even after the
+    // context was removed, so it is neither refused for memory nor charged.
+    if (context.isRetry(instanceId, request.operationId))
+      return context.update(instanceId, generation, request, limits);
+    const bytes = Buffer.byteLength(JSON.stringify(request.params ?? null));
+    this.memory.check(owner, bytes);
+    const result = context.update(instanceId, generation, request, limits);
+    this.memory.hold(owner, bytes);
+    return result;
+  }
+  removeContext(
+    token: string,
+    actor: PluginInstanceIdentity,
+    request: PluginContextRemoveAll,
+  ) {
+    const { context, owner } = this.get(token, actor);
+    const result = context.removeAll(
+      owner.owner.instanceId,
+      owner.owner.generation,
+      request,
+    );
+    if (!result.snapshot.state) this.memory.hold(owner, 0);
+    return result;
+  }
+  close(token: string, actor: PluginInstanceIdentity) {
+    const entry = this.entries.get(token);
+    if (!entry) return;
+    if (!matches(entry.owner, actor)) throw denied();
+    this.entries.delete(token);
+    clearTimeout(entry.expiry);
+    entry.abort.abort();
+    entry.invoker.close();
+    entry.context.close(entry.owner.owner.instanceId);
+    this.memory.release(entry.owner.owner.instanceId);
+  }
+}
+export const modelApps = new ModelAppRegistry();

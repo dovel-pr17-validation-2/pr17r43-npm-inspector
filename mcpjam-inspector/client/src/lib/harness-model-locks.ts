@@ -1,0 +1,386 @@
+/**
+ * Picker-side reading of the harness × model evidence table
+ * (`shared/harness-model-support.ts`) — the SAME table, at the SAME pinned
+ * runtime versions, the server's pre-flight and eval admission read. A picker
+ * that offered a model the server then refused would only move the failure to
+ * run time; one that hid it without saying why would look like a missing model.
+ * So an incompatible row stays listed, disabled, with the server's own reason.
+ *
+ * Whose key pays is decided first, per ROW: a harness with a qualified
+ * org-key path (Claude Code, Codex) runs an MCPJam-provided row on MCPJam's
+ * key, or a row from an organization connection on its own vendor (Claude
+ * Code → Anthropic, Codex → OpenAI) on the organization's key, read on the
+ * canonical id that row's saved selection names. OpenCode is platform-funded
+ * only. Any other row (a key on this machine, an org connection a harness
+ * cannot run on) is refused, exactly as the server refuses it.
+ *
+ * While the organization requires its own provider keys (`HarnessKeyPolicy`),
+ * MCPJam-provided models are off: a brokered harness runs only on an
+ * organization connection to its own vendor, and the copy says so.
+ */
+import type { ModelSelection } from "@mcpjam/sdk/browser";
+import type { Harness } from "@mcpjam/sdk/host-config/internal";
+import { HARNESS_DESCRIPTORS } from "@/shared/harness-descriptors";
+import {
+  harnessOrgUpstream,
+  harnessModelSupport,
+  harnessModelVerdictAdmits,
+  harnessNoRunnableModelReason,
+  harnessOrgProviderUnsupportedReason,
+  harnessPinnedVersion,
+  harnessRunsOnOrgProvider,
+  type HarnessKeyPolicy,
+  type HarnessModelPurpose,
+} from "@/shared/harness-model-support";
+import {
+  hostedProviderFromCanonicalId,
+  type ModelDefinition,
+} from "@/shared/types";
+import { isMCPJamProvidedModelMenuItem } from "@/components/chat-v2/shared/model-helpers";
+import {
+  canonicalSelectionModelId,
+  modelRowKey,
+  providerKeyForModelDefinition,
+} from "@/components/chat-v2/shared/model-selection";
+import { ORG_KEYS_MODEL_REASON } from "@/lib/org-keys-refusal";
+
+export type { HarnessKeyPolicy };
+
+/** A host that runs a harness, and (optionally) the runtime version it runs.
+ *  Absent version ⇒ the adapter's pinned version. */
+export type HarnessModelTarget = {
+  harnessId: string;
+  runtimeVersion?: string | null;
+};
+
+function runtimeVersionOf(target: HarnessModelTarget): string | undefined {
+  return target.runtimeVersion ?? harnessPinnedVersion(target.harnessId);
+}
+
+/**
+ * Why `modelId` cannot run on `target` for `purpose`, or undefined when it can.
+ * `null` / undefined target = an emulated host, which runs any model.
+ */
+function harnessModelRefusalReason(
+  modelId: string,
+  target: HarnessModelTarget | null | undefined,
+  purpose: HarnessModelPurpose,
+): string | undefined {
+  if (!target) return undefined;
+  const verdict = harnessModelSupport({
+    harnessId: target.harnessId,
+    runtimeVersion: runtimeVersionOf(target),
+    modelId,
+  });
+  return harnessModelVerdictAdmits(verdict, purpose)
+    ? undefined
+    : verdict.reason;
+}
+
+/** Does this harness run on an organization's own provider key at all? */
+function harnessTakesOrgKeys(harnessId: string): boolean {
+  return harnessOrgUpstream(harnessId) !== null;
+}
+
+/**
+ * MCPJam brokers this harness's model credentials. A local key never pays,
+ * and an empty picker stays empty rather than restoring refused rows.
+ * Cursor (`modelAccess: "external-account"`) is the exception: its account
+ * picks the model, so the turn's catalog is not what runs.
+ */
+function harnessIsBrokered(harnessId: string): boolean {
+  return (
+    Object.prototype.hasOwnProperty.call(HARNESS_DESCRIPTORS, harnessId) &&
+    HARNESS_DESCRIPTORS[harnessId as Harness].modelAccess === "broker"
+  );
+}
+
+/**
+ * The id the evidence table reads for a picker ROW on `target`, or why the row
+ * cannot run there at all. See the module comment for the rule.
+ *
+ * A harness that never takes an org key (Cursor, on the customer's own
+ * Cursor account; OpenCode, platform-funded only) reads the table alone.
+ */
+export function harnessRowModelId(
+  model: ModelDefinition,
+  target: HarnessModelTarget,
+  policy: HarnessKeyPolicy = {},
+):
+  | { modelId: string; rail: "hosted" | "org" | "evidence" }
+  | { refusal: string } {
+  if (!harnessTakesOrgKeys(target.harnessId)) {
+    if (model.orgProvider) {
+      return {
+        refusal: harnessOrgProviderUnsupportedReason(
+          target.harnessId,
+          policy,
+        ),
+      };
+    }
+    return { modelId: String(model.id), rail: "evidence" };
+  }
+  if (isMCPJamProvidedModelMenuItem(model)) {
+    // Under the key policy MCPJam's key is off, so the harness's only key is
+    // the organization's own.
+    return policy.requireOrgKeys
+      ? {
+          refusal: harnessOrgProviderUnsupportedReason(
+            target.harnessId,
+            policy,
+          ),
+        }
+      : { modelId: String(model.id), rail: "hosted" };
+  }
+  if (
+    model.orgProvider &&
+    harnessRunsOnOrgProvider(
+      target.harnessId,
+      providerKeyForModelDefinition(model),
+    )
+  ) {
+    // The canonical id its saved selection names — the id the server reads
+    // the table on. A row that cannot form one cannot be routed to the org
+    // key, so the server would refuse it.
+    const canonical = canonicalSelectionModelId(model);
+    return canonical
+      ? { modelId: canonical, rail: "org" }
+      : {
+          refusal: harnessOrgProviderUnsupportedReason(
+            target.harnessId,
+            policy,
+          ),
+        };
+  }
+  return {
+    refusal: harnessOrgProviderUnsupportedReason(target.harnessId, policy),
+  };
+}
+
+/**
+ * Why a picker ROW cannot run on `target` for `purpose`, or undefined when it
+ * can. `null` / undefined target = an emulated host, which runs any model.
+ */
+export function harnessRowRefusalReason(
+  model: ModelDefinition,
+  target: HarnessModelTarget | null | undefined,
+  purpose: HarnessModelPurpose,
+  policy: HarnessKeyPolicy = {},
+): string | undefined {
+  if (!target) return undefined;
+  const row = harnessRowModelId(model, target, policy);
+  if ("refusal" in row) return row.refusal;
+  return harnessModelRefusalReason(row.modelId, target, purpose);
+}
+
+/**
+ * Why a SAVED choice (an id and, when it has one, its selection) cannot run on
+ * `target` — for a surface that holds choices rather than picker rows (the
+ * composer's resolve, `expandModelChoices`). A local selection never runs on a
+ * brokered harness; an org selection runs only on the harness's own vendor,
+ * read from its canonical id's prefix (the server, which knows the
+ * connection's provider, re-checks at admission).
+ */
+export function harnessChoiceRefusalReason(
+  choice: {
+    modelId: string;
+    selection?: Pick<ModelSelection, "source"> | null;
+  },
+  target: HarnessModelTarget | null | undefined,
+  purpose: HarnessModelPurpose,
+): string | undefined {
+  if (!target) return undefined;
+  const source = choice.selection?.source;
+  if (source === "org") {
+    const vendor = choice.modelId.includes("/")
+      ? hostedProviderFromCanonicalId(choice.modelId)
+      : undefined;
+    if (!harnessRunsOnOrgProvider(target.harnessId, vendor)) {
+      return harnessOrgProviderUnsupportedReason(target.harnessId);
+    }
+  }
+  if (harnessIsBrokered(target.harnessId) && source === "local") {
+    return harnessOrgProviderUnsupportedReason(target.harnessId);
+  }
+  return harnessModelRefusalReason(choice.modelId, target, purpose);
+}
+
+/**
+ * The lock for a picker whose choice applies to SEVERAL hosts at once (the
+ * composer's shared model axis): a row is disabled only when EVERY host
+ * refuses it. When some hosts can run it, it stays pickable and the cells the
+ * other hosts cannot run are skipped at resolve time (`expandModelChoices`),
+ * where they are reported rather than silently dropped.
+ */
+export function harnessModelLockReason(
+  model: ModelDefinition,
+  targets: ReadonlyArray<HarnessModelTarget | null | undefined>,
+  purpose: HarnessModelPurpose,
+  policy: HarnessKeyPolicy = {},
+): string | undefined {
+  if (targets.length === 0) return undefined;
+  let firstReason: string | undefined;
+  for (const target of targets) {
+    const reason = harnessRowRefusalReason(model, target, purpose, policy);
+    if (reason === undefined) return undefined;
+    firstReason ??= reason;
+  }
+  return firstReason;
+}
+
+/**
+ * Mark every row the targets cannot run as disabled, with the reason. Rows
+ * already disabled for another reason (credits, guest lock) keep theirs.
+ */
+export function applyHarnessModelLocks(
+  models: ModelDefinition[],
+  targets: ReadonlyArray<HarnessModelTarget | null | undefined>,
+  purpose: HarnessModelPurpose,
+  policy: HarnessKeyPolicy = {},
+): ModelDefinition[] {
+  if (!targets.some(Boolean)) return models;
+  return models.map((model) => {
+    if (model.disabled) return model;
+    const reason = harnessModelLockReason(model, targets, purpose, policy);
+    return reason
+      ? { ...model, disabled: true, disabledReason: reason }
+      : model;
+  });
+}
+
+/** {@link harnessModelLockReason} for every row, keyed by `modelRowKey`. */
+export function harnessModelLockReasonsByRow(
+  models: readonly ModelDefinition[],
+  targets: ReadonlyArray<HarnessModelTarget | null | undefined>,
+  purpose: HarnessModelPurpose,
+  policy: HarnessKeyPolicy = {},
+): Map<string, string> {
+  const byRow = new Map<string, string>();
+  if (targets.length === 0) return byRow;
+  for (const model of models) {
+    const reason = harnessModelLockReason(model, targets, purpose, policy);
+    if (reason) byRow.set(modelRowKey(model), reason);
+  }
+  return byRow;
+}
+
+/**
+ * The models a harness host's chat picker OFFERS: only the ones its runtime
+ * can run. Unlike `applyHarnessModelLocks` (a shared axis across several
+ * hosts, where a row one host refuses may still suit another), a single
+ * harness host has nothing to gain from rows it would refuse, and offering
+ * them is how a Codex client ended up on Claude Haiku.
+ *
+ * Kept, for a brokered harness: MCPJam-provided rows, and rows from an
+ * organization connection on the harness's own vendor (run on the org's key),
+ * that the evidence table admits for chat on their canonical id. Every other
+ * row is refused by the server, so it is not offered. A row the table has not
+ * verified (`unknown`) stays, with its reason as a warning, because the server
+ * runs it in chat with the same warning. Nothing runnable leaves the list
+ * EMPTY — the picker's empty state — never the unfiltered list, which would
+ * offer only rows the server refuses. That includes a platform-funded
+ * brokered harness (OpenCode) whose filter removed every org-key row. The
+ * catalog fallback is only for an external-account harness (Cursor): its
+ * account picks the model, so the turn's picker is not what runs.
+ *
+ * Under the organization's key policy (`policy.requireOrgKeys`) a brokered
+ * harness offers only organization rows on its own vendor. A saved model the
+ * policy no longer allows (`ORG_KEYS_MODEL_REASON`) is kept as it is: the
+ * picker never lists it and shows it only on its trigger, as a warning, so
+ * the saved choice is never switched silently.
+ */
+export function harnessPickerModels(
+  models: ModelDefinition[],
+  target: HarnessModelTarget | null | undefined,
+  policy: HarnessKeyPolicy = {},
+): ModelDefinition[] {
+  if (!target) return models;
+  const kept: ModelDefinition[] = [];
+  for (const model of models) {
+    if (
+      policy.requireOrgKeys &&
+      model.disabled &&
+      model.disabledReason === ORG_KEYS_MODEL_REASON
+    ) {
+      kept.push(model);
+      continue;
+    }
+    const row = harnessRowModelId(model, target, policy);
+    if ("refusal" in row) continue;
+    if (row.rail === "evidence" && !isMCPJamProvidedModelMenuItem(model)) {
+      continue;
+    }
+    const verdict = harnessModelSupport({
+      harnessId: target.harnessId,
+      runtimeVersion: runtimeVersionOf(target),
+      modelId: row.modelId,
+    });
+    if (!harnessModelVerdictAdmits(verdict, "chat")) continue;
+    kept.push(
+      verdict.status === "unknown" && !model.warningReason
+        ? { ...model, warningReason: verdict.reason }
+        : model,
+    );
+  }
+  if (kept.length > 0 || harnessIsBrokered(target.harnessId)) return kept;
+  return models;
+}
+
+const NO_RUNNABLE_HARNESS_MODEL_ID = "mcpjam/no-runnable-harness-model";
+
+/**
+ * Stands in for the selected model when a harness host has NO row it can run
+ * (`harnessPickerModels` returned the empty list): a runtime version the
+ * evidence table admits nothing on, or no hosted rows and no matching org
+ * connection. Disabled, with the reason, so the picker shows the empty state
+ * and the chat refuses to send rather than send an id the server refuses.
+ */
+export function noRunnableHarnessModel(
+  harnessId: string,
+  policy: HarnessKeyPolicy = {},
+): ModelDefinition {
+  return {
+    id: NO_RUNNABLE_HARNESS_MODEL_ID,
+    name: "No runnable model",
+    provider: "custom",
+    hosted: false,
+    disabled: true,
+    disabledReason: harnessNoRunnableModelReason(harnessId, policy),
+  };
+}
+
+export function isNoRunnableHarnessModel(
+  model: ModelDefinition | null | undefined,
+): boolean {
+  return model?.id === NO_RUNNABLE_HARNESS_MODEL_ID;
+}
+
+/**
+ * The model a harness host starts on when nothing selected is runnable: the
+ * host's own model if it is offered and enabled, else the first enabled row
+ * the evidence table fully supports, else the first enabled row. Never the
+ * emulated default (`getDefaultModel`), whose first choice is a Claude model.
+ */
+export function harnessDefaultModel(
+  models: ModelDefinition[],
+  target: HarnessModelTarget,
+  preferredModelId?: string | null,
+): ModelDefinition | undefined {
+  const enabled = models.filter((model) => !model.disabled);
+  const preferred = preferredModelId
+    ? enabled.find((model) => String(model.id) === preferredModelId)
+    : undefined;
+  if (preferred) return preferred;
+  const supported = enabled.find((model) => {
+    const row = harnessRowModelId(model, target);
+    return (
+      !("refusal" in row) &&
+      harnessModelSupport({
+        harnessId: target.harnessId,
+        runtimeVersion: runtimeVersionOf(target),
+        modelId: row.modelId,
+      }).status === "supported"
+    );
+  });
+  return supported ?? enabled[0];
+}

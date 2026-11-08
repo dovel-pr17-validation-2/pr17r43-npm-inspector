@@ -1,0 +1,114 @@
+---
+title: "@mcpjam/sdk"
+description: "MCP server unit testing, end-to-end (e2e) testing, and server evals"
+icon: "box"
+---
+
+The [**@mcpjam/sdk**](https://www.npmjs.com/package/@mcpjam/sdk) is a TypeScript SDK for testing, evaluating, and building applications with MCP (Model Context Protocol) servers. It gives you the tools to check your MCP server works reliably across different LLMs and environments.
+
+## Who is this for?
+
+- **MCP Server Developers** - Test your tools work correctly with real LLMs
+- **MCP Client Developers** - Build robust multi-server applications
+- **App Marketplace Maintainers** - Evaluate server quality and compatibility
+- **SDK Developers** - Integrate MCP capabilities into your products
+
+## What can you do with it?
+
+<CardGroup cols={2}>
+  <Card title="Unit Testing" icon="flask-conical">
+    Test MCP primitives (tools, resources, prompts) deterministically without LLM calls
+  </Card>
+  <Card title="End-to-End Testing" icon="refresh-cw">
+    Simulate real user interactions by connecting LLMs to your MCP servers
+  </Card>
+</CardGroup>
+
+CI-friendly conformance is built into the same package:
+
+- [Protocol Conformance SDK](/sdk/reference/protocol-conformance)
+- [OAuth Conformance SDK](/sdk/reference/oauth-conformance)
+- [MCP Apps Conformance SDK](/sdk/reference/apps-conformance)
+
+Use the suite classes inside Jest or Vitest, then convert results into shared JSON or JUnit XML reporters with `toConformanceReport(...)` and `renderConformanceReportJUnitXml(...)`.
+
+## Installation
+
+```bash
+npm install @mcpjam/sdk
+```
+
+## Quick Example
+
+```typescript
+import { MCPClientManager, HostRunner, EvalTest } from "@mcpjam/sdk";
+
+// Connect to your MCP server
+const manager = new MCPClientManager({
+  myServer: {
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-everything"],
+  },
+});
+
+// Create a runner with LLM + MCP tools
+const runner = new HostRunner({
+  tools: await manager.getToolsForAiSdk(),
+  model: "anthropic/claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+// Run a prompt and inspect results
+const result = await runner.run("Add 2 and 3");
+console.log(result.toolsCalled());     // ["add"]
+console.log(result.e2eLatencyMs());    // 1234
+
+// Run statistical evaluation
+const test = new EvalTest({
+  id: "c_addition",
+  name: "addition",
+  test: async (runner) => {
+    const r = await runner.run("Add 2+3");
+    return r.hasToolCall("add");
+  },
+});
+await test.run(runner, { iterations: 30 });
+console.log(`Accuracy: ${(test.accuracy() * 100).toFixed(1)}%`);
+```
+
+<Note>
+**Renames in 1.11.** `TestAgent` → `HostRunner`, `EvalAgent` → `HostExecutor`, `.prompt()` → `.run()`, `Host.addServer()` → `Host.requireServer()`. No deprecation aliases. The same code with the old names will not type-check against `@mcpjam/sdk@>=1.11`.
+</Note>
+
+## Spec-first: `Host` + `HostRuntime`
+
+For richer setups — pinning a host style/profile, applying sandbox/permission policy, or running the same configuration in CI that the MCPJam Inspector uses — start from a `Host` spec instead of constructing a runner directly:
+
+```typescript
+import { MCPClientManager, Host, EvalTest } from "@mcpjam/sdk";
+
+const manager = new MCPClientManager();
+await manager.connectToServer("everything", {
+  command: "npx",
+  args: ["-y", "@modelcontextprotocol/server-everything"],
+});
+
+const host = new Host({
+  style: "mcpjam",
+  model: "openai/gpt-4o",
+}).requireServer("everything");
+
+// Bind the spec to the live manager. apiKey lives on the runtime, not per-call.
+const runtime = host.withManager(manager, {
+  apiKey: process.env.OPENAI_API_KEY!,
+});
+
+const test = new EvalTest({
+  id: "c_add",
+  name: "add",
+  test: async (runner) => (await runner.run("Add 2+3")).hasToolCall("add"),
+});
+await test.run(runtime, { iterations: 10 });
+```
+
+See [Run evals from your own runtime](/sdk/concepts/running-evals#bring-your-own-host) for the full Host / HostRunner / HostRuntime story.

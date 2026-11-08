@@ -1,0 +1,163 @@
+import type { ModelDefinition } from "../../../shared/types";
+import {
+  GROUNDING_LIMITS,
+  mayRunAfterSetup,
+  type SetupRecord,
+} from "../../../shared/swarm-grounding";
+import {
+  reportTargetGrounding,
+  type PersonaSnapshot,
+  type PinnedHostExecutionSpec,
+} from "../swarm-agent";
+import { logger } from "../../utils/logger";
+import { withDeadline } from "../../utils/run-supervisor/deadline";
+import type { JourneyManagerFactory } from "./swarm-runner";
+import { abortable, probeReadOnlyTools } from "./target-discovery";
+import { runSwarmSetupTurn, SwarmSetupError } from "./swarm-setup-turn";
+import type { SponsoredPlatformFailure } from "../../../shared/swarm-sponsorship";
+import {
+  isStandingXaaFailure,
+  xaaAuthorizationServerStatusOf,
+  xaaConnectFailureReasonOf,
+} from "../../../shared/xaa-connect-failure";
+export async function prepareTargetGrounding(args: {
+  runId: string;
+  projectId: string;
+  target: PinnedHostExecutionSpec;
+  persona: PersonaSnapshot;
+  goal?: string;
+  setupWrites?: boolean;
+  modelDefinition: ModelDefinition;
+  managerFactory: JourneyManagerFactory;
+  convexHttpUrl: string;
+  bearer: string;
+  signal: AbortSignal;
+  /** The target has sponsored conversations (setup and grounding are sponsored). */
+  sponsored?: boolean;
+}) {
+  if (!args.target.targetId || args.signal.aborted) return;
+  const identity = {
+    projectId: args.projectId,
+    runId: args.runId,
+    targetId: args.target.targetId,
+    hostId: args.target.hostId,
+  };
+  let setup: SetupRecord | undefined;
+  const report = async (body: Parameters<typeof reportTargetGrounding>[2]) => {
+    if (args.signal.aborted) return;
+    try {
+      await reportTargetGrounding(
+        args.convexHttpUrl,
+        args.bearer,
+        body,
+        args.signal,
+        args.sponsored,
+      );
+    } catch {
+      logger.warn(
+        "[swarm.runner] target grounding report unavailable",
+        identity,
+      );
+    }
+  };
+  if (args.setupWrites) {
+    const setupArgs = { ...args, authHeader: `Bearer ${args.bearer}` };
+    let platformFailure: SponsoredPlatformFailure | undefined;
+    let cause: unknown;
+    try {
+      setup = await runSwarmSetupTurn(setupArgs);
+    } catch (error) {
+      if (!(error instanceof SwarmSetupError)) throw error;
+      setup = error.partial;
+      platformFailure = error.platformFailure;
+      cause = error.cause;
+      // A refused server sign-in is not retried: a second setup turn signs in
+      // again, and an authorization server that refused (or throttled) the
+      // first request refuses the second the same way. A sign-in that may
+      // clear on the next try (a timeout, say) keeps its retry.
+      if (
+        !args.signal.aborted &&
+        !error.platformFailure &&
+        !isStandingXaaFailure(
+          xaaConnectFailureReasonOf(cause),
+          xaaAuthorizationServerStatusOf(cause),
+        ) &&
+        setup.writeCallsDispatched === 0
+      ) {
+        try {
+          setup = await runSwarmSetupTurn({ ...setupArgs, retried: true });
+          cause = undefined;
+        } catch (retryError) {
+          if (!(retryError instanceof SwarmSetupError)) throw retryError;
+          setup = retryError.partial;
+          platformFailure = retryError.platformFailure;
+          cause = retryError.cause;
+        }
+      }
+    }
+    await report({ ...identity, setup });
+    if (args.signal.aborted) return;
+    if (!mayRunAfterSetup(setup))
+      throw new SwarmSetupError(setup, platformFailure, cause);
+    // The target runs on setup's evidence; the reason records that the model's
+    // report was unreadable, reported missing data, or claimed unbacked items.
+    if (setup.status === "completed" && setup.reason)
+      logger.info("[swarm.runner] setup report disregarded", {
+        ...identity,
+        setupReason: setup.reason,
+        missingCount: setup.missing.length,
+        unsupportedClaims: setup.unsupportedClaims,
+      });
+  }
+  const deadline = withDeadline(
+    args.signal,
+    GROUNDING_LIMITS.totalMs,
+    "discovery",
+  );
+  let connection: Awaited<ReturnType<JourneyManagerFactory>> | undefined;
+  logger.info("target.discovery.start", identity);
+  try {
+    connection = await abortable(
+      args.managerFactory(args.target).then(async (built) => {
+        if (deadline.signal.aborted) {
+          await built.dispose();
+          throw deadline.signal.reason;
+        }
+        return built;
+      }),
+      deadline.signal,
+    );
+    if (!connection) throw new Error("Target connection unavailable");
+    const discovery = await probeReadOnlyTools({
+      manager: connection.manager,
+      serverIds: connection.connectedServerIds,
+      serverNames: connection.connectedServerNames,
+      signal: deadline.signal,
+    });
+    if (args.signal.aborted) return;
+    await report({
+      ...identity,
+      ...discovery,
+      ...(setup?.createdEntities.length
+        ? { seedFacts: setup.createdEntities }
+        : {}),
+    });
+    logger.info("target.discovery.finish", identity);
+  } catch {
+    if (!args.signal.aborted) {
+      await report({
+        ...identity,
+        probes: [],
+        probedTools: [],
+        skippedReason: "connect_failed",
+        ...(setup?.createdEntities.length
+          ? { seedFacts: setup.createdEntities }
+          : {}),
+      });
+      logger.info("target.discovery.skipped", identity);
+    }
+  } finally {
+    deadline.dispose();
+    await connection?.dispose().catch(() => {});
+  }
+}

@@ -1,0 +1,185 @@
+import { describe, expect, it, vi, beforeEach } from "vitest";
+import { render, screen } from "@testing-library/react";
+import { WidgetReplay } from "../widget-replay";
+
+const mockDetectUIType = vi.fn();
+vi.mock("@/components/host-workspace/OwnedModelApp", () => ({
+  OwnedModelApp: ({ marker }: { marker: { instanceToken: string } }) => (
+    <div data-testid="owned-instance">{marker.instanceToken}</div>
+  ),
+}));
+
+// After the renderer consolidation (Phase 3), every UI-bearing tool —
+// Apps SDK, MCP Apps, or dual-metadata — routes through MCPAppsRenderer.
+// The previous chatgpt-vs-mcp branching by scenario style is gone.
+
+vi.mock("../mcp-apps/mcp-apps-renderer", () => ({
+  MCPAppsRenderer: ({ toolName }: { toolName: string }) => (
+    <div data-testid="mcp-apps-renderer">{toolName}</div>
+  ),
+}));
+
+// WidgetReplay wraps the renderer in <InspectorWidgetHostProvider> (which composes
+// the host from ~14 stores/contexts). These routing tests mock the renderer to a
+// stub, so the provider is a pass-through here.
+vi.mock("../mcp-apps/use-widget-host", () => ({
+  InspectorWidgetHostProvider: ({
+    children,
+  }: {
+    children: import("react").ReactNode;
+  }) => children,
+}));
+
+vi.mock("@/lib/mcp-ui/mcp-apps-utils", () => ({
+  detectUIType: (...args: unknown[]) => mockDetectUIType(...args),
+  getUIResourceUri: (uiType: string | null) => uiType ? "ui://widget/test.html" : null,
+  UIType: {
+    MCP_APPS: "mcp-apps",
+    OPENAI_SDK: "openai-sdk",
+    OPENAI_SDK_AND_MCP_APPS: "openai-sdk-and-mcp-apps",
+    MCP_UI: "mcp-ui",
+  },
+}));
+
+vi.mock("@/lib/apis/mcp-tools-api", () => ({
+  getToolServerId: () => "server-1",
+}));
+
+vi.mock("@/lib/tool-result-utils", () => ({
+  readToolResultMeta: () => undefined,
+  readToolResultServerId: () => "server-1",
+}));
+
+describe("WidgetReplay", () => {
+  const baseProps = {
+    toolName: "dual-tool",
+    toolCallId: "call-1",
+    toolState: "output-available" as const,
+    toolInput: { prompt: "hello" },
+    toolOutput: { ok: true },
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("routes Apps-SDK-only widgets through MCPAppsRenderer", () => {
+    mockDetectUIType.mockReturnValue("openai-sdk");
+    render(<WidgetReplay {...baseProps} />);
+    expect(screen.getByTestId("mcp-apps-renderer")).toBeInTheDocument();
+  });
+
+  it("routes MCP-Apps-only widgets through MCPAppsRenderer", () => {
+    mockDetectUIType.mockReturnValue("mcp-apps");
+    render(<WidgetReplay {...baseProps} />);
+    expect(screen.getByTestId("mcp-apps-renderer")).toBeInTheDocument();
+  });
+
+  it("routes dual-metadata widgets through MCPAppsRenderer", () => {
+    mockDetectUIType.mockReturnValue("openai-sdk-and-mcp-apps");
+    render(<WidgetReplay {...baseProps} />);
+    expect(screen.getByTestId("mcp-apps-renderer")).toBeInTheDocument();
+  });
+
+  it("uses the owned instance when its catalog URI is absent, subject to host policy", () => {
+    mockDetectUIType.mockReturnValue(null);
+    const marker = {
+      instanceToken: "x".repeat(43),
+      hostId: "host",
+      workspaceId: "workspace",
+      projectId: "project",
+      serverId: "server-1",
+    };
+    const props = { ...baseProps, attributedModelApp: marker, serverId: marker.serverId };
+    const view = render(<WidgetReplay {...props} resolveHostSupportsWidget={() => false} />);
+    expect(screen.queryByTestId("owned-instance")).toBeNull();
+    view.rerender(<WidgetReplay {...props} resolveHostSupportsWidget={() => true} />);
+    expect(screen.getByTestId("owned-instance")).toHaveTextContent(marker.instanceToken);
+    expect(screen.queryByTestId("mcp-apps-renderer")).toBeNull();
+  });
+
+  it("renders nothing when detectUIType returns null", () => {
+    mockDetectUIType.mockReturnValue(null);
+    const { container } = render(<WidgetReplay {...baseProps} />);
+    expect(container.firstChild).toBeNull();
+  });
+
+  it.each([
+    { type: "error-text", value: "INSTANCE_BINDING_UNAVAILABLE" },
+    { type: "error-json", value: { error: "denied" } },
+    { isError: true, content: [{ type: "text", text: "denied" }] },
+  ])("never mounts a guest for failed tool output %j", (output) => {
+    mockDetectUIType.mockReturnValue("mcp-apps");
+    render(<WidgetReplay {...baseProps} toolOutput={output} />);
+    expect(screen.queryByTestId("mcp-apps-renderer")).not.toBeInTheDocument();
+  });
+
+  it("preserves immutable call attribution ahead of duplicate tool-name lookup", () => {
+    mockDetectUIType.mockReturnValue("mcp-apps");
+    const gate = vi.fn(() => true);
+    render(
+      <WidgetReplay
+        {...baseProps}
+        serverId="original-imported-server"
+        resolveHostSupportsWidget={gate}
+      />,
+    );
+    expect(gate).toHaveBeenCalledWith("original-imported-server");
+    expect(gate).not.toHaveBeenCalledWith("server-1");
+  });
+
+  it("addresses a restored snapshot through the caller's resolved server", () => {
+    mockDetectUIType.mockReturnValue("mcp-apps");
+    const gate = vi.fn(() => true);
+    render(
+      <WidgetReplay
+        {...baseProps}
+        serverId="qa-server"
+        renderOverride={{ serverId: "convex-server-1" }}
+        resolveHostSupportsWidget={gate}
+      />,
+    );
+    expect(gate).toHaveBeenCalledWith("qa-server");
+    expect(gate).not.toHaveBeenCalledWith("convex-server-1");
+  });
+
+  // The caps-blob → boolean integration (`hostSupportsWidgetRendering` over the
+  // active host's resolved `clientCapabilities`) now lives in the injecting
+  // caller (PartSwitch) and is covered by PartSwitch.test.tsx. WidgetReplay only
+  // applies the injected `resolveHostSupportsWidget` gate with its own serverId.
+  describe("host capability gate (injected)", () => {
+    it("renders when resolveHostSupportsWidget returns true", () => {
+      mockDetectUIType.mockReturnValue("mcp-apps");
+      render(
+        <WidgetReplay {...baseProps} resolveHostSupportsWidget={() => true} />,
+      );
+      expect(screen.getByTestId("mcp-apps-renderer")).toBeInTheDocument();
+    });
+
+    it("renders nothing when resolveHostSupportsWidget returns false (e.g. Codex strips the UI extension)", () => {
+      mockDetectUIType.mockReturnValue("mcp-apps");
+      const { container } = render(
+        <WidgetReplay {...baseProps} resolveHostSupportsWidget={() => false} />,
+      );
+      expect(container.firstChild).toBeNull();
+    });
+
+    it("applies the gate with the tool's resolved serverId", () => {
+      mockDetectUIType.mockReturnValue("mcp-apps");
+      const resolveHostSupportsWidget = vi.fn(() => true);
+      render(
+        <WidgetReplay
+          {...baseProps}
+          resolveHostSupportsWidget={resolveHostSupportsWidget}
+        />,
+      );
+      expect(resolveHostSupportsWidget).toHaveBeenCalledWith("server-1");
+    });
+
+    it("defaults to permissive (renders) when no gate is injected", () => {
+      mockDetectUIType.mockReturnValue("mcp-apps");
+      render(<WidgetReplay {...baseProps} />);
+      expect(screen.getByTestId("mcp-apps-renderer")).toBeInTheDocument();
+    });
+  });
+});

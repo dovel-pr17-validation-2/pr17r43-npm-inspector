@@ -1,0 +1,115 @@
+# Server Logging Conventions
+
+## Quick rule
+
+- **New production diagnostics in `server/routes/`** → use `logger.event()` via `getRequestLogger`
+- **Ad-hoc debugging anywhere** → `logger.debug()` is fine
+- **Legacy code outside converted routes** → `logger.warn/error` remain; migrate opportunistically
+
+---
+
+## Why typed events?
+
+`logger.warn("something failed", { ... })` produces unstructured Axiom rows that are hard to query.
+`logger.event("tunnel.created", ...)` produces a row you can filter by `event`, `projectId`, `orgId`, `route`, etc. without grepping prose.
+
+---
+
+## How to emit a typed event from a route handler
+
+```ts
+import { getRequestLogger } from "../../utils/request-logger.js";
+import { classifyError } from "../../utils/error-classify.js";
+
+// inside a Hono handler that has `c: Context`
+getRequestLogger(c, "routes.web.tools").event("mcp.tool.execution.failed", {
+  toolName: body.toolName,
+  errorCode: classifyError(error),
+});
+```
+
+The request context (`projectId`, `orgId`, `projectRole`, etc.) is automatically
+picked up from `c.var.requestLogContext`, which is populated by:
+1. `requestLogContextMiddleware` at request start (sets `requestId`, `route`, `method`)
+2. `authorizeServer` / `createAuthorizedManager` after Convex auth succeeds (sets project + user fields)
+3. the API-key, Slack and Discord credential checks in `server/middleware/` (set `orgId`)
+
+`orgId`, `projectId` and `serverId` are `LogConvexId`s. Rows copy them from
+this context alone, never from an event payload or a `logger.warn/info/error`
+context, so `serverId: body.serverId` in a payload logs nothing. Brand one with
+`logConvexId()` from `log-convex-id.ts` only when a Convex authorization
+response or a verified credential's stored binding produced it; a value from a
+request body, path or header is not one, whatever its shape. Other IDs,
+`sessionId` among them, are not logged.
+
+---
+
+## Event catalog
+
+| Event | Emitted from | Key payload fields |
+|---|---|---|
+| `http.request.completed` | middleware | `statusCode` |
+| `http.request.failed` | middleware | `statusCode`, `errorCode` |
+| `eval.import.environment_selection.failed` | `routes/shared/eval-authoring.ts` | `projectId`, `suiteId`, `reason`; hosted imports missing an environment also report to Sentry |
+| `mcp.oauth.proxy.failed` | `routes/mcp/oauth.ts`, `routes/web/oauth.ts` | `targetUrlHost`, `oauthPhase`, `errorCode`, `statusCode?` |
+| `mcp.tool.execution.failed` | `routes/web/tools.ts` | `toolName`, `serverId?`, `errorCode` |
+| `tunnel.created` | `routes/mcp/tunnels.ts` | `tunnelKind`, `tunnelDomain`, `existed`, `credentialIdPresent?` |
+| `tunnel.creation_failed` | `routes/mcp/tunnels.ts` | `tunnelKind`, `errorCode` |
+| `tunnel.record_failed` | `routes/mcp/tunnels.ts` | `tunnelKind`, `tunnelDomain?`, `errorCode` |
+| `chat.session.persist.failed` | `utils/chat-ingestion.ts` | `failureKind`, `statusCode?`, `sourceType?` |
+| `chat.secrets.undelivered` | `routes/web/chat-v2.ts` | `secretCount`, `isScenarioSession` |
+| `chat.builtin_tools.withheld` | `routes/web/chat-v2.ts` | `toolIds`, `unknownCount`, `reasons`, `targetKind` |
+| `chat.harness_model_unverified` | `routes/web/chat-v2.ts`, `routes/mcp/chat-v2.ts` | `harness`, `modelId`, `reason` |
+| `agent.loop_guard.tripped` | `utils/agent-loop-guard.ts` (from `routes/web/mcpjam-agent.ts`, `routes/web/chat-v2.ts`) | `surface`, `reason`, `steps`, `maxSteps`, `toolName?` |
+| `widget.resource.served` | `routes/apps/mcp-apps/index.ts` | `widgetType`, `resourceUri`, `cspMode`, `mimeTypeValid?` |
+| `widget.resource.failed` | `routes/apps/mcp-apps/index.ts` | `widgetType`, `resourceUri?`, `errorCode` |
+| `plugin.instance.request.timing` | `routes/web/plugin-instances.ts` | `action`, `statusCode`, `totalMs`, `spans` (per-step `count`/`totalMs`/`maxMs`) |
+| `swarm.generation.upstream_failed` | `routes/web/swarm-generate.ts` | `statusCode`, `errorCode` |
+| `browser_profile.download.failed` | `routes/web/browser-profile-download.ts` | `stage`, `statusCode?`, `errorMessage?` |
+| `apikey.expiry.workos_refused` | `routes/web/api-keys.ts` | `statusCode` |
+| `apikey.inventory.truncated` | `routes/web/api-keys.ts` | `listed` |
+| `apikey.admin_revoke.completed` | `routes/web/api-keys.ts` | `workosKeyId`, `alreadyRevoked`, `bindingCleanupFailed`, `bindingCleanupAttempts`, `bindingStatus?` |
+| `apikey.admin_revoke.unavailable` | `routes/web/api-keys.ts` | `workosKeyId`, `errorMessage` |
+| `auth.session.revoke_incomplete` | `routes/web/auth-session.ts` | `reason`, `status` |
+| `computer.terminal.input_failed` | `routes/web/computer-terminal.ts` | `errorCode` |
+| `mcp.connection.closed_with_pending_requests` | `index.ts` (system event) | `errorCode` |
+| `process.vitals` | `utils/process-vitals.ts` (system event) | `reason`, `heapUsedBytes`, `heapLimitBytes`, `oldSpaceUsedBytes`, `rpcLogBufferBytes`, `peakHeapUsedBytes` |
+
+All events live in `server/utils/log-events.ts`. Add new events there before emitting them.
+
+---
+
+## Adding a new event
+
+1. Add the event name and payload type to `RequestEventMap` (or `SystemEventMap`) in `log-events.ts`.
+2. Emit it with `getRequestLogger(c, "routes.your.component").event("your.event.name", payload)`.
+3. Add a row to the catalog table above.
+
+---
+
+## Scrubbing
+
+Every row — `logger.event`, `logger.info/warn/error/debug` — and the context `logger.error`
+attaches to Sentry goes through `scrubLogPayload` (`shared/log-scrubber.ts`). The Sentry SDK's own
+attachments (request body, headers, breadcrumbs, exception text) go through the same module via
+`beforeSend` / `beforeBreadcrumb` (`shared/sentry-config.ts`).
+
+- **Credentials.** Forbidden key substrings (token, secret, email, authorization, cookie, apikey,
+  stripe\*, pkce\*) are replaced with `"[redacted]"` — unless the value is just a URL
+  (`tokenEndpoint`), which keeps its origin. String values lose Bearer tokens, JWTs, email
+  addresses, `sk-` keys and `key=value` secrets.
+- **Customer content.** A key whose last word names a prompt, message, content, input/output,
+  args/params, result, body, payload, headers, text, snapshot or title — or a typed label such as
+  `serverName` — keeps its shape (`{city: string(6), nights: number}`) and loses its values.
+- **Free text.** Every web URL is cut to its origin (`https://mcp.acme.com/…`). Strings are capped
+  at 1000 characters; error text (`error`, `message`, `cause`, `stderr`, `*Error`…) at 500.
+
+Ids, codes, statuses, counts, model ids and tool names pass through. If a field you need is being
+shaped, rename it to say what it is (`client`, not `body`) rather than widening the scrubber.
+
+---
+
+## ESLint enforcement
+
+`eslint.config.js` warns on new `logger.warn|error|info` calls in `server/routes/web/`.
+Run `npx eslint server/routes/web/` to check before committing route changes.

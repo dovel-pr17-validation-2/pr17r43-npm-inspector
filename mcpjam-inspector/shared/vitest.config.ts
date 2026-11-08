@@ -1,0 +1,109 @@
+import { defineConfig } from "vitest/config";
+import path from "path";
+
+const rootDir = path.resolve(__dirname, "..");
+const sdkIndexEntry = path.resolve(rootDir, "../sdk/src/index.ts");
+const sdkOperationsEntry = path.resolve(rootDir, "../sdk/src/operations.ts");
+const sdkSkillReferenceEntry = path.resolve(
+  rootDir,
+  "../sdk/src/skill-reference.ts",
+);
+const sdkMatchersEntry = path.resolve(rootDir, "../sdk/src/matchers.ts");
+const sdkBrowserEntry = path.resolve(rootDir, "../sdk/src/browser.ts");
+const sdkPredicatesEntry = path.resolve(
+  rootDir,
+  "../sdk/src/predicates/index.ts",
+);
+const sdkAssertionsEntry = path.resolve(
+  rootDir,
+  "../sdk/src/assertions/index.ts",
+);
+// The versioned contract — now the canonical home of the step union that
+// `shared/steps.ts` re-exports. Needs its own alias BEFORE the bare
+// `@mcpjam/sdk` entry below: a string `find` matches by prefix, so without it
+// `@mcpjam/sdk/contract` would rewrite to `<sdk index>.ts/contract`.
+const sdkContractEntry = path.resolve(rootDir, "../sdk/src/contract/index.ts");
+// `shared/harness-model-support.ts` keys its pinned versions by the SDK's
+// harness ids. Same prefix-match reason as the contract entry above.
+// MCP Events: the shared event-turn prompt the chat parses (same prefix-match
+// reason as the contract entry above).
+const sdkEventsEntry = path.resolve(rootDir, "../sdk/src/events/index.ts");
+const sdkHostConfigInternalEntry = path.resolve(
+  rootDir,
+  "../sdk/src/host-config/internal.ts",
+);
+
+export default defineConfig({
+  define: {
+    __MCPJAM_SDK_VERSION__: JSON.stringify("test"),
+  },
+  plugins: [
+    {
+      name: "raw-markdown-for-sdk-tests",
+      transform(source, id) {
+        if (!id.endsWith(".md")) {
+          return null;
+        }
+
+        return {
+          code: `export default ${JSON.stringify(source)};`,
+          map: null,
+        };
+      },
+    },
+  ],
+  test: {
+    globals: true,
+    environment: "node",
+    include: ["**/__tests__/**/*.test.ts"],
+    exclude: ["node_modules", "dist"],
+    testTimeout: 30000,
+    hookTimeout: 30000,
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "json", "html"],
+      include: ["**/*.ts"],
+      exclude: ["**/__tests__/**", "**/*.test.ts", "vitest.config.ts"],
+    },
+  },
+  resolve: {
+    alias: [
+      { find: "@mcpjam/sdk/public-api", replacement: path.resolve(rootDir, "../sdk/src/public-api/index.ts") },
+      { find: "@mcpjam/sdk/internal/telemetry", replacement: path.resolve(rootDir, "../sdk/src/internal/telemetry.ts") },
+      {
+        find: "@mcpjam/sdk/host-compat",
+        replacement: path.resolve(rootDir, "../sdk/src/host-compat/index.ts"),
+      },
+      {
+        find: "@mcpjam/sdk/widget-runtime",
+        replacement: path.resolve(
+          rootDir,
+          "../sdk/src/widget-runtime/index.ts",
+        ),
+      },
+      {
+        find: "@mcpjam/sdk/skill-reference",
+        replacement: sdkSkillReferenceEntry,
+      },
+      { find: "@mcpjam/sdk/operations", replacement: sdkOperationsEntry },
+      { find: "@mcpjam/sdk/matchers", replacement: sdkMatchersEntry },
+      { find: "@mcpjam/sdk/browser", replacement: sdkBrowserEntry },
+      { find: "@mcpjam/sdk/predicates", replacement: sdkPredicatesEntry },
+      { find: "@mcpjam/sdk/assertions", replacement: sdkAssertionsEntry },
+      { find: "@mcpjam/sdk/contract", replacement: sdkContractEntry },
+      { find: "@mcpjam/sdk/events", replacement: sdkEventsEntry },
+      {
+        find: "@mcpjam/sdk/host-config/internal",
+        replacement: sdkHostConfigInternalEntry,
+      },
+      { find: "@mcpjam/sdk", replacement: sdkIndexEntry },
+      // A history test reads the client's transcript conversion, which imports
+      // chat-ui; its published entry points at dist, so resolve from source.
+      {
+        find: /^@mcpjam\/chat-ui$/,
+        replacement: path.resolve(rootDir, "../chat-ui/src/index.ts"),
+      },
+      { find: "@/shared", replacement: path.resolve(__dirname, "./") },
+    ],
+  },
+});

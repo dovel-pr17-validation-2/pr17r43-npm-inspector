@@ -1,0 +1,262 @@
+---
+title: "MCP Apps Conformance"
+description: "Validate MCP Apps tool metadata and ui:// resource wiring from the CLI"
+icon: "app-window"
+---
+
+The `apps conformance` command validates the server-side MCP Apps surface your server exposes through tools and `ui://` resources.
+
+Use `tools call --ui` when you want to execute one UI-capable tool and render the completed result in the local Inspector App Builder.
+
+<Note>
+  This is currently **server-side** MCP Apps conformance only. A passing run does
+  **not** prove full SEP-1865 host behavior such as `ui/initialize`,
+  `ui/notifications/tool-input` ordering, sandbox proxy behavior, or host
+  display-mode handling.
+</Note>
+
+## Quick start
+
+```bash
+mcpjam apps conformance --url https://your-server.com/mcp
+```
+
+For a local stdio server:
+
+```bash
+mcpjam apps conformance --command node --args server.js --cwd /path/to/project
+```
+
+You can emit CI-friendly JUnit XML from either the single-run or suite command:
+
+```bash
+mcpjam apps conformance \
+  --url https://your-server.com/mcp \
+  --reporter junit-xml > apps-report.xml
+```
+
+To reproduce one tool result in the local Inspector:
+
+```bash
+mcpjam tools call \
+  --url https://your-server.com/mcp \
+  --tool-name create_view \
+  --tool-args @params.json \
+  --ui \
+  --quiet \
+  --format json
+```
+
+## What it checks
+
+The current runner validates:
+
+1. MCP Apps tools are present.
+2. Tool metadata uses valid `_meta.ui.resourceUri` and `visibility` values.
+3. Tool `inputSchema` is a non-null JSON Schema object.
+4. Listed UI resources use `ui://` URIs and `text/html;profile=mcp-app`.
+5. Referenced UI resources can be fetched with `resources/read`.
+6. Resource contents provide exactly one HTML payload via `text` or `blob`.
+7. `_meta.ui.csp`, `permissions`, `domain`, and `prefersBorder` use valid shapes.
+
+## Example output
+
+```bash
+mcpjam apps conformance \
+  --url https://your-server.com/mcp \
+  --format json
+```
+
+Typical success summary:
+
+```json
+{
+  "passed": true,
+  "outcome": "passed",
+  "summary": "7/7 checks passed, 0 failed, 0 could not run, 0 not applicable",
+  "discovery": {
+    "toolCount": 3,
+    "uiToolCount": 1,
+    "listedResourceCount": 1,
+    "listedUiResourceCount": 1,
+    "checkedUiResourceCount": 1
+  }
+}
+```
+
+## Suite runner
+
+Use `apps conformance-suite` when you want a named CI matrix from a config file.
+
+Example config:
+
+```json
+{
+  "name": "Apps CI",
+  "target": {
+    "url": "https://your-server.com/mcp",
+    "timeout": 30000
+  },
+  "defaults": {
+    "checkIds": ["ui-tools-present", "ui-tool-metadata-valid"]
+  },
+  "runs": [
+    {
+      "label": "metadata"
+    },
+    {
+      "label": "resources",
+      "checkIds": [
+        "ui-resources-readable",
+        "ui-resource-contents-valid",
+        "ui-resource-meta-valid"
+      ]
+    }
+  ]
+}
+```
+
+Run it with:
+
+```bash
+mcpjam apps conformance-suite \
+  --config ./apps-conformance.json \
+  --reporter junit-xml > apps-report.xml
+```
+
+`target` uses the same shared server shape as the rest of the CLI, so it can point at either:
+
+- an HTTP target with `url`
+- a stdio target with `command`, optional `args`, optional `env`, and optional `cwd`
+
+## Categories and check ids
+
+Two categories are available:
+
+- `tools`
+- `resources`
+
+Specific check ids:
+
+- `ui-tools-present`
+- `ui-tool-metadata-valid`
+- `ui-tool-input-schema-valid`
+- `ui-listed-resources-valid`
+- `ui-resources-readable`
+- `ui-resource-contents-valid`
+- `ui-resource-meta-valid`
+
+Use `--category` to run a subset by category, or `--check-id` to run specific checks.
+
+```bash
+# Tool-only checks
+mcpjam apps conformance \
+  --url https://your-server.com/mcp \
+  --category tools
+
+# Specific checks
+mcpjam apps conformance \
+  --url https://your-server.com/mcp \
+  --check-id ui-resources-readable \
+  --check-id ui-resource-contents-valid
+```
+
+<Note>
+  If you pass both `--category` and `--check-id`, the explicit `--check-id`
+  selection wins.
+</Note>
+
+## Render one app result
+
+Use `tools list` to find UI-capable tools. A tool has interactive UI when its metadata includes `_meta.ui.resourceUri`, deprecated `_meta["ui/resourceUri"]`, or `openai/outputTemplate` in `toolsMetadata`.
+
+Then use `tools call --ui` when you need to inspect the output of one UI-capable tool call. The CLI starts or attaches to the local Inspector backend, opens Inspector by default in a TTY, connects the target server, focuses App Builder in the active Inspector browser client, injects the already-completed tool result, and requests a UI snapshot. `--inspector-url` is the Inspector backend/API URL; `--frontend-url` is the browser/client URL and skips frontend discovery. Use `--no-open` when browser automation already opened `http://127.0.0.1:6274/#app-builder`; use `--attach-only` to disallow startup, browser opening, and discovery. Default non-TTY `--ui` runs do not open a browser unless `--open` is passed. TTY stderr runs print the App Builder URL and initial wait progress unless `--quiet` is set; the elapsed-seconds heartbeat only appears when stderr is a TTY.
+
+```bash
+mcpjam tools call \
+  --command node --args server.js --cwd /path/to/project \
+  --tool-name create_view \
+  --tool-args @params.json \
+  --ui \
+  --protocol mcp-apps \
+  --device desktop \
+  --theme light \
+  --format json
+```
+
+<Note>
+  `tools call --ui` executes the server tool once. Inspector receives the
+  completed result through `renderToolResult`, so the UI render path does not
+  call the tool a second time. The rendered state lives in the active Inspector
+  client; opening the URL in a fresh tab later does not hydrate the old render.
+</Note>
+
+If `inspectorRender.status` is `skipped`, the tool call succeeded but Inspector had no active browser client, a render precondition was missing, or the render wait timed out; the envelope includes a stable root `warning` and `inspectorRender.warning` with one of the stable codes `no_active_client`, `timeout`, `disconnected_server`, or `unsupported_in_mode`, plus an `inspectorRender.remediation` hint. Non-quiet runs print a stderr tip, and the command keeps the tool-call exit code unless `--require-render` is set. If the command returns `success: false` with an `error`, check whether the failure came from `result` or from an Inspector render command.
+
+Raw `ui://` resource HTML can be inspected directly:
+
+```bash
+mcpjam resources read \
+  --url https://your-server.com/mcp \
+  --resource-uri ui://widget/app.html \
+  --quiet \
+  --format json
+```
+
+## Shared connection flags
+
+`apps conformance` uses the same shared target flags as the rest of the CLI:
+
+| Flag | Description |
+|------|-------------|
+| `--transport <transport>` | Explicit transport type (`http` or `stdio`) |
+| `--url <url>` | HTTP MCP server URL |
+| `--access-token <token>` | Bearer access token |
+| `--oauth-access-token <token>` | OAuth bearer access token |
+| `--refresh-token <token>` | OAuth refresh token |
+| `--client-id <id>` | OAuth client ID (with `--refresh-token`) |
+| `--client-secret <secret>` | OAuth client secret (with `--refresh-token`) |
+| `--header <header>` | HTTP header in `Key: Value` format (repeatable) |
+| `--client-capabilities <json>` | Client capabilities as inline JSON, `@path`, or `-` for stdin |
+| `--command <command>` | Command for a stdio server |
+| `--args <arg...>` | Preferred stdio command arguments |
+| `--command-args <arg>` | Legacy stdio command argument (repeatable) |
+| `-e, --env <env...>` | Stdio environment `KEY=VALUE` values |
+| `--cwd <path>` | Working directory for the stdio child process |
+
+Stdio child processes inherit the parent shell environment by default. Use
+`-e/--env` to add values or override inherited ones when the app server needs
+project-specific configuration.
+`--transport` is optional; without it, `--url` implies HTTP and `--command`
+implies stdio.
+
+## Outcomes: passed, failed, incomplete
+
+A run reports one of three outcomes, and `passed` is `true` only for the first:
+
+| `outcome` | Exit code | Meaning |
+|---|---|---|
+| `passed` | `0` | Every selected check either ran and passed, or does not apply to this server. |
+| `failed` | `1` | At least one check found a violation. |
+| `incomplete` | `3` | Nothing failed, but at least one selected check could not be run, so the run does not establish conformance. |
+
+Every skipped check carries a `skipReason`:
+
+- `not-applicable` — the check cannot apply here (no MCP Apps tools discovered, no UI resources listed). These never hold a run back.
+- `could-not-run` — the check applies but was never exercised (tools/list did not complete, connection failed). These make the run `incomplete`.
+
+An incomplete run carries a root `incompleteReason` naming the checks that did not run and what to change; non-quiet runs also print it to stderr. For a suite, the exit code is the worst of all runs (failure outranks incomplete).
+
+## Notes
+
+- The runner always advertises the MCP Apps UI extension capability so servers do not hide their MCP Apps surface when custom client capabilities are provided.
+- Deprecated `_meta["ui/resourceUri"]` is accepted. Tools that still use it are reported as one "Deprecation Notice" advice item (`apps-readiness-deprecated-resource-uri`), printed under `Advice` on stderr (suppressed by `--quiet`). It costs no points and never changes the exit code.
+- Tool name conventions (length, character set, uniqueness) are core MCP rules, so this suite does not check them. The protocol suite reports them on every tool as the advice item `readiness-tool-name-conventions`, on protocol 2025-11-25 and later.
+- `permissions` are validated against the SEP-1865 object shape, for example `geolocation: {}` instead of booleans.
+- Exit codes are CI-friendly: `0` when all selected checks pass, `1` when any check fails, `2` for invalid command usage or config files, and `3` when the run is incomplete because a selected check could not be run.
+
+## Related commands
+
+- [Server inspection](/cli/server-inspection) for breadth-first connectivity and capability triage
+- [Tools, resources & prompts](/cli/tools-resources-prompts) for direct connected checks
+- [Command reference](/cli/reference) for the full flag list

@@ -1,0 +1,626 @@
+/**
+ * The in-sandbox bridge for the `codex app-server` transport.
+ *
+ * Bundled to `bridge.mjs` and spawned inside the box by the host adapter. It
+ * owns one long-lived `codex app-server` child and one thread; the framework's
+ * `runBridge` owns the socket, the event log, replay and the lifecycle files.
+ *
+ * Boot order matters and is not arbitrary:
+ *
+ *   1. the host-tool relay binds first, because
+ *   2. the rendered `CODEX_HOME` has to name its port, because
+ *   3. Codex reads that config at startup. Forwarding credentials can later
+ *      rotate through its explicit MCP reload without resuming a model turn.
+ *
+ * Host-executed tool catalog changes still require a new runtime; they are
+ * separate from rotating credentials for the same native MCP server set.
+ */
+import { mkdirSync } from "node:fs";
+import { isAbsolute, join } from "node:path";
+import { runBridge, type BridgeTurn } from "@ai-sdk/harness/bridge";
+import { callHostTool } from "./host-tool-call.js";
+import { RELAY_MCP_SERVER_NAME } from "../shared/tool-names.js";
+import {
+  runtimeConfigFingerprint,
+  turnConfigurationFingerprintInput,
+} from "../shared/turn-fingerprint.js";
+import type { StartMessage } from "../codex-appserver-bridge-protocol.js";
+import {
+  parseWorkspaceWriteSandboxPolicy,
+  sandboxPolicyFingerprint,
+  type CodexWorkspaceWriteSandboxPolicy,
+} from "../shared/sandbox-policy.js";
+import {
+  spawnAppServerClient,
+  type AppServerClient,
+} from "./app-server-client.js";
+import type {
+  CodexApprovalPolicy,
+  CodexSandboxMode,
+  CodexSandboxPolicy,
+  JsonRpcNotification,
+  ThreadStartParams,
+  TurnStartResult,
+} from "./app-server-protocol.js";
+import {
+  createNativeMcpRefresher,
+  type NativeMcpRuntime,
+} from "./native-mcp-refresh.js";
+import { waitForMcpStartup, waitForNativeMcpServers } from "./native-mcp-ready.js";
+import { needsNativeMcpReload } from "../shared/native-mcp.js";
+import { createApprovalController } from "./approval-controller.js";
+import { foreignMcpServerOverrides } from "./mcp-isolation.js";
+import { setupWindowsSandbox } from "./windows-sandbox-setup.js";
+import { openConfiguredThread } from "./thread-configuration.js";
+import { buildHostToolCatalog } from "./host-tool-catalog.js";
+import { prepareCodexHome, untrustedProjectPathsFor, type CodexHomeInput } from "./codex-home.js";
+import { startHostToolRelay, type HostToolRelay } from "./host-tool-relay.js";
+import { createStreamTranslator } from "./stream-translator.js";
+
+type Args = {
+  workdir: string;
+  bridgeStateDir: string;
+  sessionDataDir: string;
+  /** Where Codex itself is installed (`node_modules/@openai/codex`). */
+  vendorDir: string;
+  /** Where MCPJam's own entrypoints are (`host-tools-mcp.mjs`). */
+  layerDir: string;
+};
+
+/**
+ * In a sandbox one `--bootstrap-dir` holds everything: the recipe installed
+ * Codex next to our bundles. A LOCAL session splits it along the two trusted
+ * sources — the verified vendor pack (`--vendor-dir`) and the Inspector layer
+ * (`--layer-dir`) — so each half is read from where it was verified. Either
+ * flag falls back to `--bootstrap-dir`, so the hosted launch is unchanged.
+ */
+export function parseArgs(argv: string[]): Args {
+  const read = (flag: string): string | undefined => {
+    const index = argv.indexOf(`--${flag}`);
+    return index === -1 ? undefined : argv[index + 1];
+  };
+  const workdir = read("workdir") ?? process.cwd();
+  const bootstrapDir = read("bootstrap-dir") ?? process.cwd();
+  return {
+    workdir,
+    bridgeStateDir:
+      read("bridge-state-dir") ?? join(workdir, ".harness-bridge"),
+    sessionDataDir: read("session-data-dir") ?? join(workdir, ".codex-session"),
+    vendorDir: read("vendor-dir") ?? bootstrapDir,
+    layerDir: read("layer-dir") ?? bootstrapDir,
+  };
+}
+
+/**
+ * Is this bridge supervised on a user's own machine rather than inside a cloud
+ * sandbox? The local supervisor ALWAYS sets `MCPJAM_LOCAL_CONTROL_ROOT` in the
+ * child environment (`session-env.ts`) and a cloud box never has it, so its
+ * presence is the one signal that there is no outer boundary around Codex.
+ */
+export function isSupervisedLocally(
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return (
+    typeof env.MCPJAM_LOCAL_CONTROL_ROOT === "string" &&
+    env.MCPJAM_LOCAL_CONTROL_ROOT.length > 0
+  );
+}
+
+export class CodexPermissionRefusedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CodexPermissionRefusedError";
+  }
+}
+
+/**
+ * Permission mode → Codex's policy and sandbox. FAIL CLOSED.
+ *
+ * `untrusted` is what produces approval requests. Measured on 0.149.1
+ * (PROBES.md (c)): it asks about EVERY command — `pwd`, `ls` and `cat`
+ * included — and about every file change (both `apply_patch` forms), so an
+ * attended Codex turn prompts more than an attended Claude Code one, and the
+ * product must not claim reads are free. `allow-edits` maps the same way as
+ * `allow-reads` deliberately — Codex has no middle policy that gates only
+ * writes, and the safe direction when the host asked for approval is to ask
+ * more, not less.
+ *
+ * `allow-all` means nobody is there to approve. In a cloud sandbox the box is
+ * the boundary, so that is `danger-full-access`. On a user's machine it is
+ * legal ONLY with an explicit workspace-write `sandboxPolicy` (the unattended
+ * local arm, `shared/sandbox-policy.ts`): `danger-full-access` under local
+ * supervision would hand an unattended agent the OS user's whole authority,
+ * so it is refused rather than silently granted.
+ *
+ * Anything that is not one of the three framework modes is refused too. The
+ * previous mapping turned an unknown string into `danger-full-access`, which
+ * meant a typo or a future mode name granted the widest access there is.
+ */
+export function toCodexPermissions(
+  mode: string | undefined,
+  options: {
+    sandboxPolicy?: CodexWorkspaceWriteSandboxPolicy | undefined;
+    supervisedLocally?: boolean;
+    warmWorkDir?: string;
+  } = {},
+): {
+  approvalPolicy: CodexApprovalPolicy;
+  sandbox: CodexSandboxMode;
+  sandboxPolicy?: CodexSandboxPolicy;
+} {
+  // Checked here, not trusted: the framework only `JSON.parse`s the start
+  // message, so a policy of any shape (e.g. `dangerFullAccess`) would
+  // otherwise reach `turn/start` as-is.
+  if (options.warmWorkDir !== undefined &&
+      (options.supervisedLocally || !isAbsolute(options.warmWorkDir))) {
+    throw new CodexPermissionRefusedError("A warm Codex turn requires an absolute hosted working directory.");
+  }
+  let sandboxPolicy: CodexWorkspaceWriteSandboxPolicy | undefined;
+  if (options.sandboxPolicy !== undefined) {
+    const parsed = parseWorkspaceWriteSandboxPolicy(options.sandboxPolicy);
+    if (parsed === null) {
+      throw new CodexPermissionRefusedError(
+        "Refusing a command-sandbox policy that is not MCPJam's " +
+          "workspace-write policy.",
+      );
+    }
+    if (options.supervisedLocally && parsed.networkAccess) {
+      throw new CodexPermissionRefusedError(
+        "Refusing command network access for a turn on a user's machine.",
+      );
+    }
+    sandboxPolicy = parsed;
+  }
+  switch (mode ?? "allow-all") {
+    case "allow-reads":
+    case "allow-edits":
+      return {
+        approvalPolicy: "untrusted",
+        sandbox: "workspace-write",
+        ...(sandboxPolicy ? { sandboxPolicy } : options.warmWorkDir
+          ? { sandboxPolicy: { type: "workspaceWrite", networkAccess: false } } : {}),
+      };
+    case "allow-all":
+      if (sandboxPolicy) {
+        return {
+          approvalPolicy: "never",
+          sandbox: "workspace-write",
+          sandboxPolicy: { ...sandboxPolicy },
+        };
+      }
+      if (options.supervisedLocally) {
+        throw new CodexPermissionRefusedError(
+          "Refusing to start Codex with danger-full-access on a user's " +
+            "machine: an unattended local turn must carry an explicit " +
+            "workspace-write sandbox policy.",
+        );
+      }
+      return {
+        approvalPolicy: "never", sandbox: "danger-full-access",
+        ...(options.warmWorkDir ? { sandboxPolicy: { type: "dangerFullAccess" } as const } : {}),
+      };
+    default:
+      throw new CodexPermissionRefusedError(
+        `Unknown permission mode ${JSON.stringify(mode)}; refusing rather ` +
+          `than guessing how much access to grant.`,
+      );
+  }
+}
+
+/**
+ * The per-thread config layer: the host's `codexConfig`, plus a disable entry
+ * for every MCP server a system or managed layer declares (`mcp-isolation.ts`)
+ * so MCPJam's relay is the model's only MCP surface. The relay's own entry is
+ * rendered into `CODEX_HOME` and never overridden here.
+ */
+function withThreadConfig(
+  start: StartMessage,
+  effectiveConfig?: unknown,
+): { config?: Record<string, unknown> } {
+  const config = threadConfig(start, effectiveConfig);
+  return Object.keys(config).length > 0 ? { config } : {};
+}
+
+function threadConfig(start: StartMessage, effectiveConfig?: unknown): Record<string, unknown> {
+  const config: Record<string, unknown> = { ...(start.codexConfig ?? {}) };
+  const foreign = foreignMcpServerOverrides({ keep: RELAY_MCP_SERVER_NAME, effectiveConfig });
+  if (Object.keys(foreign).length > 0) {
+    const existing =
+      config.mcp_servers && typeof config.mcp_servers === "object"
+        ? (config.mcp_servers as Record<string, unknown>)
+        : {};
+    config.mcp_servers = { ...foreign, ...existing };
+  }
+  for (const key of Object.keys(start.nativeMcpServers ?? {})) {
+    if (config.mcp_servers && typeof config.mcp_servers === "object") {
+      delete (config.mcp_servers as Record<string, unknown>)[key];
+    }
+  }
+  return config;
+}
+
+/** Configuration whose change cannot be applied to a live thread. */
+function turnConfigurationFingerprint(start: StartMessage): string {
+  return JSON.stringify({
+    // Shared with the host so the two cannot disagree about what a "changed
+    // tool" is — and over the whole descriptor, not just the name: a tool whose
+    // schema changed under a fixed name is invisible to a live thread.
+    turn: turnConfigurationFingerprintInput({
+      instructions: start.instructions,
+      tools: start.tools ?? [],
+    }),
+    permissionMode: start.warmWorkDir ? undefined : start.permissionMode ?? "allow-all",
+    // A changed command sandbox is a changed configuration: a resumed thread
+    // would otherwise keep running under the previous one.
+    sandboxPolicy: start.warmWorkDir ? undefined : sandboxPolicyFingerprint(start.sandboxPolicy),
+    webSearch: start.webSearch ?? false,
+    model: start.warmWorkDir ? undefined : start.model ?? "",
+  });
+}
+
+async function main(): Promise<void> {
+  const args = parseArgs(process.argv.slice(2));
+  mkdirSync(args.sessionDataDir, { recursive: true });
+
+  let client: AppServerClient | undefined;
+  let relay: HostToolRelay | undefined;
+  let threadId: string | undefined;
+  let lastFingerprint: string | undefined;
+  /** Set by the current turn so the relay can reach its tool channel. */
+  let activeTurn:
+    | {
+        turn: BridgeTurn;
+        aliasToCanonical: Map<string, string>;
+      }
+    | undefined;
+  let catalog = buildHostToolCatalog([]);
+  /**
+   * The config that is baked into `CODEX_HOME` when the runtime starts, and
+   * therefore CANNOT be changed on a running one.
+   *
+   * Two things live here, and both are invisible to a restarted THREAD:
+   *
+   *  - `web_search`, written by `prepareCodexHome()` and not a `thread/start`
+   *    parameter, so a reused process runs the new turn under the FIRST turn's
+   *    setting.
+   *  - the HOST-TOOL CATALOG. Codex reads its MCP server's tool list once, when
+   *    the process starts, and this adapter wires no `tools/list_changed`. A
+   *    reused process therefore keeps the tool set it booted with: a newly
+   *    selected server is uncallable, and a removed one stays callable. The
+   *    turn fingerprint restarts the thread on the same change, which is not
+   *    enough — the thread is not what holds the catalog.
+   */
+  let runtimeConfig: string | undefined;
+  let nativeHome: CodexHomeInput | undefined;
+  const invalidateRuntime = async (runtime: NativeMcpRuntime) => {
+    nativeHome = undefined;
+    if (client !== runtime) return;
+    client = undefined;
+    threadId = undefined;
+    const oldRelay = relay;
+    relay = undefined;
+    await oldRelay?.close();
+  };
+  const retireRuntime = async (runtime: NativeMcpRuntime) => {
+    try {
+      await runtime.kill();
+    } finally {
+      await invalidateRuntime(runtime);
+    }
+  };
+  const nativeRefresh = createNativeMcpRefresher({
+    current: () => client && nativeHome ? { runtime: client, home: nativeHome, threadId } : undefined,
+    commit: (home) => { nativeHome = home; },
+    invalidate: invalidateRuntime,
+  });
+  const runtimeConfigOf = (start: StartMessage): string =>
+    runtimeConfigFingerprint(start);
+
+  const ensureRuntime = async (start: StartMessage): Promise<void> => {
+    const wanted = runtimeConfigOf(start);
+    if (client && runtimeConfig !== undefined && runtimeConfig !== wanted) {
+      // Tear the old one down before rebuilding: the relay holds a port and the
+      // child holds the stale CODEX_HOME.
+      await client.kill();
+      await relay?.close();
+      client = undefined;
+      relay = undefined;
+      threadId = undefined;
+    }
+    runtimeConfig = wanted;
+    if (client) return;
+
+    relay = await startHostToolRelay({
+      listTools: () => catalog.descriptors,
+      callTool: (request) => callHostTool(activeTurn, request),
+    });
+
+    const homeInput: CodexHomeInput = {
+      codexHome: join(args.sessionDataDir, "codex-home"),
+      nativeMcpServers: start.nativeMcpServers,
+      // Delivered per session as the adapter's credential environment: the
+      // hosted proxy's `…/openai/v1`, or the local gateway's bare origin. The
+      // real lease is injected outside the process; `CODEX_API_KEY` is the
+      // placeholder (or local capability) that satisfies Codex's auth check.
+      baseUrl: process.env.OPENAI_BASE_URL ?? "https://api.openai.com/v1",
+      apiKeyEnvVar: "CODEX_API_KEY",
+      closeModelConnections: process.env.MCPJAM_CLOSE_MODEL_CONNECTIONS === "1",
+      hostToolsEntrypoint: join(args.layerDir, "host-tools-mcp.mjs"),
+      relayUrl: relay.url,
+      relayCredential: relay.credential,
+      webSearch: start.webSearch ?? false,
+      // Keeps the folder's own `.codex/config.toml` (MCP servers, hooks, exec
+      // policies) out: see `untrustedProjectPathsFor`.
+      untrustedProjectPaths: untrustedProjectPathsFor(args.workdir),
+    };
+    nativeHome = homeInput;
+    const codexHome = prepareCodexHome(homeInput);
+
+    client = spawnAppServerClient({
+      command: process.execPath,
+      args: [
+        join(
+          args.vendorDir,
+          "node_modules",
+          "@openai",
+          "codex",
+          "bin",
+          "codex.js",
+        ),
+        "app-server",
+      ],
+      cwd: args.workdir,
+      env: { ...process.env, CODEX_HOME: codexHome },
+      // Codex's own diagnostics, forwarded to the bridge's stderr — which the
+      // host already tails into a bridge startup error and its logs. Without
+      // this a Codex that failed to start (a sandbox it could not initialise,
+      // a config it rejected) surfaced only as an opaque exit code.
+      onStderrLine: (line) => {
+        process.stderr.write(`[codex] ${line}\n`);
+      },
+    });
+
+    /*
+     * A DEAD CLIENT MUST NOT BE REUSED.
+     *
+     * `AppServerClient` rejects every request once its child is gone, but
+     * nothing here noticed: `ensureRuntime` returns early on `if (client)`, so
+     * after Codex crashed, every later turn with the same fingerprint failed
+     * instantly on `thread/start` — permanently, since nothing ever rebuilt it.
+     * The turn that witnessed the crash reports it (see the `exited` race in
+     * `onStart`); this is about every turn after.
+     *
+     * Guarded on identity because `ensureRuntime`'s own teardown also resolves
+     * `exited`: by then it has already installed a replacement, and clearing
+     * `client` there would drop the runtime that was just built.
+     */
+    const spawned = client;
+    void spawned.exited.then(() => {
+      if (client !== spawned) return;
+      client = undefined;
+      // The parked thread lived in the process that just died.
+      threadId = undefined;
+      // The relay was reachable only by that Codex, and its credential was
+      // rendered into that CODEX_HOME. Nothing can call it now.
+      const orphaned = relay;
+      relay = undefined;
+      void orphaned?.close();
+    });
+
+    await client.request("initialize", {
+      clientInfo: {
+        name: "mcpjam-inspector",
+        title: "MCPJam Inspector",
+        version: "1.0.0",
+      },
+    });
+    client.notify("initialized", {});
+    if (process.platform === "win32") {
+      try {
+        await setupWindowsSandbox(spawned, args.workdir);
+      } catch (error) {
+        // A later turn must not reuse a process whose sandbox never initialized.
+        await spawned.kill();
+        if (client === spawned) client = undefined;
+        throw error;
+      }
+    }
+  };
+
+  const bridgeOptions: Parameters<typeof runBridge<StartMessage>>[0] & {
+    onMcpRefresh(candidate: unknown): Promise<void>;
+  } = {
+    onMcpRefresh: (candidate) => nativeRefresh.refresh(candidate),
+    // Kept as `codex`: `bridge-meta.json`'s type is matched by the framework's
+    // `waitForBridgeReady`, and both Codex transports are the same harness id.
+    bridgeType: "codex",
+    bridgeStateDir: args.bridgeStateDir,
+    onStop: () => ({ threadId }),
+    onDestroy: async () => {
+      await client?.kill();
+      await relay?.close();
+    },
+    async onStart(start, turn) {
+      // Decided FIRST, before anything starts: a turn whose permissions are
+      // refused must not spawn a Codex process at all.
+      const { approvalPolicy, sandbox, sandboxPolicy } = toCodexPermissions(
+        start.permissionMode,
+        {
+          sandboxPolicy: start.sandboxPolicy,
+          supervisedLocally: isSupervisedLocally(),
+          warmWorkDir: start.warmWorkDir,
+        },
+      );
+
+      // The catalog has to exist BEFORE Codex starts: it reads the MCP server's
+      // tools once, at startup.
+      catalog = buildHostToolCatalog(start.tools ?? []);
+      await nativeRefresh.settled();
+      const previousRuntime = client;
+      const previousThreadId = threadId ?? start.resumeThreadId;
+      await ensureRuntime(start);
+      const runtime = client;
+      if (!runtime) throw new Error("codex app-server failed to start");
+
+      const readinessTimeout = start.warmWorkDir && runtime === previousRuntime ? 1500 : undefined;
+      const removed = Object.keys(nativeHome?.nativeMcpServers ?? {}).filter(name => !(name in (start.nativeMcpServers ?? {})));
+      if (start.nativeMcpServers && nativeHome) {
+        const reload = needsNativeMcpReload(nativeHome.nativeMcpServers, start.nativeMcpServers);
+        nativeHome = {
+          ...nativeHome, nativeMcpServers: start.nativeMcpServers,
+          ...(start.warmWorkDir ? { untrustedProjectPaths: untrustedProjectPathsFor(start.warmWorkDir) } : {}),
+        };
+        prepareCodexHome(nativeHome);
+        try {
+          if (reload) await waitForNativeMcpServers({
+            runtime, serverNames: [], reload: true, signal: turn.abortSignal, timeoutMs: readinessTimeout,
+          });
+        } catch (error) {
+          await retireRuntime(runtime);
+          throw error;
+        }
+      }
+      activeTurn = {
+        turn,
+        aliasToCanonical: catalog.aliasToCanonical,
+      };
+
+      const translator = createStreamTranslator({
+        emit: (event) => turn.emit(event),
+        emitWarning: (input) => turn.emitWarning(input),
+        emitError: (input) => turn.emitError(input),
+        relayServerName: RELAY_MCP_SERVER_NAME,
+      });
+      const approvals = createApprovalController({ turn, translator });
+
+      runtime.onNotification((notification: JsonRpcNotification) => {
+        translator.handleNotification(notification);
+      });
+      runtime.onServerRequest((request) => approvals.handle(request));
+
+      const fingerprint = turnConfigurationFingerprint(start);
+      const mustRestart =
+        start.restartThread === true ||
+        (lastFingerprint !== undefined && lastFingerprint !== fingerprint);
+      if (mustRestart) threadId = undefined;
+      lastFingerprint = fingerprint;
+
+      const threadParams: ThreadStartParams = {
+        cwd: start.warmWorkDir ?? args.workdir,
+        approvalPolicy,
+        sandbox,
+        // Only meaningful when the policy asks anyone at all; harmless
+        // otherwise, and explicit beats relying on a default.
+        approvalsReviewer: "user",
+        ...(start.model ? { model: start.model } : {}),
+        ...(start.instructions
+          ? { developerInstructions: start.instructions }
+          : {}),
+        ...withThreadConfig(start, process.platform === "win32"
+          ? await runtime.request("config/read", { cwd: args.workdir, includeLayers: true })
+          : undefined),
+        serviceName: "mcpjam-inspector",
+      };
+
+      // A fresh thread must read the new catalog, while its fork retains the
+      // previous transcript. Never silently replace a conversation with empty history.
+      const resumeId = previousThreadId;
+      const thread = await openConfiguredThread(runtime, threadParams, resumeId, mustRestart);
+      threadId = thread.thread?.id ?? (mustRestart ? undefined : resumeId);
+      const nativeNames = Object.keys(start.nativeMcpServers ?? {});
+      if (!threadId) throw new Error("MCP startup requires a thread");
+      try {
+        await waitForMcpStartup({
+          runtime,
+          threadId,
+          serverNames: nativeNames,
+          ...(start.warmWorkDir ? {removedServerNames: removed} : {}),
+          timeoutMs: readinessTimeout,
+          signal: turn.abortSignal,
+        });
+      } catch (error) {
+        await retireRuntime(runtime);
+        throw error;
+      }
+      if (threadId) turn.emit({ type: "bridge-thread", threadId });
+      turn.emit({
+        type: "stream-start",
+        ...(thread.model ? { modelId: thread.model } : {}),
+      });
+
+      const started = await runtime.request<TurnStartResult>("turn/start", {
+        threadId,
+        input: [{ type: "text", text: start.prompt }],
+        ...(start.warmWorkDir ? { cwd: start.warmWorkDir, approvalPolicy } : {}),
+        ...(start.model ? { model: start.model } : {}),
+        ...(start.reasoningEffort ? { effort: start.reasoningEffort } : {}),
+        // Explicit, every turn it applies to. The schema's own workspace-write
+        // default leaves /tmp writable; see `shared/sandbox-policy.ts`.
+        ...(sandboxPolicy ? { sandboxPolicy } : {}),
+        summary: "detailed",
+        ...(start.responseFormat?.type === "json" && start.responseFormat.schema
+          ? { outputSchema: start.responseFormat.schema }
+          : {}),
+      });
+      const turnId = started.turn?.id;
+
+      const onAbort = () => {
+        // Order matters: cancel the pauses FIRST so nothing is still waiting on
+        // a human, then ask Codex to stop. Interrupting while an approval is
+        // outstanding would leave the child blocked on a request nobody is
+        // going to answer.
+        approvals.cancelAll();
+        relay?.cancelAll("turn aborted");
+        if (turnId) {
+          void runtime
+            .request("turn/interrupt", { threadId, turnId })
+            .catch(() => {});
+        }
+      };
+      if (turn.abortSignal.aborted) onAbort();
+      else turn.abortSignal.addEventListener("abort", onAbort, { once: true });
+
+      /*
+       * Whichever comes first. A child that dies mid-turn must settle the turn
+       * rather than leave `onStart` pending until the teardown grace expires.
+       *
+       * `settled` is what keeps the LOSER quiet. `Promise.race` does not cancel
+       * anything, so the `exited` handler outlives the turn that installed it
+       * — and it fires on the next runtime exit whenever that happens: a crash
+       * during somebody else's turn, or the ordinary `client.kill()` at
+       * teardown. Both emitted an error on this turn's handle long after it
+       * finished, which the host reads as a frame belonging to whatever turn is
+       * open now. Found by killing Codex between two live turns; the second
+       * turn inherited the first one's failure.
+       */
+      let settled = false;
+      await Promise.race([
+        translator.waitForTurn().then(() => {
+          settled = true;
+        }),
+        runtime.exited.then((error) => {
+          if (settled || !error) return;
+          settled = true;
+          turn.emitError({ error });
+          translator.finishTurn({ status: "failed" });
+        }),
+      ]);
+      settled = true;
+      activeTurn = undefined;
+    },
+  };
+  await runBridge<StartMessage>(bridgeOptions);
+}
+
+/*
+ * AUTOSTART IS OPT-IN.
+ *
+ * The bundle script appends the `main()` call to the built `bridge.mjs`, so the
+ * shipped artifact starts on its own. The SOURCE must not: this module also
+ * exports `toCodexPermissions`, and importing it from a unit test would
+ * otherwise bind a WebSocket server and spawn Codex. That is not hypothetical —
+ * it happened, and the test suite printed a `bridge-ready` line.
+ */
+if (process.env.MCPJAM_CODEX_APPSERVER_BRIDGE_AUTOSTART === "true") {
+  void main();
+}

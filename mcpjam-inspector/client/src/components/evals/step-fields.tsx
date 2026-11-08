@@ -1,0 +1,661 @@
+import { PAPER_FIELD_STYLES } from "./paper-field-styles";
+/**
+ * Per-kind step field editors, shared by the two surfaces that author steps.
+ *
+ * These were private to `StepListEditor` — the deep step list on `/evals`. The
+ * spine on the Evaluate surface authors the SAME four step kinds, and a second
+ * copy of an interact-action editor or a widget-assertion editor is how two
+ * surfaces start disagreeing about what a step can hold. Moved verbatim: the
+ * markup, the test ids and the field semantics are unchanged, and
+ * `StepListEditor` now imports them.
+ */
+
+import { useId } from "react";
+import {
+  CheckCircle2,
+  Gavel,
+  Loader2,
+  MessageSquare,
+  MinusCircle,
+  MousePointerClick,
+  Wrench,
+  XCircle,
+} from "lucide-react";
+import { Input } from "@mcpjam/design-system/input";
+import { Label } from "@mcpjam/design-system/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@mcpjam/design-system/select";
+import type { EvalStepStatus } from "@/shared/eval-stream-events";
+import type { ElementLocator } from "@/shared/scripted-steps";
+import {
+  isWidgetAssertion,
+  newStepId,
+  WIDGET_ASSERTION_LABELS,
+  type InteractAction,
+  type TestStep,
+  type WidgetAssertion,
+} from "@/shared/steps";
+import { blankPredicate } from "./checks-section";
+import { LocatorFields } from "./scripted-steps-editor";
+
+export type AvailableTool = {
+  name: string;
+  description?: string;
+  inputSchema?: any;
+  serverId?: string;
+  /** "system" = harness-native built-in (bash, read, …). Assertable by name,
+   *  but not invokable through MCPJam and never a widget view — the pinned
+   *  tool-call and "View (tool)" pickers filter these back out. */
+  source?: "system";
+};
+
+/** Tools MCPJam can actually invoke / render as a widget view — everything
+ *  except harness system tools. */
+export function invokableTools(tools: AvailableTool[]): AvailableTool[] {
+  return tools.filter((t) => t.source !== "system");
+}
+
+// ── per-kind labels / icons ───────────────────────────────────────────────────
+export const STEP_META: Record<
+  TestStep["kind"],
+  { label: string; Icon: typeof MessageSquare; tint: string }
+> = {
+  prompt: {
+    label: "Prompt",
+    Icon: MessageSquare,
+    tint: "text-sky-600 dark:text-sky-400",
+  },
+  toolCall: {
+    label: "Tool call",
+    Icon: Wrench,
+    tint: "text-violet-600 dark:text-violet-400",
+  },
+  interact: {
+    label: "Interact",
+    Icon: MousePointerClick,
+    tint: "text-amber-600 dark:text-amber-400",
+  },
+  assert: {
+    // A neutral "ruling" icon — NOT a green check. The check shape + emerald
+    // tint read as "passed", so a failing assertion looked passed regardless of
+    // its verdict. Verdict is carried by `StepStatusBadge` (✓/✗) instead; the
+    // type icon must stay verdict-neutral.
+    label: "Assertion",
+    Icon: Gavel,
+    tint: "text-indigo-600 dark:text-indigo-400",
+  },
+};
+
+/** Live status pip shown in a step card header during a quick run. */
+export function StepStatusBadge({ status }: { status: EvalStepStatus }) {
+  if (status === "running") {
+    return (
+      <Loader2
+        className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground"
+        aria-label="Step running"
+      />
+    );
+  }
+  if (status === "ok") {
+    return (
+      <CheckCircle2
+        className="h-3.5 w-3.5 shrink-0 text-emerald-600 dark:text-emerald-400"
+        aria-label="Step passed"
+      />
+    );
+  }
+  if (status === "skipped") {
+    // Fail-fast never ran this step — greyed, distinct from fail (red).
+    return (
+      <MinusCircle
+        className="h-3.5 w-3.5 shrink-0 text-muted-foreground/60"
+        aria-label="Step skipped"
+      />
+    );
+  }
+  return (
+    <XCircle
+      className="h-3.5 w-3.5 shrink-0 text-destructive"
+      aria-label="Step failed"
+    />
+  );
+}
+
+/**
+ * One line for a collapsed step.
+ *
+ * `serverNamesById` exists because an authored tool call carries the server's
+ * ID, not its name: a snapshot whose server answered `initialize` without
+ * `serverInfo` has no name to carry. Showing the raw ID told the reader
+ * nothing about which server the step runs on, so resolve it against the
+ * project's own servers and fall back to the ID only when nothing matches.
+ */
+export function summarizeStep(
+  step: TestStep,
+  serverNamesById?: Map<string, string>,
+): string {
+  switch (step.kind) {
+    case "prompt": {
+      const t = step.prompt.trim();
+      if (!t) return "Empty prompt";
+      return t.length > 72 ? `${t.slice(0, 72)}…` : t;
+    }
+    case "toolCall": {
+      const server =
+        (step.serverId && serverNamesById?.get(step.serverId)) ||
+        (step.serverName && serverNamesById?.get(step.serverName)) ||
+        step.serverName;
+      return `${step.toolName || "pick a tool"}${
+        server ? ` on ${server}` : ""
+      }`;
+    }
+    case "interact":
+      return `${step.action.kind} · ${step.toolName || "view"}`;
+    case "assert": {
+      const a = step.assertion;
+      if (isWidgetAssertion(a)) return `${a.kind} · ${a.toolName}`;
+      if (a.type === "toolCalledWith") return `tool called: ${a.toolName}`;
+      return a.type;
+    }
+    default:
+      return "";
+  }
+}
+
+// ── interact action sub-editor ────────────────────────────────────────────────
+export const INTERACT_ACTION_KINDS = [
+  "click",
+  "type",
+  "key",
+  "scroll",
+  "wait",
+] as const;
+
+export function defaultInteractAction(
+  kind: InteractAction["kind"],
+): InteractAction {
+  switch (kind) {
+    case "click":
+      return { kind: "click", target: { testId: "" } };
+    case "type":
+      return { kind: "type", target: { testId: "" }, text: "" };
+    case "key":
+      return { kind: "key", key: "" };
+    case "scroll":
+      return { kind: "scroll", direction: "down" };
+    case "wait":
+      return { kind: "wait", ms: 500 };
+  }
+}
+
+export function InteractActionFields({
+  value,
+  onChange,
+  readOnly = false,
+  paper = false,
+}: {
+  value: InteractAction;
+  onChange: (next: InteractAction) => void;
+  readOnly?: boolean;
+  paper?: boolean;
+}) {
+  const id = useId();
+  const labelClass = "text-sm font-medium leading-[18px]";
+  const fieldClass = paper ? "h-9 text-sm md:text-sm" : "h-7 text-[11px]";
+  const targetFields =
+    value.kind === "click" || value.kind === "type" ? (
+      <div className={paper ? "space-y-1.5" : undefined}>
+        {paper ? <div className={labelClass}>Target</div> : null}
+        <div
+          role={paper ? "group" : undefined}
+          aria-label={paper ? "Target" : undefined}
+          className={
+            paper
+              ? "[&_input]:h-9 [&_input]:text-sm [&_[data-slot=select-trigger]]:h-9 [&_[data-slot=select-trigger]]:text-sm"
+              : undefined
+          }
+        >
+          <LocatorFields
+            value={value.target}
+            onChange={(target) => onChange({ ...value, target })}
+            readOnly={readOnly}
+          />
+        </div>
+      </div>
+    ) : null;
+  return (
+    <div
+      className={
+        paper
+          ? `${PAPER_FIELD_STYLES} flex flex-col gap-1.5`
+          : "flex flex-col gap-1.5"
+      }
+    >
+      {paper ? (
+        <Label htmlFor={`${id}-kind`} className={labelClass}>
+          Action
+        </Label>
+      ) : null}
+      <Select
+        value={value.kind}
+        disabled={readOnly}
+        onValueChange={(next) =>
+          onChange(defaultInteractAction(next as InteractAction["kind"]))
+        }
+      >
+        <SelectTrigger
+          id={`${id}-kind`}
+          aria-label="Interaction type"
+          className={
+            paper
+              ? "h-9 w-full text-sm font-normal"
+              : "h-7 w-[120px] text-[11px]"
+          }
+        >
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {INTERACT_ACTION_KINDS.map((k) => (
+            <SelectItem
+              key={k}
+              value={k}
+              className={paper ? "text-sm" : "text-[11px]"}
+            >
+              {k === "key" ? "Keyboard key" : k}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {value.kind === "click" ? (
+        <div className={paper ? "space-y-2" : "flex flex-col gap-1.5"}>
+          {targetFields}
+          {paper ? (
+            <Label htmlFor={`${id}-click`} className={labelClass}>
+              Click type
+            </Label>
+          ) : null}
+          <Select
+            value={value.clickType ?? "left"}
+            disabled={readOnly}
+            onValueChange={(next) =>
+              onChange({
+                ...value,
+                clickType: next as "left" | "double" | "right",
+              })
+            }
+          >
+            <SelectTrigger
+              id={`${id}-click`}
+              aria-label="Click type"
+              className={
+                paper
+                  ? "h-9 w-full text-sm font-normal"
+                  : "h-7 w-[120px] text-[11px]"
+              }
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="left">left</SelectItem>
+              <SelectItem value="double">double</SelectItem>
+              <SelectItem value="right">right</SelectItem>
+            </SelectContent>
+          </Select>
+        </div>
+      ) : null}
+      {value.kind === "type" ? (
+        <div className={paper ? "space-y-2" : "flex flex-col gap-1.5"}>
+          {targetFields}
+          {paper ? (
+            <Label htmlFor={`${id}-text`} className={labelClass}>
+              Text
+            </Label>
+          ) : null}
+          <Input
+            id={`${id}-text`}
+            aria-label="Text to type"
+            value={value.text}
+            readOnly={readOnly}
+            onChange={(e) => onChange({ ...value, text: e.target.value })}
+            placeholder="text to type…"
+            className={fieldClass}
+          />
+        </div>
+      ) : null}
+      {value.kind === "key" ? (
+        <div className={paper ? "space-y-1.5" : undefined}>
+          {paper ? (
+            <Label htmlFor={`${id}-key`} className={labelClass}>
+              Key
+            </Label>
+          ) : null}
+          <Input
+            id={`${id}-key`}
+            aria-label="Key"
+            value={value.key}
+            readOnly={readOnly}
+            onChange={(e) => onChange({ ...value, key: e.target.value })}
+            placeholder="Enter, Tab, ArrowDown…"
+            className={paper ? fieldClass : "h-7 w-[180px] text-[11px]"}
+          />
+        </div>
+      ) : null}
+      {value.kind === "scroll" ? (
+        <div className={paper ? "space-y-2" : "flex items-center gap-1.5"}>
+          {paper ? (
+            <Label htmlFor={`${id}-direction`} className={labelClass}>
+              Direction
+            </Label>
+          ) : null}
+          <Select
+            value={value.direction}
+            disabled={readOnly}
+            onValueChange={(next) =>
+              onChange({ ...value, direction: next as "up" | "down" })
+            }
+          >
+            <SelectTrigger
+              id={`${id}-direction`}
+              aria-label="Direction"
+              className={
+                paper
+                  ? "h-9 w-full text-sm font-normal"
+                  : "h-7 w-[92px] text-[11px]"
+              }
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="down">down</SelectItem>
+              <SelectItem value="up">up</SelectItem>
+            </SelectContent>
+          </Select>
+          {paper ? (
+            <Label htmlFor={`${id}-amount`} className={labelClass}>
+              Amount (optional)
+            </Label>
+          ) : null}
+          <Input
+            id={`${id}-amount`}
+            aria-label="Scroll amount"
+            type="number"
+            readOnly={readOnly}
+            value={value.amount ?? ""}
+            onChange={(e) =>
+              onChange({
+                ...value,
+                amount: e.target.value ? Number(e.target.value) : undefined,
+              })
+            }
+            placeholder="amount"
+            className={
+              paper
+                ? "h-6 w-20 text-xs md:text-xs"
+                : "h-7 w-[100px] text-[11px]"
+            }
+          />
+        </div>
+      ) : null}
+      {value.kind === "wait" ? (
+        <div className={paper ? "space-y-1.5" : undefined}>
+          {paper ? (
+            <Label htmlFor={`${id}-wait`} className={labelClass}>
+              Duration
+            </Label>
+          ) : null}
+          <div
+            className={paper ? "flex items-center gap-1.5 text-sm" : undefined}
+          >
+            <Input
+              id={`${id}-wait`}
+              aria-label="Wait duration"
+              type="number"
+              readOnly={readOnly}
+              value={value.ms}
+              onChange={(e) =>
+                onChange({ ...value, ms: Number(e.target.value) })
+              }
+              placeholder="ms"
+              className={
+                paper
+                  ? "h-6 w-20 text-xs md:text-xs"
+                  : "h-7 w-[120px] text-[11px]"
+              }
+            />
+            {paper ? <span>ms</span> : null}
+          </div>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+// ── widget assertion sub-editor ───────────────────────────────────────────────
+export const WIDGET_ASSERTION_KINDS: ReadonlyArray<WidgetAssertion["kind"]> = [
+  "textVisible",
+  "elementVisible",
+  "elementHidden",
+  "inputValue",
+  "widgetToolCalled",
+];
+
+export function defaultWidgetAssertion(
+  kind: WidgetAssertion["kind"],
+  toolName: string,
+): WidgetAssertion {
+  switch (kind) {
+    case "textVisible":
+      return { kind, toolName, text: "" };
+    case "elementVisible":
+    case "elementHidden":
+      return { kind, toolName, target: { testId: "" } };
+    case "inputValue":
+      return { kind, toolName, target: { testId: "" }, equals: "" };
+    case "widgetToolCalled":
+      return { kind, toolName, calledToolName: "" };
+  }
+}
+
+export function WidgetAssertionFields({
+  value,
+  onChange,
+  availableTools,
+  readOnly = false,
+  paper = false,
+}: {
+  value: WidgetAssertion;
+  onChange: (next: WidgetAssertion) => void;
+  availableTools: AvailableTool[];
+  readOnly?: boolean;
+  paper?: boolean;
+}) {
+  const target =
+    "target" in value ? (value.target as ElementLocator) : undefined;
+  const viewTools = invokableTools(availableTools);
+  const fieldClass = paper ? "h-9 w-full text-sm" : "h-7 text-[11px]";
+  const assertionKindPicker = (
+    <div className="space-y-1">
+      <Label className="text-[11px]">Assertion</Label>
+      <Select
+        disabled={readOnly}
+        value={value.kind}
+        onValueChange={(next) =>
+          onChange(
+            defaultWidgetAssertion(
+              next as WidgetAssertion["kind"],
+              value.toolName,
+            ),
+          )
+        }
+      >
+        <SelectTrigger aria-label="Assertion kind" className={fieldClass}>
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {WIDGET_ASSERTION_KINDS.map((k) => (
+            <SelectItem key={k} value={k} className="text-[11px]">
+              {WIDGET_ASSERTION_LABELS[k]}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+  return (
+    <div
+      className={
+        paper
+          ? `${PAPER_FIELD_STYLES} flex flex-col gap-1.5`
+          : "flex flex-col gap-2"
+      }
+    >
+      <div className={paper ? "space-y-2" : "grid gap-2 sm:grid-cols-2"}>
+        <div className="space-y-1">
+          <Label className={paper ? "text-sm font-medium" : "text-xs"}>
+            {paper ? "View" : "View (tool)"}
+          </Label>
+          {viewTools.length > 0 ? (
+            <Select
+              disabled={readOnly}
+              value={value.toolName || undefined}
+              onValueChange={(next) => onChange({ ...value, toolName: next })}
+            >
+              <SelectTrigger aria-label="View" className={fieldClass}>
+                <SelectValue placeholder="Pick a view tool…" />
+              </SelectTrigger>
+              <SelectContent>
+                {value.toolName &&
+                !viewTools.some((tool) => tool.name === value.toolName) ? (
+                  <SelectItem value={value.toolName}>
+                    {value.toolName}
+                  </SelectItem>
+                ) : null}
+                {Array.from(new Set(viewTools.map((t) => t.name))).map(
+                  (name) => (
+                    <SelectItem key={name} value={name} className="text-[11px]">
+                      {name}
+                    </SelectItem>
+                  ),
+                )}
+              </SelectContent>
+            </Select>
+          ) : (
+            <Input
+              aria-label="View"
+              value={value.toolName}
+              onChange={(e) => onChange({ ...value, toolName: e.target.value })}
+              placeholder="view tool name…"
+              readOnly={readOnly}
+              className={fieldClass}
+            />
+          )}
+        </div>
+        {!paper ? assertionKindPicker : null}
+      </div>
+      {value.kind === "textVisible" ? (
+        <div className="space-y-1">
+          {paper ? <Label className="text-sm font-medium">Text</Label> : null}
+          <Input
+            aria-label="Text"
+            value={value.text}
+            onChange={(e) => onChange({ ...value, text: e.target.value })}
+            placeholder="Visible text…"
+            readOnly={readOnly}
+            className={fieldClass}
+          />
+        </div>
+      ) : null}
+      {value.kind === "widgetToolCalled" ? (
+        <div className="space-y-1">
+          {paper ? <Label className="text-sm font-medium">Tool</Label> : null}
+          <Input
+            aria-label="Called tool"
+            value={value.calledToolName}
+            onChange={(e) =>
+              onChange({ ...value, calledToolName: e.target.value })
+            }
+            placeholder="Called tool name…"
+            readOnly={readOnly}
+            className={fieldClass}
+          />
+        </div>
+      ) : null}
+      {target !== undefined &&
+      (value.kind === "elementVisible" ||
+        value.kind === "elementHidden" ||
+        value.kind === "inputValue") ? (
+        <div
+          className={
+            paper
+              ? "[&_input]:h-9 [&_input]:text-sm [&_label]:text-sm [&_label]:font-medium"
+              : undefined
+          }
+        >
+          <LocatorFields
+            value={target}
+            onChange={(nextTarget) =>
+              onChange({ ...value, target: nextTarget } as WidgetAssertion)
+            }
+            readOnly={readOnly}
+          />
+        </div>
+      ) : null}
+      {value.kind === "inputValue" ? (
+        <div className="space-y-1">
+          {paper ? <Label className="text-sm font-medium">Value</Label> : null}
+          <Input
+            aria-label="Expected input value"
+            value={value.equals}
+            onChange={(e) => onChange({ ...value, equals: e.target.value })}
+            placeholder="Equals…"
+            readOnly={readOnly}
+            className={fieldClass}
+          />
+        </div>
+      ) : null}
+      {paper ? (
+        <details className="text-xs text-card-foreground">
+          <summary className="cursor-pointer">Check settings</summary>
+          <div className="pt-2">{assertionKindPicker}</div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+// ── add-step / add-assertion factories ────────────────────────────────────────
+export function blankStepOfKind(
+  kind: TestStep["kind"],
+  suiteServers: string[],
+): TestStep {
+  switch (kind) {
+    case "prompt":
+      return { id: newStepId("prompt"), kind: "prompt", prompt: "" };
+    case "toolCall":
+      return {
+        id: newStepId("call"),
+        kind: "toolCall",
+        serverName: suiteServers[0] ?? "",
+        toolName: "",
+        arguments: {},
+      };
+    case "interact":
+      return {
+        id: newStepId("interact"),
+        kind: "interact",
+        toolName: "",
+        action: { kind: "click", target: { testId: "" } },
+      };
+    case "assert":
+      return {
+        id: newStepId("assert"),
+        kind: "assert",
+        assertion: blankPredicate("toolCalledWith"),
+      };
+  }
+}

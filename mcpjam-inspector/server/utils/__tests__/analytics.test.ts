@@ -1,0 +1,277 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { Context } from "hono";
+
+const captureMock = vi.fn();
+const flagMock = vi.fn();
+const allFlagsMock = vi.fn();
+const shutdownMock = vi.fn().mockResolvedValue(undefined);
+
+vi.mock("posthog-node", () => ({
+  PostHog: vi.fn(function () {
+    return {
+      capture: captureMock,
+      shutdown: shutdownMock,
+      isFeatureEnabled: flagMock,
+      getAllFlags: allFlagsMock,
+    };
+  }),
+}));
+
+// HOSTED_MODE is a module-load-time const computed from the ambient
+// process.env — pinning it here (rather than relying on the CI shell
+// happening not to have VITE_MCPJAM_HOSTED_MODE set) is what makes the
+// "self_hosted" deployment assertion below deterministic. The hosted case
+// is covered by analytics.hosted.test.ts, which pins the opposite value.
+vi.mock("../../config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../../config.js")>();
+  return { ...actual, HOSTED_MODE: false };
+});
+
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { PostHog } from "posthog-node";
+import {
+  captureServerEvent,
+  evaluateBrowserRollout,
+  evaluateClientFeatureFlags,
+  evaluateLocalHarnessRollout,
+  shutdownAnalytics,
+} from "../analytics.js";
+
+function fakeContext(overrides: {
+  requestLogContext?: Record<string, unknown>;
+  guestId?: string;
+}): Context {
+  return {
+    var: { requestLogContext: overrides.requestLogContext },
+    get: (key: string) =>
+      key === "guestId" ? (overrides.guestId ?? undefined) : undefined,
+  } as unknown as Context;
+}
+
+describe("captureServerEvent", () => {
+  beforeEach(() => {
+    captureMock.mockClear();
+    flagMock.mockClear();
+    allFlagsMock.mockClear();
+    vi.mocked(PostHog).mockClear();
+    delete process.env.VITE_DISABLE_POSTHOG_LOCAL;
+    delete process.env.DO_NOT_TRACK;
+    delete process.env.MCPJAM_FEATURE_FLAGS_FILE;
+  });
+
+  afterEach(async () => {
+    await shutdownAnalytics();
+  });
+
+  it("uses the WorkOS external id (client actorKey), never the Convex userId", () => {
+    captureServerEvent(
+      fakeContext({
+        requestLogContext: {
+          userExternalId: "user_01H00000000000000000000000",
+          userId: "convex_internal_id",
+        },
+      }),
+      "send_message_server",
+      { origin: "playground" },
+    );
+
+    expect(captureMock).toHaveBeenCalledTimes(1);
+    const call = captureMock.mock.calls[0][0];
+    expect(call.distinctId).toBe("user_01H00000000000000000000000");
+    expect(call.event).toBe("send_message_server");
+    expect(call.properties.origin).toBe("playground");
+    expect(call.properties.$insert_id).toEqual(expect.any(String));
+    expect(call.properties.source).toBe("server");
+    // Real (non-hosted) config in this test file — the hosted case is
+    // covered by analytics.hosted.test.ts, which mocks HOSTED_MODE at
+    // module-load time.
+    expect(call.properties.deployment).toBe("self_hosted");
+  });
+
+  it("falls back to guestExternalId then the guestId context var", () => {
+    captureServerEvent(
+      fakeContext({
+        requestLogContext: {
+          guestExternalId: "a1234567-1234-4234-8234-123456789abc",
+        },
+      }),
+      "execute_tool_server",
+    );
+    captureServerEvent(
+      fakeContext({ guestId: "b1234567-1234-4234-8234-123456789abc" }),
+      "execute_tool_server",
+    );
+
+    expect(captureMock.mock.calls[0][0].distinctId).toBe(
+      "a1234567-1234-4234-8234-123456789abc",
+    );
+    expect(captureMock.mock.calls[1][0].distinctId).toBe(
+      "b1234567-1234-4234-8234-123456789abc",
+    );
+  });
+
+  it("drops events with no resolvable actor instead of capturing anonymously", () => {
+    captureServerEvent(fakeContext({}), "send_message_server");
+    expect(captureMock).not.toHaveBeenCalled();
+  });
+
+  it.each(["VITE_DISABLE_POSTHOG_LOCAL"])(
+    // DO_NOT_TRACK is not among these: it stops flag evaluation too (below).
+    "evaluates browser rollout with %s disabled without capturing events",
+    async (setting) => {
+      process.env[setting] = "true";
+      flagMock.mockResolvedValueOnce(true);
+      expect(
+        await evaluateBrowserRollout(
+          "local-browser-enabled",
+          "user_01H00000000000000000000000",
+        ),
+      ).toBe(true);
+      expect(flagMock).toHaveBeenLastCalledWith(
+        "local-browser-enabled",
+        "user_01H00000000000000000000000",
+        {
+          sendFeatureFlagEvents: false,
+          personProperties: { local_browser_security_version: "1" },
+        },
+      );
+      captureServerEvent(
+        fakeContext({
+          requestLogContext: {
+            userExternalId: "user_01H00000000000000000000000",
+          },
+        }),
+        "send_message_server",
+      );
+      expect(captureMock).not.toHaveBeenCalled();
+    },
+  );
+
+
+  it("preserves trusted account email for local harness targeting without exposure events", async () => {
+    flagMock.mockResolvedValueOnce(true);
+    expect(await evaluateLocalHarnessRollout("user_01H00000000000000000000000", "account@example.test")).toBe(true);
+    expect(flagMock).toHaveBeenLastCalledWith("local-harness-enabled", "user_01H00000000000000000000000", {
+      sendFeatureFlagEvents: false, personProperties: { deployment: "self_hosted", email: "account@example.test" },
+    });
+    expect(captureMock).not.toHaveBeenCalled();
+  });
+
+  it("asks PostHog nothing under DO_NOT_TRACK, so every rollout and client flag is off", async () => {
+    process.env.DO_NOT_TRACK = "true";
+    flagMock.mockResolvedValue(true);
+    expect(
+      await evaluateBrowserRollout(
+        "local-browser-enabled",
+        "user_01H00000000000000000000000",
+      ),
+    ).toBe(false);
+    expect(
+      await evaluateLocalHarnessRollout("user_01H00000000000000000000000"),
+    ).toBe(false);
+    expect(
+      await evaluateClientFeatureFlags("user_01H00000000000000000000000", {}),
+    ).toEqual({});
+    expect(flagMock).not.toHaveBeenCalled();
+    expect(allFlagsMock).not.toHaveBeenCalled();
+    expect(PostHog).not.toHaveBeenCalled();
+    flagMock.mockReset();
+  });
+
+  it("answers every flag from MCPJAM_FEATURE_FLAGS_FILE instead of PostHog", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "analytics-flags-"));
+    const path = join(dir, "flags.json");
+    writeFileSync(
+      path,
+      JSON.stringify({
+        "local-browser-enabled": true,
+        "local-harness-enabled": false,
+        "evaluate-enabled": true,
+        "guest-credit-wall-copy": "treatment",
+        "not-a-client-flag": true,
+      }),
+    );
+    process.env.MCPJAM_FEATURE_FLAGS_FILE = path;
+    try {
+      expect(
+        await evaluateBrowserRollout(
+          "local-browser-enabled",
+          "user_01H00000000000000000000000",
+        ),
+      ).toBe(true);
+      expect(
+        await evaluateLocalHarnessRollout("user_01H00000000000000000000000"),
+      ).toBe(false);
+      expect(
+        await evaluateClientFeatureFlags("user_01H00000000000000000000000", {}),
+      ).toEqual({
+        "local-browser-enabled": true,
+        "local-harness-enabled": false,
+        "evaluate-enabled": true,
+        "guest-credit-wall-copy": "treatment",
+      });
+      // An identity is still required, as it is for PostHog's answers.
+      expect(await evaluateClientFeatureFlags("not an actor", {})).toEqual({});
+      expect(flagMock).not.toHaveBeenCalled();
+      expect(allFlagsMock).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.MCPJAM_FEATURE_FLAGS_FILE;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honors DO_NOT_TRACK", () => {
+    process.env.DO_NOT_TRACK = "1";
+    captureServerEvent(
+      fakeContext({
+        requestLogContext: {
+          userExternalId: "user_01H00000000000000000000000",
+        },
+      }),
+      "send_message_server",
+    );
+    expect(captureMock).not.toHaveBeenCalled();
+  });
+
+  it("honors VITE_DISABLE_POSTHOG_LOCAL", () => {
+    process.env.VITE_DISABLE_POSTHOG_LOCAL = "true";
+    captureServerEvent(
+      fakeContext({
+        requestLogContext: {
+          userExternalId: "user_01H00000000000000000000000",
+        },
+      }),
+      "send_message_server",
+    );
+    expect(captureMock).not.toHaveBeenCalled();
+  });
+
+  it("drops arbitrary org/project attribution", () => {
+    captureServerEvent(
+      fakeContext({
+        requestLogContext: {
+          userExternalId: "user_01H00000000000000000000000",
+          orgId: "org_1",
+          projectId: "proj_1",
+        },
+      }),
+      "eval_suite_run_started_server",
+    );
+    const props = captureMock.mock.calls[0][0].properties;
+    expect(props.organization_id).toBeUndefined();
+    expect(props.project_id).toBeUndefined();
+  });
+
+  it("generates a fresh $insert_id per event", () => {
+    const ctx = fakeContext({
+      requestLogContext: { userExternalId: "user_01H00000000000000000000000" },
+    });
+    captureServerEvent(ctx, "send_message_server");
+    captureServerEvent(ctx, "send_message_server");
+    expect(captureMock.mock.calls[0][0].properties.$insert_id).not.toBe(
+      captureMock.mock.calls[1][0].properties.$insert_id,
+    );
+  });
+});

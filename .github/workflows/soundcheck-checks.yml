@@ -1,0 +1,43 @@
+name: Soundcheck checks
+
+# Soundcheck deploys to production on every push to main that touches it
+# (deploy-soundcheck.yml), so its auth checks run before merge.
+on:
+  pull_request:
+    paths:
+      - "soundcheck/**"
+      - "package.json"
+      - "package-lock.json"
+      - ".github/workflows/soundcheck-checks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: soundcheck-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+
+jobs:
+  checks:
+    name: Typecheck and auth smoke tests
+    # Blacksmith, not GitHub's shared 60-job pool; this job holds no secret or
+    # write token. TEST_RUNNER=ubuntu-latest moves it back during an outage.
+    runs-on: ${{ vars.TEST_RUNNER || 'blacksmith-4vcpu-ubuntu-2404' }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          # Matches the Node major Railway builds Soundcheck with.
+          node-version: "22"
+          cache: npm
+      # Railway runs `npm install` on Node 22, and the root lockfile does not
+      # pass npm 10's `npm ci` sync check (it does under npm 11), so mirror it.
+      - run: npm install --ignore-scripts --no-audit --no-fund
+      - run: npm run typecheck -w @mcpjam/soundcheck
+      - run: npm run test:auth -w @mcpjam/soundcheck

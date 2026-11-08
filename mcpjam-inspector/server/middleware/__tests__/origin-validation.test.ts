@@ -1,0 +1,630 @@
+/**
+ * Origin Validation Middleware Tests
+ *
+ * Tests for the origin validation middleware that blocks requests from
+ * non-localhost origins. This is defense-in-depth against DNS rebinding
+ * and CSRF attacks.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { Hono } from "hono";
+import { SERVER_PORT } from "../../config.js";
+import { originValidationMiddleware } from "../origin-validation.js";
+
+/**
+ * Creates a test Hono app with the origin validation middleware.
+ */
+function createTestApp(): Hono {
+  const app = new Hono();
+
+  // Apply origin validation middleware
+  app.use("*", originValidationMiddleware);
+
+  // Test routes
+  app.get("/api/test", (c) => c.json({ message: "success" }));
+  app.post("/api/test", (c) => c.json({ message: "success" }));
+  app.get("/assets/*", (c) => c.json({ message: "static asset" }));
+
+  return app;
+}
+
+describe("originValidationMiddleware", () => {
+  let app: Hono;
+  const originalAllowedOrigins = process.env.ALLOWED_ORIGINS;
+  const originalAllowWildcardOrigins =
+    process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS;
+  const originalAllowedHosts = process.env.MCPJAM_ALLOWED_HOSTS;
+
+  beforeEach(() => {
+    app = createTestApp();
+    // Clear any custom allowed origins
+    delete process.env.ALLOWED_ORIGINS;
+    delete process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS;
+    delete process.env.MCPJAM_ALLOWED_HOSTS;
+  });
+
+  afterEach(() => {
+    // Restore original env
+    if (originalAllowedOrigins) {
+      process.env.ALLOWED_ORIGINS = originalAllowedOrigins;
+    } else {
+      delete process.env.ALLOWED_ORIGINS;
+    }
+    if (originalAllowWildcardOrigins) {
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = originalAllowWildcardOrigins;
+    } else {
+      delete process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS;
+    }
+    if (originalAllowedHosts) {
+      process.env.MCPJAM_ALLOWED_HOSTS = originalAllowedHosts;
+    } else {
+      delete process.env.MCPJAM_ALLOWED_HOSTS;
+    }
+  });
+
+  describe("requests without Origin header", () => {
+    it("allows requests without Origin header (same-origin or non-browser)", async () => {
+      const res = await app.request("/api/test");
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows POST requests without Origin header", async () => {
+      const res = await app.request("/api/test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ data: "test" }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("CORS preflight requests", () => {
+    it("allows OPTIONS requests regardless of origin", async () => {
+      const res = await app.request("/api/test", {
+        method: "OPTIONS",
+        headers: { Origin: "http://evil.com" },
+      });
+
+      // OPTIONS should pass through (not blocked by origin validation)
+      expect(res.status).not.toBe(403);
+    });
+  });
+
+  describe("localhost origins (default allowed)", () => {
+    it("allows http://localhost:6274", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:6274" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows http://127.0.0.1:6274", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://127.0.0.1:6274" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows http://localhost:5173 (Vite dev server)", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:5173" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows http://127.0.0.1:5173", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://127.0.0.1:5173" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows http://localhost:8080 (Electron dev server)", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:8080" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows http://127.0.0.1:8080", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://127.0.0.1:8080" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("non-localhost origins (blocked by default)", () => {
+    it("blocks requests from external domains", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://evil.com" },
+      });
+
+      expect(res.status).toBe(403);
+      const data = await res.json();
+      expect(data.error).toBe("Forbidden");
+      // Names what was refused, so a client-side report carries it.
+      expect(data.message).toBe("Request origin not allowed: http://evil.com.");
+    });
+
+    it("blocks requests from IP addresses on network", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://192.168.1.100:6274" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("blocks requests from https domains", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://example.com" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("blocks requests from localhost with wrong port", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:9999" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("blocks requests from localhost without port", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("blocks DNS rebinding attacks (attacker-controlled domain)", async () => {
+      // Simulating a DNS rebinding attack where attacker.com resolves to 127.0.0.1
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://attacker-localhost.com" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+  });
+
+  describe("custom allowed origins via environment variable", () => {
+    it("allows custom origins from ALLOWED_ORIGINS env var", async () => {
+      process.env.ALLOWED_ORIGINS =
+        "http://custom.example.com,http://another.com";
+
+      // Need to recreate app to pick up new env
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://custom.example.com" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows multiple custom origins", async () => {
+      process.env.ALLOWED_ORIGINS =
+        "http://first.com, http://second.com, http://third.com";
+
+      app = createTestApp();
+
+      const res1 = await app.request("/api/test", {
+        headers: { Origin: "http://first.com" },
+      });
+      expect(res1.status).toBe(200);
+
+      const res2 = await app.request("/api/test", {
+        headers: { Origin: "http://second.com" },
+      });
+      expect(res2.status).toBe(200);
+
+      const res3 = await app.request("/api/test", {
+        headers: { Origin: "http://third.com" },
+      });
+      expect(res3.status).toBe(200);
+    });
+
+    it("trims whitespace from custom origins", async () => {
+      process.env.ALLOWED_ORIGINS =
+        "  http://spacy.com  ,  http://another.com  ";
+
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://spacy.com" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("supports wildcard origins like https://*.up.railway.app", async () => {
+      process.env.ALLOWED_ORIGINS =
+        "https://*.up.railway.app,https://staging.mcpjam.com";
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://mcp-inspector-pr-1804.up.railway.app" },
+      });
+      expect(res.status).toBe(200);
+    });
+
+    it("supports mid-host wildcards like https://mcp-inspector-pr-*.up.railway.app", async () => {
+      // The deploy-staging workflow programs this exact pattern into
+      // ALLOWED_ORIGINS so PR-preview frontends can hit staging APIs.
+      // The previous matcher only handled leading `*.` patterns and
+      // silently dropped this one — leaving PR previews 403'd by
+      // origin validation.
+      process.env.ALLOWED_ORIGINS =
+        "https://staging.mcpjam.com,https://mcp-inspector-pr-*.up.railway.app";
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+
+      app = createTestApp();
+
+      const ok = await app.request("/api/test", {
+        headers: { Origin: "https://mcp-inspector-pr-2246.up.railway.app" },
+      });
+      expect(ok.status).toBe(200);
+
+      // Same domain but different prefix → still rejected.
+      const blocked = await app.request("/api/test", {
+        headers: { Origin: "https://other-pr-2246.up.railway.app" },
+      });
+      expect(blocked.status).toBe(403);
+
+      // Wildcard must not cross dots — `pr-2246.evil` does not match
+      // `mcp-inspector-pr-*.up.railway.app`.
+      const crossDot = await app.request("/api/test", {
+        headers: {
+          Origin: "https://mcp-inspector-pr-2246.evil.up.railway.app",
+        },
+      });
+      expect(crossDot.status).toBe(403);
+    });
+
+    it("blocks origins that don't match wildcard pattern", async () => {
+      process.env.ALLOWED_ORIGINS = "https://*.up.railway.app";
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://evil.com" },
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("rejects wildcard origin when scheme mismatches (http vs https)", async () => {
+      process.env.ALLOWED_ORIGINS = "https://*.up.railway.app";
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://foo.up.railway.app" },
+      });
+      expect(res.status).toBe(403);
+    });
+
+    it("strips wildcard origins outside non-prod lockdown", async () => {
+      process.env.ALLOWED_ORIGINS =
+        "https://*.up.railway.app,https://staging.mcpjam.com";
+      // MCPJAM_ALLOW_WILDCARD_ORIGINS is not set — simulates production
+
+      app = createTestApp();
+
+      // Wildcard should be stripped, so Railway origins are blocked
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://foo.up.railway.app" },
+      });
+      expect(res.status).toBe(403);
+
+      // Exact match should still work
+      const res2 = await app.request("/api/test", {
+        headers: { Origin: "https://staging.mcpjam.com" },
+      });
+      expect(res2.status).toBe(200);
+    });
+
+    it("blocks origins not in custom list", async () => {
+      process.env.ALLOWED_ORIGINS = "http://only-this.com";
+
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:5173" },
+      });
+
+      // A custom list drops the default dev ports. Only the server's own UI
+      // origin stays allowed (next describe).
+      expect(res.status).toBe(403);
+    });
+
+    // The desktop app inherits the user's OS environment, so an
+    // `ALLOWED_ORIGINS` set there for another project must not lock the
+    // app's own page out of its server.
+    describe("the server's own UI origin outside hosted mode", () => {
+      const ownOrigins = [
+        `http://localhost:${SERVER_PORT}`,
+        `http://127.0.0.1:${SERVER_PORT}`,
+      ];
+
+      it.each(ownOrigins)("keeps %s next to a custom list", async (origin) => {
+        process.env.ALLOWED_ORIGINS = "http://only-this.com";
+
+        app = createTestApp();
+
+        const res = await app.request("/api/test", {
+          method: "POST",
+          headers: { Origin: origin },
+        });
+        expect(res.status).toBe(200);
+        const custom = await app.request("/api/test", {
+          headers: { Origin: "http://only-this.com" },
+        });
+        expect(custom.status).toBe(200);
+      });
+
+      // The wildcard filter returns early when it strips an entry. A user with
+      // e.g. `https://*.vercel.app` in their environment must still reach the
+      // app, so the own origins have to be added before that return.
+      it.each(ownOrigins)(
+        "keeps %s when an unapproved wildcard is stripped",
+        async (origin) => {
+          process.env.ALLOWED_ORIGINS = "https://*.vercel.app";
+
+          app = createTestApp();
+
+          const res = await app.request("/api/test", {
+            method: "POST",
+            headers: { Origin: origin },
+          });
+          expect(res.status).toBe(200);
+        },
+      );
+
+      // The desktop app falls back to 6275, 6276, ... when 6274 is taken, and
+      // the page is then served from that port.
+      it("follows a non-default SERVER_PORT", async () => {
+        vi.stubEnv("SERVER_PORT", "6276");
+        vi.stubEnv("ALLOWED_ORIGINS", "http://only-this.com");
+        vi.resetModules();
+        try {
+          const { originValidationMiddleware: middleware } =
+            await import("../origin-validation.js");
+          const fallback = new Hono();
+          fallback.use("*", middleware);
+          fallback.post("/api/test", (c) => c.json({ message: "success" }));
+
+          const own = await fallback.request("/api/test", {
+            method: "POST",
+            headers: { Origin: "http://127.0.0.1:6276" },
+          });
+          expect(own.status).toBe(200);
+          const defaultPort = await fallback.request("/api/test", {
+            method: "POST",
+            headers: { Origin: "http://127.0.0.1:6274" },
+          });
+          expect(defaultPort.status).toBe(403);
+        } finally {
+          vi.unstubAllEnvs();
+          vi.resetModules();
+        }
+      });
+    });
+
+    it("still replaces the list in hosted mode", async () => {
+      vi.stubEnv("VITE_MCPJAM_HOSTED_MODE", "true");
+      vi.stubEnv("ALLOWED_ORIGINS", "https://app.example.com");
+      vi.resetModules();
+      try {
+        const { originValidationMiddleware: hostedMiddleware } =
+          await import("../origin-validation.js");
+        const hosted = new Hono();
+        hosted.use("*", hostedMiddleware);
+        hosted.post("/api/test", (c) => c.json({ message: "success" }));
+
+        const local = await hosted.request("/api/test", {
+          method: "POST",
+          headers: { Origin: `http://127.0.0.1:${SERVER_PORT}` },
+        });
+        expect(local.status).toBe(403);
+        const allowed = await hosted.request("/api/test", {
+          method: "POST",
+          headers: { Origin: "https://app.example.com" },
+        });
+        expect(allowed.status).toBe(200);
+      } finally {
+        vi.unstubAllEnvs();
+        vi.resetModules();
+      }
+    });
+  });
+
+  // Regression: MCPJAM_ALLOWED_HOSTS must open BOTH the token gate and this
+  // origin gate. Before this, a self-hosted operator who set it to reach the
+  // inspector over the LAN got the token but then 403'd on every connect / tool
+  // / chat POST here, because origin validation only knew localhost +
+  // ALLOWED_ORIGINS. See BB-118.
+  describe("MCPJAM_ALLOWED_HOSTS (self-hosted LAN access)", () => {
+    it("allows a GET from an allowlisted LAN host origin", async () => {
+      process.env.MCPJAM_ALLOWED_HOSTS = "192.168.1.50";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://192.168.1.50:6274" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows a POST from an allowlisted LAN host origin (the connect/tool path)", async () => {
+      process.env.MCPJAM_ALLOWED_HOSTS = "192.168.1.50";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        method: "POST",
+        headers: {
+          Origin: "http://192.168.1.50:6274",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ data: "test" }),
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("still blocks a LAN host that is NOT on the allowlist", async () => {
+      process.env.MCPJAM_ALLOWED_HOSTS = "192.168.1.50";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://192.168.1.99:6274" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("supports a *.domain allowlist entry (with the wildcard opt-in)", async () => {
+      // Wildcard Origin acceptance requires MCPJAM_ALLOW_WILDCARD_ORIGINS, the
+      // same gate ALLOWED_ORIGINS wildcards go through (see the two dedicated
+      // wildcard cases below).
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+      process.env.MCPJAM_ALLOWED_HOSTS = "*.internal.example.com";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://box.internal.example.com" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("does not widen localhost: a bad localhost port is still blocked", async () => {
+      // Allowlisting a LAN IP must not accidentally re-open localhost origins
+      // that getAllowedOrigins would reject on an exact scheme+port basis.
+      process.env.MCPJAM_ALLOWED_HOSTS = "192.168.1.50";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:9999" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("rejects a non-serialized Origin that embeds the allowlisted host", async () => {
+      // A real browser Origin is scheme://host[:port] only. A value carrying a
+      // path or userinfo must not smuggle the allowlisted host past the gate
+      // via hostname extraction.
+      process.env.MCPJAM_ALLOWED_HOSTS = "192.168.1.50";
+      app = createTestApp();
+
+      for (const origin of [
+        "http://192.168.1.50:6274/evil",
+        "http://attacker@192.168.1.50:6274",
+      ]) {
+        const res = await app.request("/api/test", {
+          headers: { Origin: origin },
+        });
+        expect(res.status).toBe(403);
+      }
+    });
+
+    it("vetoes a tunnel Origin even when its domain is allowlisted", async () => {
+      // Same invariant the token gate enforces: a tunnel host must never pass
+      // the allowlist, even misconfigured into MCPJAM_ALLOWED_HOSTS.
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+      process.env.MCPJAM_ALLOWED_HOSTS = "*.tunnels.mcpjam.com";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://abc123.tunnels.mcpjam.com" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("ignores a wildcard allowlist entry for Origins without the opt-in", async () => {
+      // Production (no MCPJAM_ALLOW_WILDCARD_ORIGINS): a platform wildcard must
+      // not make every co-tenant an accepted Origin.
+      process.env.MCPJAM_ALLOWED_HOSTS = "*.up.railway.app";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://someone-elses-app.up.railway.app" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("honors a wildcard allowlist entry when MCPJAM_ALLOW_WILDCARD_ORIGINS=true", async () => {
+      process.env.MCPJAM_ALLOW_WILDCARD_ORIGINS = "true";
+      process.env.MCPJAM_ALLOWED_HOSTS = "*.up.railway.app";
+      app = createTestApp();
+
+      const res = await app.request("/api/test", {
+        headers: { Origin: "https://my-app.up.railway.app" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("static asset exemption", () => {
+    it("allows /assets/ requests with any origin (Vite crossorigin modules)", async () => {
+      const res = await app.request("/assets/index-abc123.js", {
+        headers: { Origin: "https://preview.up.railway.app" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+
+    it("allows /assets/ CSS requests with any origin", async () => {
+      const res = await app.request("/assets/index-abc123.css", {
+        headers: { Origin: "https://preview.up.railway.app" },
+      });
+
+      expect(res.status).toBe(200);
+    });
+  });
+
+  describe("security edge cases", () => {
+    it("blocks origin with trailing slash", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:6274/" },
+      });
+
+      // Origins should not have trailing slash
+      expect(res.status).toBe(403);
+    });
+
+    it("blocks origin with path", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "http://localhost:6274/some/path" },
+      });
+
+      expect(res.status).toBe(403);
+    });
+
+    it("is case sensitive for origin comparison", async () => {
+      const res = await app.request("/api/test", {
+        headers: { Origin: "HTTP://LOCALHOST:6274" },
+      });
+
+      // Origin header should be lowercase
+      expect(res.status).toBe(403);
+    });
+  });
+});

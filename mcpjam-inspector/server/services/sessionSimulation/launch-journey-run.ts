@@ -1,0 +1,758 @@
+import { ensureLocalHarnessTarget } from "../../utils/harness/local/readiness.js";
+import { resolveLocalHarnessActor } from "../../utils/harness/local/acting-user.js";
+import { eligibleUnattendedLocalHarnesses } from "../../utils/harness/local/run-resources.js";
+/**
+ * Launching a journey run, with no HTTP in it.
+ *
+ * WHY THIS IS A SERVICE. The launch used to live inline in
+ * `routes/web/swarm-runs.ts`, and everything it needs was reachable from the
+ * request `Context` sitting in scope — the delegated bearer, the XAA issuer,
+ * the caller context threaded into every authorize batch. That is exactly what
+ * made it un-callable from anywhere else: `POST /api/v1/projects/:p/journeys/
+ * :id/runs` needs the same 200 lines, and a second copy of a fan-out launcher
+ * is not a thing to maintain. So the four request-derived values are now
+ * PARAMETERS, resolved by whichever route is calling, and the launch itself
+ * knows nothing about Hono.
+ *
+ * THE ORDERING RULE, which the comments below repeat where it bites: once
+ * `createJourneyRun` returns, a durable run row exists. Anything that throws
+ * after that point orphans it — a run in the database with no runner, visible
+ * in the UI, advancing to nothing until the backend's stale-run cron reaps it.
+ * So validation happens BEFORE the create, and everything after it is either
+ * infallible or explicitly deferred into the detached runner.
+ *
+ * THE BEARER IS A THUNK, not a string. The runner detaches after the caller
+ * gets its 202 and can fan out for hours; a delegated JWT lives about two.
+ * `deps.bearerToken` is for the create, which happens inside the request.
+ * `deps.getRunBearer` is for everything the runner does afterwards, and it is
+ * re-resolved per unit of work rather than per outbound call — see
+ * `swarm-runner.ts`.
+ */
+import { environmentModelRequiredError } from "../environments/resolve.js";
+import { ErrorCode, WebRouteError } from "../../routes/web/errors.js";
+import { aiRefusalRouteError } from "../../utils/ai-refusal-route-error.js";
+import {
+  createAuthorizedManager,
+  type ManagerCallerContext,
+} from "../../routes/web/auth.js";
+import { xaaPolicyFromMcpProfile } from "../../utils/effective-auth.js";
+import { WEB_STREAM_TIMEOUT_MS } from "../../config.js";
+import {
+  createJourneyRun,
+  finalizePendingAttempts,
+  SwarmAgentError,
+} from "../swarm-agent.js";
+import { startJourneyRun } from "./swarm-runner.js";
+import {
+  readFrozenSwarmBudgets,
+  UNREADABLE_SWARM_BUDGETS_CODE,
+} from "./frozen-swarm-budgets.js";
+import { resolveTargetPluginServerIds } from "../journeys/plugin-servers.js";
+import { createConvexClient } from "../evals/route-helpers.js";
+import { buildHostConnectionPins } from "../host-connection-pins.js";
+import { logger } from "../../utils/logger.js";
+import { isHostedBrowserAvailableFor } from "../../utils/computers/hosted-browser-availability.js";
+import { assertAdmitting } from "../lifecycle/admission.js";
+import { serverDrain } from "../lifecycle/drain.js";
+import type { PinnedHostExecutionSpec } from "../swarm-agent.js";
+import {
+  parseFundingChangedDetails,
+  SWARM_FUNDING_CHANGED_CODE,
+  type SwarmFundingSummary,
+} from "../../../shared/swarm-sponsorship.js";
+
+const BROWSER_TOOL_ID = "browser";
+
+/**
+ * Drop `browser` from every pinned host unless the launching member may use
+ * the hosted browser's tools in this project — the backend's answer, which is
+ * the `hosted-browser` flag evaluated by email plus deployment readiness, the
+ * same decision the desktop reservation behind it makes. A member outside it
+ * whose client still had `browser` saved would otherwise get a swarm that
+ * either provisioned a desktop for it or told them, on every session, why a
+ * tool they cannot see was not advertised.
+ *
+ * `isAvailable` must not reject; it is asked only when a host wants `browser`.
+ */
+export async function withoutBrowserOutsideRollout(
+  hosts: PinnedHostExecutionSpec[],
+  isAvailable: () => Promise<boolean>,
+): Promise<PinnedHostExecutionSpec[]> {
+  const wantsBrowser = (host: PinnedHostExecutionSpec) =>
+    (host.builtInToolIds ?? []).includes(BROWSER_TOOL_ID);
+  if (!hosts.some(wantsBrowser)) return hosts;
+  if (await isAvailable()) return hosts;
+  return hosts.map((host) =>
+    wantsBrowser(host)
+      ? {
+          ...host,
+          builtInToolIds: (host.builtInToolIds ?? []).filter(
+            (id) => id !== BROWSER_TOOL_ID,
+          ),
+        }
+      : host,
+  );
+}
+
+/** The request-derived values a launch needs, resolved by the calling route. */
+export interface LaunchJourneyRunDeps {
+  /**
+   * For the CREATE, which happens inside the request. `/journey-execution/*`
+   * is JWT-only, so an `sk_` API-key caller needs the delegated JWT here — the
+   * raw key would 401 downstream.
+   */
+  bearerToken: string;
+  /**
+   * For everything the DETACHED runner does. Must be the thunk, not a captured
+   * string: the run outlives the token.
+   */
+  getRunBearer: () => Promise<string>;
+  /**
+   * MCPJam test-IdP issuer, resolved from the live request (it reads
+   * `x-forwarded-proto`). `createAuthorizedManager` fails closed for a
+   * Cross-App-Access server without it, so a pinned host with an XAA server
+   * would 500 inside the manager factory — after the run row exists.
+   */
+  xaaIssuer: string;
+  /** Threaded into every authorize batch the run's sessions drive. */
+  callerContext: ManagerCallerContext;
+}
+
+export interface LaunchJourneyRunInput {
+  projectId: string;
+  journeyRefId: string;
+  /**
+   * Caller-supplied idempotency key. Replaying one returns the ORIGINAL run
+   * with `deduped: true` and starts no second runner — see below for why that
+   * matters more than it looks.
+   */
+  launchKey: string;
+  /** Opaque id linking the sibling runs of one co-launched batch. */
+  waveId?: string;
+  /** Per-run environment fan-out; the backend does the real validation. */
+  environmentIds?: string[];
+  /** Iterations for THIS run; leaves the journey's own config untouched. */
+  sessionsPerTarget?: number;
+  /**
+   * How many of this run's conversations the caller was shown as sponsored.
+   * A mismatch is a typed 409 (`swarm_funding_changed`) before anything is
+   * created, never a silent shift onto the organization's credits.
+   */
+  expectedSponsored?: number;
+}
+
+export interface LaunchJourneyRunResult {
+  runId: string;
+  deduped?: boolean;
+  /** How the backend funded this run's conversations, when it says. */
+  funding?: SwarmFundingSummary;
+}
+
+const MAX_PASSTHROUGH_REASON_LENGTH = 300;
+
+/**
+ * A launch the organization's AI key policy refused, when the backend's own
+ * sentence is too long to pass through.
+ */
+const AI_LAUNCH_REFUSED_FALLBACK =
+  "This organization requires its own provider keys for AI features, and this launch has dependencies that can't run on them.";
+
+/** The backend's refusal for a hosted harness target with a broken image pin. */
+const JOURNEY_TARGET_IMAGE_UNAVAILABLE = "JOURNEY_TARGET_IMAGE_UNAVAILABLE";
+
+/**
+ * Every character a renderer may break a line on — not just `\n`. `String.trim`
+ * strips these at the ends but not in the middle, so a body carrying `\r` or a
+ * Unicode separator would otherwise pass as a "single sentence" and then render
+ * as multiple lines in a toast.
+ *
+ * Form feed is in the set because the toast renders with `white-space:
+ * pre-wrap`, and CSS Text converts U+000C to a segment break exactly as it does
+ * U+000D — so it breaks lines on screen even though it looks inert in a string.
+ * Vertical tab and next-line complete it: with CR, LF, FF and the two Unicode
+ * separators, these are every mandatory break in UAX #14.
+ */
+const LINE_BREAK = /[\r\n\v\f\u0085\u2028\u2029]/;
+
+/**
+ * A human-readable reason from a backend launch rejection.
+ *
+ * `bodyText` is the RAW response body and is never passed through unexamined.
+ * It arrives in three shapes and only one of them is fit to show:
+ *
+ *   - a STRUCTURED rejection — a v1 envelope (`{"error":{"message":…}}`) or
+ *     Convex `ConvexError` data (`{"code":…,"message":…}`). Unwrap it; the raw
+ *     form renders as a wall of braces in a toast.
+ *   - a PLAIN SENTENCE the backend wrote for a human ("journey exceeds the
+ *     maximum host count"). This is the useful case and it survives — bounded
+ *     by {@link showableReason}, because a "sentence" that is 8 KB or full of
+ *     markup is not one. The SAME bound applies to a message unwrapped from a
+ *     structured body.
+ *   - anything else — an HTML error page from a proxy, a stack trace, an empty
+ *     body. Replaced by a sentence of our own.
+ *
+ * Deliberately tolerant: every branch is best-effort, because the failure this
+ * runs inside is already a failure and a parse error here would replace a
+ * useful message with a 500.
+ */
+export function launchFailureMessage(
+  err: SwarmAgentError,
+  /** Replaces the generic sentence when the caller knows the refusal's code. */
+  fallbackOverride?: string,
+): string {
+  const fallback =
+    fallbackOverride ??
+    (err.status === 402
+      ? "This launch would exceed your organization's credit limit."
+      : "This journey can't be launched.");
+  const raw = err.bodyText?.trim();
+  if (!raw) return fallback;
+
+  if (raw.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      // v1 envelope: { error: { code, message } }
+      const envelope = parsed.error;
+      if (envelope && typeof envelope === "object") {
+        const unwrapped = showableReason(
+          (envelope as { message?: unknown }).message,
+        );
+        if (unwrapped) return unwrapped;
+      }
+      // Convex structured ConvexError data: { code, message, details? }
+      const unwrapped = showableReason(parsed.message);
+      if (unwrapped) return unwrapped;
+    } catch {
+      // Not valid JSON despite the leading brace. Deliberately NOT re-tested as
+      // prose: a truncated or malformed JSON body is a broken envelope, not a
+      // sentence somebody wrote, and echoing its fragment would show braces.
+    }
+    return fallback;
+  }
+
+  return showableReason(raw) ?? fallback;
+}
+
+/**
+ * `value` if it is a string fit to put in front of a user, else `null`.
+ *
+ * The SAME policy for a structured `message` and for a plain body: a backend
+ * envelope is no more trustworthy than a bare one — it can just as easily carry
+ * a stack trace, an HTML fragment, or an unbounded diagnostic — and applying
+ * the bound to only one of the two would leave the "never passed through
+ * unexamined" promise true of the less likely case and false of the more
+ * likely one.
+ */
+export function showableReason(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const text = value.trim();
+  if (!text) return null;
+  const showable =
+    text.length <= MAX_PASSTHROUGH_REASON_LENGTH &&
+    !LINE_BREAK.test(text) &&
+    !text.includes("<");
+  return showable ? text : null;
+}
+
+/** Preserve structured billing/environment metadata across the WebRouteError boundary. */
+function launchFailureDetails(
+  err: SwarmAgentError,
+): Record<string, unknown> | undefined {
+  const raw = err.bodyText?.trim();
+  if (!raw?.startsWith("{")) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const envelope = parsed.error;
+    const source =
+      envelope && typeof envelope === "object"
+        ? (envelope as Record<string, unknown>)
+        : parsed;
+    const details = source.details;
+    // `typeof [] === "object"`, and spreading an array yields `{0: …}` — index
+    // keys masquerading as structured metadata. A list is not a details bag.
+    const bag =
+      details && typeof details === "object" && !Array.isArray(details)
+        ? { ...(details as Record<string, unknown>) }
+        : undefined;
+    // Carry the backend's `code` alongside its details. The message is bounded
+    // and prose-shaped by design, so it is the wrong thing to branch on; a
+    // caller that needs to tell "this environment has no model"
+    // (`ENV_MODEL_REQUIRED`) from a transient resolution failure has nothing
+    // else to read. Cheap to forward, and the same code the eval and v1
+    // environment surfaces already expose.
+    const code = typeof source.code === "string" ? source.code : undefined;
+    // The organization's AI key policy refuses a launch with EVERY
+    // dependency that can't run on its providers, beside its message.
+    const problems = Array.isArray(source.problems)
+      ? source.problems
+      : undefined;
+    if (!bag && !code && !problems) return undefined;
+    // The DETAILS bag wins when it carries its own `code`. A response can hold
+    // both — an envelope code describing the transport failure and a domain
+    // code inside `details` naming the specific refusal — and the domain one is
+    // the branchable half. The envelope code only fills a gap.
+    const hasDetailCode = typeof bag?.code === "string" && bag.code.length > 0;
+    return {
+      ...(bag ?? {}),
+      ...(code && !hasDetailCode ? { code } : {}),
+      ...(problems && !bag?.problems ? { problems } : {}),
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function requireConvexHttpUrl(): string {
+  const url = process.env.CONVEX_HTTP_URL;
+  if (!url) {
+    throw new WebRouteError(
+      500,
+      ErrorCode.INTERNAL_ERROR,
+      "Server missing CONVEX_HTTP_URL configuration",
+    );
+  }
+  return url;
+}
+
+/**
+ * Create the run, then start its fan-out runner fire-and-forget.
+ *
+ * Returns as soon as the run row exists — the caller answers 202 and the work
+ * continues in the background. Throws a `WebRouteError` for anything the
+ * caller can act on (a journey with no hosts, a backend 4xx); anything the
+ * runner hits later is logged, because there is no longer a caller to tell.
+ */
+export async function launchJourneyRun(
+  deps: LaunchJourneyRunDeps,
+  input: LaunchJourneyRunInput,
+): Promise<LaunchJourneyRunResult> {
+  // Before the run is created: a draining server could not finish it. Once
+  // admitted, the launch holds the drain through every setup step, so a
+  // shutdown that begins while the run is being created still waits for it.
+  assertAdmitting();
+  return serverDrain.track("swarm_run", createAndStartJourneyRun(deps, input));
+}
+
+async function createAndStartJourneyRun(
+  deps: LaunchJourneyRunDeps,
+  input: LaunchJourneyRunInput,
+): Promise<LaunchJourneyRunResult> {
+  const convexHttpUrl = requireConvexHttpUrl();
+  // Capture the signed-in identity before replacing its bearer with the
+  // background credential. Membership and rollout are rechecked per session.
+  // The harnesses the wave's targets use, so the launch can declare which of
+  // them this runner will execute locally.
+  let waveHarnesses: Array<string | undefined> = [];
+  if (input.waveId) {
+    const client = createConvexClient(deps.bearerToken);
+    const journey = await client.query("journeys:getJourney" as never, {
+      projectId: input.projectId, journeyRefId: input.journeyRefId,
+    } as never) as any;
+    const environmentIds = input.environmentIds?.length ? input.environmentIds : journey?.environmentIds ?? [];
+    const hostIds = environmentIds.length
+      ? await Promise.all(environmentIds.map(async (environmentId: string) => {
+          const environment = await client.query("projectEnvironments:getEnvironment" as never, {
+            projectId: input.projectId, environmentId,
+          } as never) as any;
+          return environment?.hostId;
+        }))
+      : journey?.hostIds ?? [];
+    const hosts = await Promise.all(hostIds.map(async (hostId: string) =>
+      client.query("hosts:getHost" as never, { hostId } as never) as any,
+    ));
+    waveHarnesses = hosts.map(host => host?.config?.harness);
+  }
+  // Per harness, unattended (a swarm runs with nobody to approve anything):
+  // machine, sandbox evidence, rollout and authorization. Declared to the
+  // backend below so it stamps exactly these targets local — and the runner
+  // executes exactly these locally.
+  const localHarnessIds = await eligibleUnattendedLocalHarnesses(deps.bearerToken, input.projectId, waveHarnesses);
+  const localEnabled = localHarnessIds.length > 0;
+  for (const harnessId of localHarnessIds) {
+    await ensureLocalHarnessTarget({ bearer: deps.bearerToken, projectId: input.projectId, scope: "attended", waitForInstall: false, harnessId });
+  }
+  const localActorResult = localEnabled
+    ? await resolveLocalHarnessActor({ authorizationHeader: `Bearer ${deps.bearerToken.replace(/^Bearer\s+/i, "")}`, contextCredential: null })
+    : undefined;
+
+  // Create the run over the journey's full pinned host set (no maxHosts
+  // cap). A backend rejection (a hard host-count ceiling, a journey with no
+  // hosts, a duplicate launchKey, …) surfaces as a clear 4xx instead of a
+  // bare 500.
+  let created;
+  try {
+    created = await createJourneyRun(convexHttpUrl, deps.bearerToken, {
+      runtimeVenue: localEnabled ? "local" : "hosted",
+      ...(localEnabled ? { localHarnessIds } : {}),
+      projectId: input.projectId,
+      journeyRefId: input.journeyRefId,
+      launchKey: input.launchKey,
+      kind: input.waveId ? "swarm" : "user_testing",
+      ...(input.waveId ? { swarmRunGroupId: input.waveId } : {}),
+      ...(input.sessionsPerTarget !== undefined
+        ? { sessionsPerTarget: input.sessionsPerTarget }
+        : {}),
+      ...(input.environmentIds?.length
+        ? { environmentIds: input.environmentIds }
+        : {}),
+      ...(input.expectedSponsored !== undefined
+        ? { expectedSponsored: input.expectedSponsored }
+        : {}),
+    });
+  } catch (err) {
+    if (
+      err instanceof SwarmAgentError &&
+      err.status >= 400 &&
+      err.status < 500
+    ) {
+      // Keep the backend's MEANING, not just its status. Collapsing every 4xx
+      // to VALIDATION_ERROR tells a caller that branches on `code` to go fix
+      // its request — wrong advice for a launch refused on permissions, aimed
+      // at a journey that does not exist, replaying a conflicting key, or
+      // rejected on quota. The status was already distinct; the code should be
+      // too. Anything else 4xx really is "your request was not acceptable".
+      //
+      // 429 matters most of the five: it is the only RETRYABLE one, and
+      // reading it as invalid input turns "wait and try again" into "this
+      // request can never work".
+      //
+      // 402 is the SIXTH and the other one that changes what a caller should
+      // do: the organization is out of credit, so retrying is pointless and
+      // every sibling launch in the same wave will fail identically. The
+      // swarm fan-out reads this code to stop scheduling rather than fire N
+      // more doomed requests.
+      const CODE_BY_STATUS: Record<number, ErrorCode> = {
+        401: ErrorCode.UNAUTHORIZED,
+        402: ErrorCode.BILLING_LIMIT_REACHED,
+        403: ErrorCode.FORBIDDEN,
+        404: ErrorCode.NOT_FOUND,
+        409: ErrorCode.CONFLICT,
+        429: ErrorCode.RATE_LIMITED,
+      };
+      const code = CODE_BY_STATUS[err.status] ?? ErrorCode.VALIDATION_ERROR;
+      const details = launchFailureDetails(err);
+      if (err.status === 409 && details?.code === SWARM_FUNDING_CHANGED_CODE) {
+        const changed = parseFundingChangedDetails(details);
+        throw new WebRouteError(
+          409,
+          ErrorCode.CONFLICT,
+          changed
+            ? `Sponsored conversations changed while you were reviewing this launch: ${changed.expectedSponsored} were expected and ${changed.actualSponsored} of ${changed.totalConversations} would be sponsored now. Nothing was launched.`
+            : "Sponsored conversations changed while you were reviewing this launch. Nothing was launched.",
+          { ...(changed ?? {}), code: SWARM_FUNDING_CHANGED_CODE },
+        );
+      }
+      // The organization's AI key policy refused the launch: the same answer
+      // an eval launch gets (403 or 422 with the code and its remediation),
+      // with the problem list the client shows in full. The backend's
+      // summary sentence is often past the passthrough bound, so the
+      // fallback says what happened.
+      if (
+        details &&
+        Array.isArray(details.problems) &&
+        typeof details.code === "string"
+      ) {
+        throw aiRefusalRouteError(
+          details.code,
+          launchFailureMessage(err, AI_LAUNCH_REFUSED_FALLBACK),
+          details,
+        );
+      }
+      // A hosted harness target whose pinned image cannot boot refuses the
+      // whole launch. The backend's sentence names the target, and passes
+      // through when it fits; a long client or environment name can push it
+      // past the passthrough bound, and the generic fallback would then drop
+      // the one thing the launcher needs to know: which fix applies.
+      const message = launchFailureMessage(
+        err,
+        details?.code === JOURNEY_TARGET_IMAGE_UNAVAILABLE
+          ? "A target in this launch pins a computer image that can't boot. " +
+              "Fix that image, or remove the target, then launch again."
+          : undefined,
+      );
+      const modelError = environmentModelRequiredError({
+        data: {
+          code: details?.code,
+          message,
+          details,
+        },
+      });
+      const routeError =
+        modelError ?? new WebRouteError(err.status, code, message, details);
+      // The wave fan-out and every generic client read `Retry-After` to decide
+      // WHEN to come back; the 429 alone only says "not now". The backend's
+      // daily launch cap sends the UTC roll and its burst brake sends the
+      // bucket refill, so this is the one number nobody downstream can derive.
+      throw err.retryAfter
+        ? routeError.withHeaders({ "Retry-After": err.retryAfter })
+        : routeError;
+    }
+    throw err;
+  }
+
+  // The backend derives + authorizes projectId from the journey (and is
+  // LAUNCHER + project-member gated) — that is the authoritative gate. We do
+  // NOT re-check the client-supplied `body.projectId` here: a post-create
+  // reject would leave a durable run row with no runner (an orphan). Trust
+  // the backend's gating and always proceed to start the runner on a
+  // successful create.
+  const { runId, projectId, snapshot } = created;
+
+  // Deduped launch (launchKey replay onto an EXISTING run): the ORIGINAL
+  // launch's runner owns that run. Starting a second runner here would
+  // race it — duplicate claims (suppressed per-attempt by `applied:false`)
+  // and, worse, the duplicate's shutdown/cleanup (finalize-pending, abort
+  // finalizers, heartbeat stop) can kill attempts the owner is still
+  // executing. Acknowledge idempotently with the SAME runId and start
+  // nothing. If the original runner is dead, the backend stale-run cron
+  // finalizes the run; a retry then needs a FRESH launchKey.
+  if (created.deduped) {
+    logger.info("[swarm-runs] deduped launch — runner already owns run", {
+      runId,
+      projectId,
+    });
+    return {
+      runId,
+      deduped: true,
+      ...(created.funding ? { funding: created.funding } : {}),
+    };
+  }
+
+  if (!Array.isArray(snapshot.hosts) || snapshot.hosts.length === 0) {
+    throw new WebRouteError(
+      400,
+      ErrorCode.VALIDATION_ERROR,
+      "This journey has no pinned hosts to run",
+    );
+  }
+  const hosts = snapshot.hosts;
+  const localHarnessActor = localActorResult?.ok ? localActorResult.actor : undefined;
+
+  // The run's clocks, frozen by the backend at launch and captured here once:
+  // claims and heartbeats never carry them, so no later edit reaches a running
+  // run. Unreadable budgets refuse the launch rather than default, and the run
+  // row that already exists is closed now instead of waiting for the stale
+  // sweep.
+  const frozenBudgets = readFrozenSwarmBudgets(snapshot);
+  if (!frozenBudgets.ok) {
+    logger.warn("[swarm-runs] refused a launch with unreadable budgets", {
+      runId,
+      issues: frozenBudgets.issues,
+    });
+    // The bearer is minted inside the guard too: closing the run is best
+    // effort, and nothing that fails here may replace the refusal.
+    try {
+      await finalizePendingAttempts(convexHttpUrl, await deps.getRunBearer(), {
+        projectId,
+        runId,
+        terminalStatus: "failed",
+        errorCode: UNREADABLE_SWARM_BUDGETS_CODE,
+        errorMessage: frozenBudgets.message,
+      });
+    } catch (error) {
+      // The backend's stale-run cron still ends the run.
+      logger.warn("[swarm-runs] could not close the refused run", {
+        runId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    throw new WebRouteError(409, ErrorCode.CONFLICT, frozenBudgets.message);
+  }
+
+  // Client for the run's D2 re-gates. Constructed PER CALL and deliberately
+  // not memoized: a client bakes its auth token in at construction, so a
+  // whole-run singleton would carry the launch-time bearer for hours and start
+  // 401ing partway through a long fan-out. The cost is one client object per
+  // session; the alternative was a re-gate that stops working mid-run.
+  //
+  // Lazy for a second reason: `createConvexClient` throws when `CONVEX_URL` is
+  // unset, and we are past `createJourneyRun` — a throw here would orphan a
+  // durable run row with no runner. A journey that pins no plugins never calls
+  // this at all.
+  const getPluginRegateClient = async () =>
+    createConvexClient(await deps.getRunBearer());
+
+  // Registered before the launch settles and released when the runner does,
+  // so the drain holds the run with no gap between setup and the runner.
+  let runnerSettled!: () => void;
+  void serverDrain.track(
+    "swarm_run",
+    new Promise<void>((resolve) => {
+      runnerSettled = resolve;
+    }),
+  );
+  setImmediate(async () => {
+    // Never rejects: every failure, the bearer included, reads as "no browser".
+    const runHosts = await withoutBrowserOutsideRollout(hosts, async () => {
+      let bearer: string;
+      try {
+        bearer = await deps.getRunBearer();
+      } catch (error) {
+        logger.warn(
+          "[journeys] no run bearer for the hosted-browser check; launching without browser",
+          { error: error instanceof Error ? error.message : String(error) },
+        );
+        return false;
+      }
+      return isHostedBrowserAvailableFor({
+        bearer,
+        projectId,
+        surface: "tools",
+      });
+    });
+    const runner = startJourneyRun({
+      runId,
+      projectId,
+      hosts: runHosts,
+      personaSnapshot: snapshot.personaSnapshot,
+      sessionsPerTarget: snapshot.sessionsPerTarget,
+      maxTurns: snapshot.maxTurns,
+      ...(frozenBudgets.budgets ? { budgets: frozenBudgets.budgets } : {}),
+      ...(created.sessions?.length ? { sessionFunding: created.sessions } : {}),
+      setupWrites: snapshot.setupWrites,
+      goal: snapshot.goal,
+      // Whether this run is rubric-graded at all. The runner only needs
+      // the yes/no — the criteria themselves come back from the claim, so
+      // the authoritative list is always the backend's pinned copy and
+      // never a value that rode along in process memory.
+      hasRubric:
+        ((snapshot.standardCheckProfile?.criteria ?? snapshot.rubric)?.length ??
+          0) > 0,
+      convexHttpUrl,
+      getBearer: deps.getRunBearer,
+      localHarnessActor,
+      ...(localEnabled ? { localHarnessIds } : {}),
+      // Host-aware: each host connects ONLY its own pinned required servers
+      // (optionalServerIds stay off, matching a real no-opt-in visitor).
+      managerFactory: async (host) => {
+        // Decision D2 — re-gate the target's pinned plugin servers against
+        // the LIVE plugin, here at connect time, rather than trusting the
+        // snapshot's `pluginServerIds`. That stored list records what was
+        // PINNED; a plugin disabled or uninstalled since launch must stop
+        // contributing servers even though the snapshot still names them.
+        // Throwing fails this target's sessions as a config error — the
+        // same treatment an invalid stored xaaPolicy gets — because a
+        // silently shrunken server set runs an environment nobody
+        // configured.
+        //
+        // Re-gated per SESSION, not once per target: `managerFactory` is
+        // invoked per session attempt, so a plugin uninstalled mid-run
+        // stops contributing to the very next session rather than at the
+        // next launch. Deliberate — revocation should not wait for a run
+        // to finish — at the cost of one query per session.
+        const pluginServerIds = await resolveTargetPluginServerIds(
+          getPluginRegateClient,
+          {
+            runId,
+            targetId: host.targetId,
+            snapshotPluginServerIds: host.pluginServerIds,
+          },
+        );
+        // Deduped union: the backend keeps plugin ids out of `serverIds`,
+        // but an overlap would double-connect rather than fail, so guard it.
+        const hostServerIds = new Set(host.serverIds);
+        const pluginOnlyServerIds = pluginServerIds.filter(
+          (id) => !hostServerIds.has(id),
+        );
+        const serverIds =
+          pluginOnlyServerIds.length > 0
+            ? [...host.serverIds, ...pluginOnlyServerIds]
+            : host.serverIds;
+        // Reconnect with THIS host's non-secret connection settings
+        // (per-request timeout + MCP protocol pins) so the run reproduces
+        // the pinned snapshot rather than the host's current live config.
+        // Secrets/headers stay live-resolved by the authorize batch.
+        const connection = buildHostConnectionPins(host, WEB_STREAM_TIMEOUT_MS);
+        const { manager } = await createAuthorizedManager(
+          deps.callerContext,
+          // Per-SESSION: `managerFactory` runs once per session attempt,
+          // and the authorize batch it drives resolves live credentials —
+          // so it must not carry a bearer minted at launch.
+          await deps.getRunBearer(),
+          projectId,
+          serverIds,
+          connection.timeoutMs,
+          undefined,
+          // Pinned MCP client capabilities from the snapshot — negotiate
+          // INITIALIZE with the SAME capabilities the host declared at
+          // run-create time (mirrors the scenario path), not the current
+          // live config's.
+          host.clientCapabilities,
+          {
+            accessScope: "project_member",
+            // XAA servers fail closed without the issuer; resolved above
+            // from the live request Context.
+            xaaIssuer: deps.xaaIssuer,
+            // Enterprise-managed policy from the PINNED host snapshot
+            // (server-side, mcpProfile copied verbatim at run-create) —
+            // the run reproduces the snapshot's policy, and an invalid
+            // stored policy fails the host's sessions as a config error
+            // rather than silently un-enforcing.
+            xaaPolicy: xaaPolicyFromMcpProfile(host.mcpProfile),
+            ...(connection.initializePins
+              ? { initializePins: connection.initializePins }
+              : {}),
+            ...(connection.mcpProtocolVersionsByServerId
+              ? {
+                  mcpProtocolVersionsByServerId:
+                    connection.mcpProtocolVersionsByServerId,
+                }
+              : {}),
+            ...(connection.requestTimeoutByServerId
+              ? {
+                  requestTimeoutByServerId: connection.requestTimeoutByServerId,
+                }
+              : {}),
+          },
+        );
+        // `MCPClientManager` starts eager connections in the background. Do
+        // not hand that manager to a session while its servers are still only
+        // "registered": the first model turn can otherwise race initialization
+        // and report that an MCP server is not connected (or give the model no
+        // tools, which looks like the server is unavailable).
+        //
+        // `listTools` is deliberately used as the readiness barrier instead
+        // of reaching into the manager's private connection state. It waits
+        // for the initial connection, exercises the same retry/reconnect path
+        // used by normal requests, and populates the SDK's tool cache before
+        // `prepareChatV2` runs. The manager remains owned by this session and
+        // is disposed only after the session finishes.
+        try {
+          await Promise.all(
+            serverIds.map((serverId) => manager.listTools(serverId)),
+          );
+        } catch (error) {
+          // The factory has not returned yet, so the runner cannot call its
+          // dispose hook. Clean up any sibling connections before propagating
+          // the failure and letting the session classify it.
+          await manager.disconnectAllServers().catch(() => {});
+          throw error;
+        }
+        return {
+          manager,
+          connectedServerIds: serverIds,
+          // The session connects these, but `resumeConfig` must never tell
+          // a later viewer to reconnect them without re-gating the plugin.
+          //
+          // Subtract anything ALSO in the host's own `serverIds`: D1 keeps
+          // plugin ids out of that list so the overlap should be empty, but
+          // the union above already guards for it, and marking such an id
+          // non-resumable would strip a legitimately host-pinned server
+          // from resume. An id that stands on its own in the host config
+          // does not need the plugin to justify reconnecting it.
+          ...(pluginOnlyServerIds.length > 0
+            ? { nonResumableServerIds: pluginOnlyServerIds }
+            : {}),
+          dispose: async () => {
+            await manager.disconnectAllServers();
+          },
+        };
+      },
+    }).catch((err) => {
+      logger.error("[swarm-runs] startJourneyRun failed", err, { runId });
+    });
+    void runner.finally(runnerSettled);
+  });
+
+  return { runId, ...(created.funding ? { funding: created.funding } : {}) };
+}

@@ -1,0 +1,457 @@
+import { HARNESS_DESCRIPTORS } from "./harness-descriptors";
+/**
+ * Which models a harness runtime can run, keyed by the runtime's VERSION.
+ *
+ * The rules are an evidence table, not constants: every row names the harness,
+ * the runtime versions it was observed on, the model family it covers, the
+ * verdict, the evidence for it and when it was observed. The table itself is
+ * data — `harness-model-support-evidence.json` beside this file — because the
+ * backend's lease rule reads the SAME rows (it keeps a byte-for-byte mirror and
+ * pins its hash), so the two sides cannot disagree about a harness × model
+ * pair. Edit the JSON, never a copy of its rules in code.
+ *
+ * A verdict is three-valued on purpose:
+ *
+ *  - `supported`   — measured or documented to work on this runtime version.
+ *  - `unsupported` — measured or documented NOT to work (the runtime would
+ *                    silently substitute its own model, or run it without
+ *                    tools). Refused everywhere.
+ *  - `unknown`     — nobody has checked this pair on this version. Refused for
+ *                    evals and swarms ("not verified for <harness> <version>"),
+ *                    allowed in Playground chat with a warning.
+ *
+ * Shared by the server registry (`server/utils/harness/registry.ts`), the
+ * admission gates, and the client pickers, so a picker never offers what the
+ * server would refuse.
+ */
+import type { Harness } from "@mcpjam/sdk/host-config/internal";
+import evidenceTable from "./harness-model-support-evidence.json" with { type: "json" };
+
+export type HarnessModelSupportStatus = "supported" | "unsupported" | "unknown";
+
+export type HarnessDiscoveryRoute = {
+  runtimeVersion: string;
+  adapterVersion: string;
+  protocolVersion: string;
+  modelId: string;
+  delivery: "forwarded-native" | "forwarded-bridge" | "native-proxy" | "host-tools";
+  venue: "hosted" | "local";
+  surface: "chat" | "eval" | "swarm";
+  funding: "platform" | "organization";
+  upstreamProfile: HarnessUpstreamProfile;
+};
+
+export type HarnessDiscoveryEvidence = HarnessDiscoveryRoute & {
+  status: HarnessModelSupportStatus;
+  evidence: string;
+  observedAt: string;
+};
+
+/** One evidence row, exactly as it appears in the JSON table. */
+export type HarnessModelSupportRow = {
+  harness: string;
+  /** `"*"` (any version, including an unknown one), `"<=A.B.x"`, `">A.B.x"` or `"A.B.x"`. */
+  versionRange: string;
+  /** Regular expression tested against the normalized canonical model id. */
+  familyPattern: string;
+  status: HarnessModelSupportStatus;
+  evidence: string;
+  /** ISO date the evidence was observed. */
+  observedAt: string;
+  nativeDiscovery?: readonly HarnessDiscoveryEvidence[];
+};
+
+/** Model compatibility alone is not proof of native discovery on a route. */
+export function harnessNativeDiscoverySupport(args: {
+  harnessId: string;
+  route: HarnessDiscoveryRoute;
+  rows?: readonly HarnessModelSupportRow[];
+}): { status: HarnessModelSupportStatus; reason: string } {
+  const modelSupport = harnessModelSupport({ harnessId: args.harnessId, modelId: args.route.modelId, runtimeVersion: args.route.runtimeVersion, rows: args.rows });
+  if (modelSupport.status !== "supported") return modelSupport;
+  const modelId = normalizeHarnessModelId(args.route.modelId);
+  for (const row of args.rows ?? HARNESS_MODEL_SUPPORT_ROWS) {
+    if (row.harness !== args.harnessId) continue;
+    for (const proof of row.nativeDiscovery ?? []) {
+      if (
+        normalizeHarnessModelId(proof.modelId) === modelId &&
+        proof.runtimeVersion === args.route.runtimeVersion &&
+        proof.adapterVersion === args.route.adapterVersion &&
+        proof.protocolVersion === args.route.protocolVersion &&
+        proof.delivery === args.route.delivery && proof.venue === args.route.venue &&
+        proof.surface === args.route.surface && proof.funding === args.route.funding &&
+        proof.upstreamProfile === args.route.upstreamProfile
+      ) return { status: proof.status, reason: proof.evidence };
+    }
+  }
+  return { status: "unknown", reason: "Native tool discovery is not qualified for this client, model and execution route." };
+}
+
+export type HarnessModelSupportVerdict = {
+  status: HarnessModelSupportStatus;
+  /** Human copy. For `unknown` it always reads
+   *  `not verified for <harness> <version>`. */
+  reason: string;
+  /** The row that decided the verdict, when one did. */
+  evidence?: HarnessModelSupportRow;
+};
+
+/**
+ * Where a model is about to run, which decides what an `unknown` verdict means:
+ * evals and swarms produce results someone will compare, so an unverified pair
+ * is refused; Playground chat is exploratory, so it runs with a warning.
+ */
+export type HarnessModelPurpose = "chat" | "eval" | "swarm";
+
+export const HARNESS_MODEL_SUPPORT_ROWS: readonly HarnessModelSupportRow[] =
+  evidenceTable.rows as HarnessModelSupportRow[];
+
+/**
+ * The runtime CLI version each harness adapter pins — the version the evidence
+ * rows are evaluated against when nothing more specific is known.
+ *
+ *  - `claude-code`: `@anthropic-ai/claude-code` in the bridge package the
+ *    installed `@ai-sdk/harness-claude-code` bootstraps.
+ *  - `codex`: `@openai/codex` in the app-server bootstrap
+ *    (`PINNED_CODEX_VERSION`).
+ *  - `cursor`: the CLI build `cursor-bootstrap.ts` installs. Cursor's own
+ *    installer serves whatever is current, so the hosted bootstrap replaces it
+ *    with a checksummed download of exactly this build. Its evidence rows are
+ *    all version-independent; the pin exists so the baked template, the box and
+ *    the recorded session version can be compared.
+ *
+ * Asserted against the installed packages in the registry tests; bump here in
+ * the same change that bumps an adapter.
+ */
+export const HARNESS_PINNED_VERSIONS = {
+  "claude-code": HARNESS_DESCRIPTORS["claude-code"].runtimeVersion,
+  "codex": HARNESS_DESCRIPTORS["codex"].runtimeVersion,
+  "copilot-cli": HARNESS_DESCRIPTORS["copilot-cli"].runtimeVersion,
+  "cursor": HARNESS_DESCRIPTORS["cursor"].runtimeVersion,
+  "opencode": HARNESS_DESCRIPTORS["opencode"].runtimeVersion,
+} as const satisfies Record<Harness, string | null>;
+
+/** The pinned runtime version for a harness id, or undefined when the harness
+ *  is unknown or its version is not pinned. */
+export function harnessPinnedVersion(harnessId: string): string | undefined {
+  return Object.prototype.hasOwnProperty.call(
+    HARNESS_PINNED_VERSIONS,
+    harnessId,
+  )
+    ? (HARNESS_PINNED_VERSIONS[harnessId as Harness] ?? undefined)
+    : undefined;
+}
+
+/**
+ * The organization upstream a harness can run on: its own vendor's native API,
+ * on the organization's key, and the runtime profile that talks to it. Claude
+ * Code speaks Anthropic Messages and Codex speaks OpenAI Responses, so a turn
+ * whose saved selection names an org Anthropic (resp. OpenAI) connection runs
+ * on that key through MCPJam's model proxy. Cursor authenticates with the
+ * customer's own Cursor account. OpenCode is platform-funded only until its
+ * org-key path is qualified, so it takes no org connection.
+ *
+ * This is the preflight's answer from non-secret metadata; the backend still
+ * resolves the connection id authoritatively at lease start and refuses a
+ * mismatch (`provider_mismatch`).
+ */
+export type HarnessOrgUpstream = {
+  provider: "anthropic" | "openai";
+  profile: "anthropic-native" | "openai-native";
+};
+
+export const HARNESS_ORG_UPSTREAM = {
+  "claude-code": HARNESS_DESCRIPTORS["claude-code"].orgUpstream,
+  "codex": HARNESS_DESCRIPTORS["codex"].orgUpstream,
+  "copilot-cli": HARNESS_DESCRIPTORS["copilot-cli"].orgUpstream,
+  "cursor": HARNESS_DESCRIPTORS["cursor"].orgUpstream,
+  "opencode": HARNESS_DESCRIPTORS["opencode"].orgUpstream,
+} as const satisfies Record<Harness, HarnessOrgUpstream | null>;
+
+/** The org upstream `harnessId` runs on, or null when it takes no org key. */
+export function harnessOrgUpstream(
+  harnessId: string,
+): HarnessOrgUpstream | null {
+  return Object.prototype.hasOwnProperty.call(HARNESS_ORG_UPSTREAM, harnessId)
+    ? HARNESS_ORG_UPSTREAM[harnessId as Harness]
+    : null;
+}
+
+/** Whether `harnessId` can run on an org connection to `providerKey`. */
+export function harnessRunsOnOrgProvider(
+  harnessId: string,
+  providerKey: string | undefined,
+): boolean {
+  return (
+    providerKey !== undefined &&
+    harnessOrgUpstream(harnessId)?.provider === providerKey
+  );
+}
+
+/**
+ * Which upstream a harness runtime is configured for, as the backend resolved
+ * it at lease start. Non-secret. The Gateway profile keeps the Gateway's
+ * Claude model spellings and effort workarounds; a native profile talks to the
+ * vendor's own API with native model ids.
+ */
+export type HarnessUpstreamProfile =
+  "gateway" | "anthropic-native" | "openai-native";
+
+const ORG_PROVIDER_LABELS: Record<HarnessOrgUpstream["provider"], string> = {
+  anthropic: "Anthropic",
+  openai: "OpenAI",
+};
+
+/**
+ * The organization's AI key policy, as harness copy reads it. When the
+ * organization requires its own provider keys ("Use your keys for all AI
+ * features"), MCPJam-provided models are off, so a brokered harness runs only
+ * on the organization's key for its own vendor.
+ */
+export type HarnessKeyPolicy = { requireOrgKeys?: boolean };
+
+/** The refusal copy for an org connection the harness cannot run on. */
+export function harnessOrgProviderUnsupportedReason(
+  harnessId: string,
+  policy: HarnessKeyPolicy | null = {},
+): string {
+  const name = harnessDisplayName(harnessId);
+  const upstream = harnessOrgUpstream(harnessId);
+  if (!upstream) {
+    return `The ${name} client does not support organization provider keys. Choose another client.`;
+  }
+  const vendor = ORG_PROVIDER_LABELS[upstream.provider];
+  if (policy === null) {
+    return `The ${name} client needs a supported model and an eligible ${vendor} connection. Choose another model or contact your organization admin.`;
+  }
+  return policy.requireOrgKeys
+    ? `The ${name} client requires your organization's ${vendor} key. Choose an organization model or contact your organization admin.`
+    : `The ${name} client needs an MCPJam model or your organization's ${vendor} key. Choose a supported model.`;
+}
+
+/**
+ * Why a harness host's picker has no row it can run, and what fixes it. Under
+ * the key policy the picker adds the fix itself ("Add a provider", or ask an
+ * admin), so the sentence names only the vendor.
+ */
+export function harnessNoRunnableModelReason(
+  harnessId: string,
+  policy: HarnessKeyPolicy = {},
+): string {
+  const name = harnessDisplayName(harnessId);
+  const upstream = harnessOrgUpstream(harnessId);
+  if (!upstream) return `${name} has no model it can run here.`;
+  const vendor = ORG_PROVIDER_LABELS[upstream.provider];
+  return policy.requireOrgKeys
+    ? `This organization requires its own provider keys, so ${name} runs only on an organization ${vendor} provider.`
+    : `${name} runs MCPJam models or your organization's ${vendor} key. Add one in Organization models.`;
+}
+
+/** Human-facing runtime names (same values as the registry's `displayName`). */
+const HARNESS_DISPLAY_NAMES: Record<string, string> = {
+  "claude-code": HARNESS_DESCRIPTORS["claude-code"].displayName,
+  codex: HARNESS_DESCRIPTORS.codex.displayName,
+  "copilot-cli": HARNESS_DESCRIPTORS["copilot-cli"].displayName,
+  cursor: HARNESS_DESCRIPTORS.cursor.displayName,
+  opencode: HARNESS_DESCRIPTORS.opencode.displayName,
+};
+
+/** The runtime's human-facing name ("Claude Code"), or the id itself. */
+export function harnessDisplayName(harnessId: string): string {
+  return HARNESS_DISPLAY_NAMES[harnessId] ?? harnessId;
+}
+
+// ── Versions ─────────────────────────────────────────────────────────────────
+
+/** `[major, minor, patch]`, or undefined when the string is not a version. A
+ *  leading `v` and any prerelease/build suffix are tolerated. */
+export function parseHarnessVersion(
+  version: string | null | undefined,
+): [number, number, number] | undefined {
+  if (typeof version !== "string") return undefined;
+  const match = version.trim().match(/^v?(\d+)\.(\d+)(?:\.(\d+))?(?:[-+].*)?$/);
+  if (!match) return undefined;
+  return [Number(match[1]), Number(match[2]), Number(match[3] ?? 0)];
+}
+
+/** Compare two parsed versions on major.minor only (patch ignored). */
+function compareMajorMinor(
+  a: readonly [number, number, number],
+  b: readonly [number, number],
+): number {
+  if (a[0] !== b[0]) return a[0] - b[0];
+  return a[1] - b[1];
+}
+
+type ParsedRange =
+  { kind: "any" } | { kind: "lte" | "gt" | "eq"; bound: [number, number] };
+
+function parseVersionRange(range: string): ParsedRange | undefined {
+  if (range === "*") return { kind: "any" };
+  const match = range.match(/^(<=|>)?(\d+)\.(\d+)\.x$/);
+  if (!match) return undefined;
+  return {
+    kind: match[1] === "<=" ? "lte" : match[1] === ">" ? "gt" : "eq",
+    bound: [Number(match[2]), Number(match[3])],
+  };
+}
+
+/** Is `range` well-formed (`"*"`, `"<=A.B.x"`, `">A.B.x"` or `"A.B.x"`)? */
+export function isValidHarnessVersionRange(range: string): boolean {
+  return parseVersionRange(range) !== undefined;
+}
+
+/**
+ * Does `range` admit `version`? `"*"` admits anything, including an unknown
+ * version. A version-specific range never admits an unknown/unparseable
+ * version, nor does a malformed range admit anything.
+ */
+export function harnessVersionInRange(
+  range: string,
+  version: string | null | undefined,
+): boolean {
+  const parsedRange = parseVersionRange(range);
+  if (!parsedRange) return false;
+  if (parsedRange.kind === "any") return true;
+  const parsed = parseHarnessVersion(version);
+  if (!parsed) return false;
+  const cmp = compareMajorMinor(parsed, parsedRange.bound);
+  return parsedRange.kind === "lte" ? cmp <= 0 : parsedRange.kind === "gt" ? cmp > 0 : cmp === 0;
+}
+
+// ── Model ids ────────────────────────────────────────────────────────────────
+
+const CLAUDE_FAMILY_ID =
+  /^claude-(haiku|sonnet|opus)-(\d+)(?:-\d{8}|[.-](\d+)(?:-\d{8})?)?$/;
+
+/**
+ * Normalize a model id to the canonical spelling the evidence rows match:
+ * lower-case, provider-prefixed (`claude-*` → `anthropic/`, `gpt-*` →
+ * `openai/` when bare), and Anthropic family ids spelled with a dotted minor
+ * and no date suffix (`claude-sonnet-4-5-20250929` → `claude-sonnet-4.5`), the
+ * same family/major/minor the Claude Code adapter maps to its native id.
+ *
+ * Callers should still canonicalize with the provider first
+ * (`getCanonicalModelId`); this only makes the table robust to the spellings
+ * that reach it anyway.
+ */
+export function normalizeHarnessModelId(modelId: string): string {
+  let id = modelId.trim().toLowerCase();
+  if (!id.includes("/")) {
+    if (id.startsWith("claude-")) id = `anthropic/${id}`;
+    else if (id.startsWith("gpt-")) id = `openai/${id}`;
+  }
+  if (id.startsWith("anthropic/")) {
+    const slug = id.slice("anthropic/".length);
+    const match = slug.match(CLAUDE_FAMILY_ID);
+    if (match) {
+      const [, family, major, minor] = match;
+      id = `anthropic/claude-${family}-${major}${minor ? `.${minor}` : ""}`;
+    }
+  }
+  return id;
+}
+
+// ── Verdict ──────────────────────────────────────────────────────────────────
+
+function notVerifiedReason(
+  harnessId: string,
+  runtimeVersion: string | null | undefined,
+): string {
+  const version =
+    typeof runtimeVersion === "string" && runtimeVersion.trim()
+      ? runtimeVersion.trim()
+      : "unknown version";
+  return `This model has not been verified for the ${harnessDisplayName(harnessId)} client (${version}). Choose a verified model or another client.`;
+}
+
+/** The refusal copy for an `unsupported` verdict — the same sentence the
+ *  harness pre-flight has always used for a model the runtime can't run. */
+export function harnessModelUnsupportedReason(harnessId: string): string {
+  const name = harnessDisplayName(harnessId);
+  return `This model isn’t supported by ${name}. Choose a supported model or switch clients.`;
+}
+
+/**
+ * Can `harnessId` at `runtimeVersion` run `modelId`?
+ *
+ * Rows are evaluated in order and the first match wins. A row matches when its
+ * harness is `harnessId`, its `familyPattern` matches the normalized model id,
+ * and its `versionRange` admits `runtimeVersion`. When the version is missing
+ * or unparseable and a VERSION-SPECIFIC row's pattern matches, the verdict is
+ * `unknown` — the table has evidence for some versions of this pair, but
+ * cannot say which one is running. A harness with no rows, or a model no row
+ * covers, is `unknown` too.
+ */
+export function harnessModelSupport(args: {
+  harnessId: string;
+  runtimeVersion?: string | null;
+  modelId: string;
+  /** Override the table (tests). Defaults to {@link HARNESS_MODEL_SUPPORT_ROWS}. */
+  rows?: readonly HarnessModelSupportRow[];
+}): HarnessModelSupportVerdict {
+  const rows = args.rows ?? HARNESS_MODEL_SUPPORT_ROWS;
+  const modelId = normalizeHarnessModelId(args.modelId);
+  const versionKnown = parseHarnessVersion(args.runtimeVersion) !== undefined;
+  const unknown = (evidence?: HarnessModelSupportRow) => ({
+    status: "unknown" as const,
+    reason: notVerifiedReason(args.harnessId, args.runtimeVersion),
+    ...(evidence ? { evidence } : {}),
+  });
+
+  for (const row of rows) {
+    if (row.harness !== args.harnessId) continue;
+    let pattern: RegExp;
+    try {
+      pattern = new RegExp(row.familyPattern);
+    } catch {
+      continue;
+    }
+    if (!pattern.test(modelId)) continue;
+    if (row.versionRange !== "*") {
+      if (!versionKnown) return unknown(row);
+      if (!harnessVersionInRange(row.versionRange, args.runtimeVersion)) {
+        continue;
+      }
+    }
+    switch (row.status) {
+      case "supported":
+        return { status: "supported", reason: row.evidence, evidence: row };
+      case "unsupported":
+        return {
+          status: "unsupported",
+          reason: harnessModelUnsupportedReason(args.harnessId),
+          evidence: row,
+        };
+      default:
+        return unknown(row);
+    }
+  }
+  return unknown();
+}
+
+/** {@link harnessModelSupport} at the harness adapter's pinned CLI version. */
+export function harnessModelSupportAtPinnedVersion(args: {
+  harnessId: string;
+  modelId: string;
+}): HarnessModelSupportVerdict {
+  return harnessModelSupport({
+    harnessId: args.harnessId,
+    runtimeVersion: harnessPinnedVersion(args.harnessId),
+    modelId: args.modelId,
+  });
+}
+
+/**
+ * Does a verdict admit the model for `purpose`? `supported` always does,
+ * `unsupported` never does, and `unknown` only in Playground chat (where the
+ * caller shows the verdict's reason as a warning).
+ */
+export function harnessModelVerdictAdmits(
+  verdict: Pick<HarnessModelSupportVerdict, "status">,
+  purpose: HarnessModelPurpose,
+): boolean {
+  if (verdict.status === "supported") return true;
+  if (verdict.status === "unknown") return purpose === "chat";
+  return false;
+}

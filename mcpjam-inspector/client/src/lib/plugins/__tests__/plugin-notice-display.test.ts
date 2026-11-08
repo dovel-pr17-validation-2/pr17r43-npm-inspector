@@ -1,0 +1,334 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const toastInfo = vi.hoisted(() => vi.fn());
+vi.mock("@/lib/toast", () => ({ toast: { info: toastInfo } }));
+const config = vi.hoisted(() => ({ hostedMode: false }));
+vi.mock("@/lib/config", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/config")>()),
+  get HOSTED_MODE() {
+    return config.hostedMode;
+  },
+}));
+
+import { useTrafficLogStore } from "@/stores/traffic-log-store";
+import {
+  PLUGINS_UNAVAILABLE_MESSAGE,
+  describePluginNotice,
+  pluginNoticeKey,
+  registerPluginNoticeSignIn,
+  resetShownPluginNotices,
+  showPluginNotice,
+  type PluginNoticeData,
+} from "../plugin-notice-display";
+
+const bitsNeedsAuth: Extract<PluginNoticeData, { kind: "skipped" }> = {
+  kind: "skipped",
+  plugins: [
+    {
+      pluginId: "plg_bits",
+      name: "bits-and-bolts",
+      displayName: "Bits & Bolts",
+      reason: "needs_auth",
+    },
+  ],
+};
+
+describe("describePluginNotice", () => {
+  it("names the plugin and says what to do, per reason", () => {
+    expect(describePluginNotice(bitsNeedsAuth)).toBe(
+      "Bits & Bolts was skipped: sign in to its server first.",
+    );
+  });
+
+  it("says a plugin ran without one of its servers, and what to do", () => {
+    const partial = (reason: "needs_auth" | "needs_setup" | "unreachable") =>
+      describePluginNotice({
+        kind: "skipped",
+        plugins: [{ ...bitsNeedsAuth.plugins[0], reason, partial: true }],
+      });
+    expect(partial("needs_auth")).toBe(
+      "Bits & Bolts ran without one of its servers: sign in to that server to use it.",
+    );
+    expect(partial("needs_setup")).toBe(
+      "Bits & Bolts ran without one of its servers: finish that server's setup to use it.",
+    );
+    expect(partial("unreachable")).toBe(
+      "Bits & Bolts ran without one of its servers: that server isn't available right now. Try again later.",
+    );
+  });
+
+  describe("a plugin skipped for where it runs", () => {
+    const placement = (where?: "local" | "computer") =>
+      describePluginNotice({
+        kind: "skipped",
+        plugins: [
+          {
+            pluginId: "plg_bits",
+            name: "bits-and-bolts",
+            displayName: null,
+            reason: "placement",
+            ...(where ? { placement: where } : {}),
+          },
+        ],
+      });
+
+    afterEach(() => {
+      config.hostedMode = false;
+    });
+
+    it("says, on this computer, that it is not started automatically", () => {
+      expect(placement("local")).toBe(
+        "bits-and-bolts was skipped: it runs on this computer and isn't started automatically.",
+      );
+      expect(placement()).toBe(
+        "bits-and-bolts was skipped: it runs on this computer and isn't started automatically.",
+      );
+    });
+
+    it("says a computer component is not started automatically either", () => {
+      expect(placement("computer")).toBe(
+        "bits-and-bolts was skipped: it runs in a computer and isn't started automatically.",
+      );
+    });
+
+    it("says, in the hosted app, that it runs on a local runtime", () => {
+      config.hostedMode = true;
+      expect(placement("local")).toBe(
+        "bits-and-bolts was skipped: its server runs on a local runtime.",
+      );
+    });
+  });
+
+  it("says the chat ran without its plugins when they couldn't be set up", () => {
+    expect(describePluginNotice({ kind: "unavailable" })).toBe(
+      PLUGINS_UNAVAILABLE_MESSAGE,
+    );
+  });
+
+  it("stays one line when several plugins were skipped", () => {
+    const line = describePluginNotice({
+      kind: "skipped",
+      plugins: ["a", "b", "c"].map((id) => ({
+        pluginId: id,
+        name: id,
+        displayName: null,
+        reason: "needs_setup" as const,
+      })),
+    });
+    expect(line).toBe(
+      "a was skipped: finish its setup first. 2 more plugins were skipped; see Logs for details.",
+    );
+  });
+});
+
+describe("pluginNoticeKey", () => {
+  it("ignores the order the plugins arrived in", () => {
+    const a = { pluginId: "a", name: "a", displayName: null } as const;
+    const b = { pluginId: "b", name: "b", displayName: null } as const;
+    expect(
+      pluginNoticeKey("chat-1", {
+        kind: "skipped",
+        plugins: [
+          { ...a, reason: "needs_auth" },
+          { ...b, reason: "over_cap" },
+        ],
+      }),
+    ).toBe(
+      pluginNoticeKey("chat-1", {
+        kind: "skipped",
+        plugins: [
+          { ...b, reason: "over_cap" },
+          { ...a, reason: "needs_auth" },
+        ],
+      }),
+    );
+  });
+});
+
+describe("pluginNoticeKey for a partial skip", () => {
+  it("differs from the same plugin skipped whole for the same reason", () => {
+    const [whole] = bitsNeedsAuth.plugins;
+    expect(
+      pluginNoticeKey("chat-1", {
+        kind: "skipped",
+        plugins: [{ ...whole, partial: true }],
+      }),
+    ).not.toBe(pluginNoticeKey("chat-1", bitsNeedsAuth));
+  });
+});
+
+describe("showPluginNotice", () => {
+  beforeEach(() => {
+    toastInfo.mockClear();
+    resetShownPluginNotices();
+    useTrafficLogStore.getState().clear();
+  });
+
+  it("shows a notice once per chat and writes one Logs entry", () => {
+    expect(showPluginNotice("chat-1", bitsNeedsAuth)).toBe(true);
+    expect(showPluginNotice("chat-1", bitsNeedsAuth)).toBe(false);
+
+    expect(toastInfo).toHaveBeenCalledTimes(1);
+    expect(toastInfo).toHaveBeenCalledWith(
+      "Bits & Bolts was skipped: sign in to its server first.",
+    );
+    const logs = useTrafficLogStore.getState().mcpServerItems;
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({
+      serverId: "plugins",
+      serverName: "Plugins",
+      method: "plugins/skipped",
+      payload: {
+        level: "warning",
+        message: "Bits & Bolts was skipped: sign in to its server first.",
+        plugins: [
+          { pluginId: "plg_bits", name: "Bits & Bolts", reason: "needs_auth" },
+        ],
+      },
+    });
+  });
+
+  it("shows it again in another chat, or for a different skip", () => {
+    showPluginNotice("chat-1", bitsNeedsAuth);
+    showPluginNotice("chat-2", bitsNeedsAuth);
+    showPluginNotice("chat-1", {
+      kind: "skipped",
+      plugins: [{ ...bitsNeedsAuth.plugins[0]!, reason: "needs_setup" }],
+    });
+    expect(toastInfo).toHaveBeenCalledTimes(3);
+    expect(useTrafficLogStore.getState().mcpServerItems).toHaveLength(3);
+  });
+
+  it("logs an unavailable setup under its own method", () => {
+    showPluginNotice("chat-1", { kind: "unavailable" });
+    expect(toastInfo).toHaveBeenCalledWith(PLUGINS_UNAVAILABLE_MESSAGE);
+    expect(useTrafficLogStore.getState().mcpServerItems[0]?.method).toBe(
+      "plugins/unavailable",
+    );
+  });
+
+  it("says nothing for an empty skip list", () => {
+    expect(showPluginNotice("chat-1", { kind: "skipped", plugins: [] })).toBe(
+      false,
+    );
+    expect(toastInfo).not.toHaveBeenCalled();
+  });
+});
+
+describe("a notice's Sign in", () => {
+  const binding = { pluginVersionId: "ver_bits", componentKey: "cad" };
+  const needsSignIn: PluginNoticeData = {
+    kind: "skipped",
+    plugins: [
+      {
+        ...bitsNeedsAuth.plugins[0],
+        partial: true,
+        signIn: binding,
+      },
+    ],
+  };
+
+  beforeEach(() => {
+    toastInfo.mockClear();
+    resetShownPluginNotices();
+  });
+
+  it("offers the registered Sign in for the server the notice names", () => {
+    const signIn = vi.fn();
+    const unregister = registerPluginNoticeSignIn(signIn);
+    showPluginNotice("chat-1", needsSignIn);
+    const action = toastInfo.mock.calls.at(-1)?.[1]?.action;
+    expect(action?.label).toBe("Sign in");
+    action.onClick();
+    expect(signIn).toHaveBeenCalledWith(binding);
+    unregister();
+  });
+
+  it("offers nothing without a registered Sign in, or a server to sign in to", () => {
+    showPluginNotice("chat-1", needsSignIn);
+    expect(toastInfo.mock.calls.at(-1)).toHaveLength(1);
+
+    const unregister = registerPluginNoticeSignIn(vi.fn());
+    showPluginNotice("chat-2", bitsNeedsAuth);
+    expect(toastInfo.mock.calls.at(-1)).toHaveLength(1);
+    unregister();
+  });
+
+  it("offers Sign in only for the one named plugin that needs it", () => {
+    const plugin = (name: string, signIn?: typeof binding) => ({
+      ...bitsNeedsAuth.plugins[0],
+      pluginId: `plg_${name}`,
+      name,
+      displayName: name,
+      ...(signIn ? { signIn } : {}),
+    });
+    const other = { ...binding, componentKey: "other" };
+    const signIn = vi.fn();
+    const unregister = registerPluginNoticeSignIn(signIn);
+    const actionFor = (chat: string, plugins: PluginNoticeData) => {
+      showPluginNotice(chat, plugins);
+      return toastInfo.mock.calls.at(-1)?.[1]?.action;
+    };
+
+    // Third of three: the text names only the first.
+    expect(
+      actionFor("chat-1", {
+        kind: "skipped",
+        plugins: [plugin("a"), plugin("b"), plugin("c", binding)],
+      }),
+    ).toBeUndefined();
+    // Two to sign in to: one button cannot cover both.
+    expect(
+      actionFor("chat-2", {
+        kind: "skipped",
+        plugins: [plugin("a", binding), plugin("b", other)],
+      }),
+    ).toBeUndefined();
+    // Second of two is named, and the only one that needs it.
+    const action = actionFor("chat-3", {
+      kind: "skipped",
+      plugins: [plugin("a"), plugin("b", other)],
+    });
+    expect(action?.label).toBe("Sign in");
+    action.onClick();
+    expect(signIn).toHaveBeenCalledWith(other);
+    unregister();
+  });
+
+  it("keeps a newer registration when an older one unregisters", () => {
+    const older = vi.fn();
+    const newer = vi.fn();
+    const unregisterOlder = registerPluginNoticeSignIn(older);
+    const unregisterNewer = registerPluginNoticeSignIn(newer);
+    unregisterOlder();
+    showPluginNotice("chat-1", needsSignIn);
+    toastInfo.mock.calls.at(-1)?.[1]?.action.onClick();
+    expect(newer).toHaveBeenCalledWith(binding);
+    expect(older).not.toHaveBeenCalled();
+    unregisterNewer();
+  });
+});
+
+it("offers command review distinctly from sign-in and does not execute on display", () => {
+  resetShownPluginNotices();
+  showPluginNotice("review-chat", { kind: "skipped", plugins: [{
+    ...bitsNeedsAuth.plugins[0], reason: "needs_approval", partial: true,
+    reviewCommand: { projectId: "project", serverId: "server", serverName: "Files" },
+  }] });
+  expect(toastInfo.mock.lastCall?.[0]).toContain("review its command");
+  expect(toastInfo.mock.lastCall?.[1].action.label).toBe("Review command");
+});
+
+it("preserves a separate command review action for each blocked plugin", () => {
+  resetShownPluginNotices();
+  toastInfo.mockClear();
+  const plugins = ["first", "second"].map((name) => ({
+    ...bitsNeedsAuth.plugins[0], pluginId: name, name, displayName: name,
+    reason: "needs_approval" as const, partial: true,
+    reviewCommand: { projectId: "project", serverId: name, serverName: name },
+  }));
+  expect(showPluginNotice("two-reviews", { kind: "skipped", plugins })).toBe(true);
+  expect(toastInfo).toHaveBeenCalledTimes(2);
+  for (const call of toastInfo.mock.calls) expect(call[1]?.action.label).toBe("Review command");
+  expect(showPluginNotice("two-reviews", { kind: "skipped", plugins })).toBe(false);
+});

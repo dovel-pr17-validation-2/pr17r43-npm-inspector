@@ -1,0 +1,134 @@
+import { logger } from "../../utils/logger.js";
+import { createConvexClient } from "./route-helpers.js";
+import { isEvalRunTerminalStatus } from "@mcpjam/sdk/contract";
+import { shouldSkipExecution } from "../../routes/shared/evals.js";
+import { serverDrain } from "../lifecycle/drain.js";
+
+type DetachableEvalRun = {
+  suiteId: string;
+  runId: string;
+  recorder?: {
+    finalize(args: {
+      status: "completed" | "failed" | "cancelled" | "timed_out";
+      summary?: {
+        total: number;
+        passed: number;
+        failed: number;
+        passRate: number;
+      };
+      notes?: string;
+      stopReason?: "user_cancelled" | "run_timeout" | "iteration_timeout";
+    }): Promise<void>;
+  } | null;
+  execute: () => Promise<void>;
+  /** Set when this "start" replayed an existing run — see `shouldSkipExecution`. */
+  deduped?: boolean;
+  /** The run's own status; terminal on a replay of a finished run. */
+  status?: string;
+};
+
+/**
+ * Whether the run record already reached a terminal status. Used by the
+ * detached-execution catch: `runEvalSuiteWithAiSdk` finalizes a failed run
+ * itself before rethrowing, so a rejected `execute()` usually means the
+ * terminal write already happened — re-finalizing would restamp
+ * `completedAt` and overwrite the runner's notes.
+ */
+async function isRunAlreadyTerminal(
+  convexAuthToken: string,
+  runId: string,
+): Promise<boolean> {
+  try {
+    const run = await createConvexClient(convexAuthToken).query(
+      "testSuites:getTestSuiteRun" as any,
+      { runId },
+    );
+    return isEvalRunTerminalStatus(run?.status);
+  } catch {
+    // Can't tell — let the defensive finalize proceed. recorder.finalize
+    // tolerates deleted/unauthorized runs, so the worst case is the
+    // duplicate terminal write we'd have done unconditionally before.
+    return false;
+  }
+}
+
+function formatBackgroundFailureNote(error: unknown): string {
+  return error instanceof Error
+    ? error.message.slice(0, 500)
+    : String(error).slice(0, 500);
+}
+
+export function detachPreparedEvalRun(args: {
+  prepared: DetachableEvalRun;
+  convexAuthToken: string;
+  logPrefix: string;
+  logContext: Record<string, unknown>;
+  cleanup?: () => Promise<void> | void;
+}) {
+  const { prepared, convexAuthToken, logPrefix, logContext, cleanup } = args;
+
+  // An idempotent replay belongs to its original executor. Every detached
+  // surface shares this guard so retries cannot run or bill the same trials twice.
+  if (shouldSkipExecution(prepared)) {
+    logger.info(`${logPrefix} idempotent replay — not re-executing`, {
+      ...logContext,
+      suiteId: prepared.suiteId,
+      runId: prepared.runId,
+      status: prepared.status,
+    });
+    void Promise.resolve(cleanup?.()).catch(() => {});
+    return;
+  }
+
+  const background = Promise.resolve()
+    .then(() => prepared.execute())
+    .catch(async (error) => {
+      logger.error(`${logPrefix} background eval run failed`, error, {
+        ...logContext,
+        suiteId: prepared.suiteId,
+        runId: prepared.runId,
+      });
+
+      if (await isRunAlreadyTerminal(convexAuthToken, prepared.runId)) {
+        return;
+      }
+
+      if (!prepared.recorder) {
+        return;
+      }
+
+      await prepared.recorder
+        .finalize({
+          status: "failed",
+          notes: formatBackgroundFailureNote(error),
+        })
+        .catch((finalizeError: unknown) => {
+          logger.error(
+            `${logPrefix} failed to finalize background eval run`,
+            finalizeError,
+            {
+              ...logContext,
+              suiteId: prepared.suiteId,
+              runId: prepared.runId,
+            },
+          );
+        });
+    })
+    .finally(() => {
+      if (!cleanup) {
+        return;
+      }
+      void Promise.resolve()
+        .then(() => cleanup())
+        .catch((error) => {
+          logger.warn(`${logPrefix} background eval cleanup failed`, {
+            ...logContext,
+            suiteId: prepared.suiteId,
+            runId: prepared.runId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+    });
+  // A shutdown drains the run before it closes the connections it runs on.
+  void serverDrain.track("eval_run", background);
+}

@@ -1,0 +1,531 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+vi.mock("@sentry/node", () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}));
+
+const mockIngest = vi.fn();
+vi.mock("@axiomhq/js", () => ({
+  Axiom: vi.fn().mockImplementation(function () {
+    return {
+      ingest: mockIngest,
+      flush: vi.fn().mockResolvedValue(undefined),
+    };
+  }),
+}));
+
+import * as Sentry from "@sentry/node";
+import {
+  ClientInputError,
+  markUserServerHop,
+  readRequestJson,
+  reportRouteFailure,
+} from "../route-error-report.js";
+
+const captureException = vi.mocked(Sentry.captureException);
+
+/**
+ * The failure a dead user MCP server produces. `describeError` resolves this to
+ * `transport/econnrefused`, whose origin is `user_config`.
+ */
+function deadServerError(): Error {
+  return Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:3000"), {
+    code: "ECONNREFUSED",
+  });
+}
+
+beforeEach(() => {
+  captureException.mockClear();
+  mockIngest.mockClear();
+  // `logger` builds its Axiom client lazily on first ingest and memoizes it,
+  // so these must be present before the first report in this file runs.
+  process.env.AXIOM_TOKEN = "test-token";
+  process.env.AXIOM_DATASET = "test-dataset";
+  delete process.env.DO_NOT_TRACK;
+});
+
+describe("reportRouteFailure", () => {
+  it("does not page for a dead user MCP server on a user_server_hop", () => {
+    // The regression this whole sweep exists to prevent: before it, every one
+    // of these catch-sites called `logger.error`, which captures
+    // unconditionally, so somebody else's server being down paged the team.
+    const { normalized } = reportRouteFailure(
+      "Error fetching resources",
+      deadServerError(),
+      {
+        source: "mcp.resources.list",
+        hop: "user_server_hop",
+        context: { serverId: "srv_1" },
+      },
+    );
+
+    expect(normalized.slug).toBe("transport/econnrefused");
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("does not page for a dead user MCP server even under an internal boundary", () => {
+    // A boundary declaration says "the hop was ours". It must not overrule a
+    // slug that positively identifies the user's configuration.
+    reportRouteFailure("Error reaching backend", deadServerError(), {
+      source: "mcp.models.fetch",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("pages for an unrecognized failure on an MCPJam-internal hop", () => {
+    reportRouteFailure("Failed to materialize plugin bundle", new Error("kaboom"), {
+      source: "mcp.plugins.materialize",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+    expect(captureException.mock.calls[0]![1]).toMatchObject({
+      tags: expect.objectContaining({
+        error_origin: "mcpjam",
+        capture_source: "route:mcp.plugins.materialize",
+      }),
+    });
+  });
+
+  it("does NOT page for an unrecognized failure on a user-server hop", () => {
+    // `internal/unknown` is where every unclassifiable failure from an
+    // arbitrary user server lands. Paging on it would rebuild the noise
+    // problem, which is why only a declared-internal boundary promotes it.
+    reportRouteFailure("Error listing tasks", new Error("kaboom"), {
+      source: "mcp.tasks.list",
+      hop: "user_server_hop",
+    });
+
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("keeps a closed diagnostic row for a declined failure", () => {
+    reportRouteFailure("Error fetching resources", deadServerError(), {
+      source: "mcp.resources.list",
+      hop: "user_server_hop",
+      context: { serverId: "srv_1" },
+    });
+
+    expect(mockIngest).toHaveBeenCalledWith(
+      expect.anything(),
+      [
+        expect.objectContaining({
+          level: "error",
+          event: "log.unknown",
+          origin: "user_config",
+          route: "unknown_route",
+          errorClass: "Error",
+        }),
+      ],
+    );
+    const serialized = JSON.stringify(mockIngest.mock.calls);
+    expect(serialized).not.toContain("Error fetching resources");
+    expect(serialized).not.toContain("srv_1");
+    expect(serialized).not.toContain("127.0.0.1");
+  });
+
+  it("does not page for a declined PRIMITIVE throw", () => {
+    // `throw "failure"` is legal and a primitive cannot carry the capture
+    // stamp, so the decision made by the report would be invisible to the
+    // `logger.error` right after it — and a user-fault failure would page
+    // anyway, through the exact side door this design closes.
+    reportRouteFailure("Error listing tasks", "server exploded", {
+      source: "mcp.tasks.list",
+      hop: "user_server_hop",
+    });
+
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("captures a primitive throw on an internal hop exactly once", () => {
+    reportRouteFailure("Unhandled error", "kaboom", {
+      source: "app.onError",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps primitive throw diagnostics without forwarding their text", () => {
+    reportRouteFailure("Error listing tasks", "server exploded", {
+      source: "mcp.tasks.list",
+      hop: "user_server_hop",
+    });
+
+    expect(mockIngest).toHaveBeenCalledWith(expect.anything(), [
+      expect.objectContaining({ event: "log.unknown", errorClass: "Error" }),
+    ]);
+    expect(JSON.stringify(mockIngest.mock.calls)).not.toContain("server exploded");
+  });
+
+  it("survives a null rejection", () => {
+    expect(() =>
+      reportRouteFailure("Error listing tasks", null, {
+        source: "mcp.tasks.list",
+        hop: "user_server_hop",
+      }),
+    ).not.toThrow();
+  });
+
+  it("reports the EFFECTIVE origin, including the internal promotion", () => {
+    // Recomputing from the catalog would say `ambiguous` for a failure Sentry
+    // was just paged for as `mcpjam`, so the response body and the Axiom row
+    // would contradict the alert.
+    const { origin } = reportRouteFailure("Unhandled error", new Error("kaboom"), {
+      source: "app.onError",
+      hop: "mcpjam_internal",
+    });
+
+    expect(origin).toBe("mcpjam");
+  });
+
+  it("never promotes a malformed request body to an MCPJam failure", () => {
+    // Several handlers parse the request inside the same try whose catch
+    // declares an internal hop. Without this rule, anyone with a session could
+    // page the on-call by POSTing invalid JSON.
+    const { origin } = reportRouteFailure(
+      "Error counting tokens",
+      new ClientInputError("Invalid JSON body"),
+      { source: "mcp.tokenizer.tools", hop: "mcpjam_internal" },
+    );
+
+    expect(origin).toBe("ambiguous");
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("STILL captures a SyntaxError that did not come from the request", () => {
+    // Deliberately not `error instanceof SyntaxError`: that cannot tell a
+    // request body from a response body, and `models.ts` parses our own Convex
+    // backend's JSON inside an internal catch. Malformed output from our
+    // backend is our problem, and a type-based rule would have silently
+    // stopped capturing it.
+    reportRouteFailure(
+      "[models] Convex backend error",
+      new SyntaxError("Unexpected token < in JSON at position 0"),
+      { source: "mcp.models.fetch", hop: "mcpjam_internal" },
+    );
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not page for a marked user-server hop under an internal boundary", () => {
+    // The chat route's outer catch genuinely wraps MCPJam-owned work, but it
+    // also receives whatever `prepareChatV2` threw — and the first thing that
+    // awaits is a tool listing against the user's own servers. The mark is how
+    // one catch block declares two hops.
+    const { origin } = reportRouteFailure(
+      "[mcp/chat-v2] failed to process chat request",
+      markUserServerHop(new Error("Unknown MCP server")),
+      { source: "mcp.chat-v2.request", hop: "mcpjam_internal" },
+    );
+
+    expect(origin).toBe("ambiguous");
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("never promotes a deliberate 4xx to an MCPJam failure", () => {
+    // Routes throw `new WebRouteError(400, …)` for ordinary user outcomes —
+    // "No tools found for selected servers" when someone generates eval tests
+    // against servers that expose none — and catch them in the same block that
+    // declares an internal hop. Those classify `internal/unknown`, so without
+    // this rule a routine validation result pages the on-call.
+    const { origin } = reportRouteFailure(
+      "Error in /evals/generate-tests",
+      Object.assign(new Error("No tools found for selected servers"), {
+        status: 400,
+      }),
+      { source: "mcp.evals.generate-tests", hop: "mcpjam_internal" },
+    );
+
+    expect(origin).toBe("ambiguous");
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("STILL promotes a 5xx on an internal hop", () => {
+    // Only 4xx says "the request was wrong". A 5xx really can be ours.
+    reportRouteFailure(
+      "Error in /evals/generate-tests",
+      Object.assign(new Error("upstream exploded"), { status: 503 }),
+      { source: "mcp.evals.generate-tests", hop: "mcpjam_internal" },
+    );
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("still pages for an UNMARKED failure from the same catch block", () => {
+    // The mark is scoped to the one await that leaves MCPJam. A bug in the
+    // preparation work that follows it reaches the same catch and has no other
+    // capture point, so it must still promote.
+    reportRouteFailure(
+      "[mcp/chat-v2] failed to process chat request",
+      new Error("Cannot read properties of undefined"),
+      { source: "mcp.chat-v2.request", hop: "mcpjam_internal" },
+    );
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("finds the user-server mark through a cause chain", () => {
+    const marked = markUserServerHop(new Error("tool listing failed"));
+    const wrapper = new Error("chat request failed", { cause: marked });
+
+    reportRouteFailure("[mcp/chat-v2] failed", wrapper, {
+      source: "mcp.chat-v2.request",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).not.toHaveBeenCalled();
+  });
+
+  it("survives a hostile proxy without losing the report", () => {
+    // The walk inspects the ORIGINAL value, so a throwing `get` trap would
+    // take out `reportRouteFailure` itself — losing both the capture decision
+    // and the Axiom row, and replacing the route's error response with a
+    // secondary failure from the reporting code.
+    const hostile = new Proxy(new Error("hostile"), {
+      get() {
+        throw new Error("trap: get");
+      },
+    });
+
+    expect(() =>
+      reportRouteFailure("Error listing tasks", hostile, {
+        source: "mcp.tasks.list",
+        hop: "user_server_hop",
+      }),
+    ).not.toThrow();
+    expect(mockIngest).toHaveBeenCalled();
+  });
+
+  it("survives a self-referential cause chain on the user-server walk", () => {
+    const looping = new Error("loops");
+    Object.defineProperty(looping, "cause", { value: looping });
+
+    expect(() =>
+      reportRouteFailure("Unhandled error", looping, {
+        source: "app.onError",
+        hop: "mcpjam_internal",
+      }),
+    ).not.toThrow();
+  });
+
+  it("still reports a genuine internal failure on the same route", () => {
+    reportRouteFailure("Error counting tokens", new Error("kaboom"), {
+      source: "mcp.tokenizer.tools",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not page for a frozen user-server error", () => {
+    const frozen = Object.freeze(deadServerError());
+
+    reportRouteFailure("Error fetching resources", frozen, {
+      source: "mcp.resources.list",
+      hop: "user_server_hop",
+    });
+
+    expect(captureException).not.toHaveBeenCalled();
+  });
+  it("captures a paged failure exactly once, even though it also logs", () => {
+    // `logger.error` still captures by default; it must skip an error the
+    // report already ruled on, or every MCPJam-fault error would be
+    // double-counted.
+    reportRouteFailure("Unhandled error", new Error("kaboom"), {
+      source: "app.onError",
+      hop: "mcpjam_internal",
+    });
+
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("readRequestJson", () => {
+  it("marks a malformed body so the internal boundary cannot promote it", async () => {
+    const c = {
+      req: {
+        json: () => Promise.reject(new SyntaxError("Unexpected token <")),
+      },
+    };
+
+    await expect(readRequestJson(c)).rejects.toBeInstanceOf(ClientInputError);
+  });
+
+  it("keeps the underlying parse error as the cause", async () => {
+    const underlying = new SyntaxError("Unexpected token <");
+    const c = { req: { json: () => Promise.reject(underlying) } };
+
+    await expect(readRequestJson(c)).rejects.toMatchObject({
+      cause: underlying,
+    });
+  });
+
+  it("rejects a null body, which would TypeError at destructure", async () => {
+    // `null` PARSES fine and then blows up on the caller's `const {x} = body`,
+    // as an unmarked TypeError an internal hop would happily promote to a
+    // page. Rejecting here closes that for every call site at once.
+    const c = { req: { json: () => Promise.resolve(null) } };
+
+    await expect(readRequestJson(c)).rejects.toBeInstanceOf(ClientInputError);
+  });
+
+  it.each([[42], ["a string"], [true]])(
+    "lets a scalar body (%p) through so the route's own 400 still fires",
+    async (body) => {
+      // `const {serverId} = 42` does NOT throw — it yields `undefined`, the
+      // handler's required-field check fires, and the caller gets a precise
+      // 400. Rejecting these here would convert every one of those into a
+      // generic 500.
+      const c = { req: { json: () => Promise.resolve(body) } };
+
+      await expect(readRequestJson(c)).resolves.toEqual(body);
+    },
+  );
+
+  it("lets an array through — a handler that wants one still validates it", async () => {
+    const c = { req: { json: () => Promise.resolve([1, 2]) } };
+
+    await expect(readRequestJson(c)).resolves.toEqual([1, 2]);
+  });
+
+  it("passes a well-formed body straight through", async () => {
+    const c = { req: { json: () => Promise.resolve({ serverId: "srv_1" }) } };
+
+    await expect(readRequestJson(c)).resolves.toEqual({ serverId: "srv_1" });
+  });
+});
+
+describe("reportRouteFailure — a surface's capture policy", () => {
+  // Ask MCPJam captures every failure, whatever its origin: a week of every
+  // self-hosted turn failing reached Sentry from nowhere, because each one was
+  // (correctly, for the Playground) classified as somebody else's. The policy
+  // changes what Sentry hears and NOTHING else — origin, hop and the Axiom row
+  // are exactly what they would have been.
+  const ALWAYS = {
+    always: true,
+    tags: { surface: "mcpjam_agent", page_class: "incident" },
+    fingerprint: ["mcpjam_agent", "test-site"],
+    level: "error" as const,
+  };
+
+  function axiomRows() {
+    return mockIngest.mock.calls.flatMap((call) => call[1] as unknown[]) as {
+      origin?: string;
+      hop?: string;
+      captured?: boolean;
+      source?: string;
+    }[];
+  }
+
+  it("captures a user_config failure on a user-server hop", () => {
+    const report = reportRouteFailure("agent failed", deadServerError(), {
+      source: "agent.test",
+      hop: "user_server_hop",
+      capture: ALWAYS,
+    });
+
+    expect(report.captured).toBe(true);
+    expect(captureException).toHaveBeenCalledTimes(1);
+    const [, context] = captureException.mock.calls[0] as [
+      unknown,
+      { tags: Record<string, string>; fingerprint?: string[]; level?: string },
+    ];
+    expect(context.tags).toMatchObject({
+      surface: "mcpjam_agent",
+      page_class: "incident",
+      capture_policy: "always",
+      error_origin: "user_config",
+    });
+    expect(context.fingerprint).toEqual(["mcpjam_agent", "test-site"]);
+    expect(context.level).toBe("error");
+  });
+
+  it("captures a deliberate 4xx, which the origin policy declines", () => {
+    const refusal = Object.assign(new Error("Daily limit reached"), {
+      status: 429,
+    });
+    const report = reportRouteFailure("agent refused", refusal, {
+      source: "agent.test",
+      hop: "mcpjam_internal",
+      capture: { ...ALWAYS, level: "warning" as const },
+    });
+
+    expect(report.captured).toBe(true);
+    expect(
+      (captureException.mock.calls[0]![1] as { level?: string }).level,
+    ).toBe("warning");
+  });
+
+  it("keeps the same safe diagnostic row across capture policies", () => {
+    const withPolicy = reportRouteFailure("agent failed", deadServerError(), {
+      source: "agent.test",
+      hop: "user_server_hop",
+      capture: ALWAYS,
+    });
+    const rowWithPolicy = axiomRows()[0];
+    mockIngest.mockClear();
+    const without = reportRouteFailure("agent failed", deadServerError(), {
+      source: "agent.test",
+      hop: "user_server_hop",
+    });
+    const rowWithout = axiomRows()[0];
+
+    expect(withPolicy.origin).toBe(without.origin);
+    expect(withPolicy.normalized.slug).toBe(without.normalized.slug);
+    expect(rowWithPolicy?.origin).toBe(rowWithout?.origin);
+    expect(rowWithPolicy?.event).toBe("log.unknown");
+    expect(rowWithPolicy?.fingerprint).toBe(rowWithout?.fingerprint);
+    expect(rowWithPolicy).not.toHaveProperty("hop");
+    expect(rowWithPolicy).not.toHaveProperty("captured");
+    expect(withPolicy.captured).toBe(true);
+    expect(without.captured).toBe(false);
+  });
+
+  it("reports the outcome explicitly, false for a decline", () => {
+    const declined = reportRouteFailure("not ours", deadServerError(), {
+      source: "agent.test",
+      hop: "user_server_hop",
+    });
+    expect(declined.captured).toBe(false);
+  });
+
+  it("never captures the same error twice, whichever policy asks second", () => {
+    const error = deadServerError();
+    const first = reportRouteFailure("first", error, {
+      source: "agent.test",
+      hop: "user_server_hop",
+      capture: ALWAYS,
+    });
+    const second = reportRouteFailure("second", error, {
+      source: "agent.test",
+      hop: "user_server_hop",
+      capture: ALWAYS,
+    });
+
+    expect(first.captured).toBe(true);
+    expect(second.captured).toBe(false);
+    expect(captureException).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not capture an error an earlier decision already declined", () => {
+    // The stamp means "decided", not "captured": a later always-policy must
+    // not reopen a decline — the request-log backstop, which reads the
+    // RECORDED outcome instead, is what covers that case.
+    const error = deadServerError();
+    reportRouteFailure("declined", error, {
+      source: "playground.test",
+      hop: "user_server_hop",
+    });
+    const later = reportRouteFailure("agent", error, {
+      source: "agent.test",
+      hop: "user_server_hop",
+      capture: ALWAYS,
+    });
+    expect(later.captured).toBe(false);
+    expect(captureException).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,176 @@
+# Server error reporting
+
+## Who owns Sentry capture
+
+**The logger. Only the logger.**
+
+- `Hono.onError` → `appLogger.error(...)` → `Sentry.captureException`. Route
+  handlers never call `captureException` themselves.
+- `logger.event(...)` / `logger.systemEvent(...)` capture **only** with an
+  explicit `{ sentry: true }`, at the callsite that owns the error.
+- `logger.warn` does **not** capture. It used to, and across thousands of
+  self-hosted installs that was the single largest quota-spike vector we had —
+  a warning is by definition something we chose not to treat as a failure.
+  Warnings go to Axiom, where they are queryable and cheap. A warning that
+  genuinely needs an issue should be an explicit
+  `logger.event(..., { error, sentry: true })`.
+
+If you find yourself importing `@sentry/node` in a route, you are adding a
+double-capture. Use the logger.
+
+## What an event carries
+
+`sendDefaultPii: false` governs what the SDK collects about the USER (IP,
+cookies); it does not stop the http integration from attaching the incoming
+request body, and it does not touch exception text. So:
+
+- Logger capture sites attach context; the final Sentry transport reconstructs
+  errors, transactions and standalone spans from closed schemas. Unsupported
+  envelope items, including attachments, are discarded.
+- Server, desktop and SDK diagnostics are strict by default. Only finite error
+  classes/codes, owned route templates, bounded numbers and trusted ids leave.
+  Free text, request bodies, headers, arbitrary tags and source context do not.
+- Stack frames retain verified first-party file and integer line/column locations
+  only. Function labels are discarded. Unknown customer bundles have no trusted
+  frame aliases and still produce finite error diagnostics.
+- User identity is an id and an actor kind. Email and name are not sent in strict
+  diagnostics. Live opt-out is checked again when a queued envelope is sent.
+
+Electron main installs the same final boundary for its embedded server. Its
+transport sends reconstructed envelopes directly; raw offline events and
+minidumps are not persisted for later vendor delivery.
+
+## Source maps
+
+`build:server` emits one file per entry (`dist/server/index.js` and
+`harness-install-cli.js`), then `scripts/server-sourcemaps.mjs` injects a debug
+ID into each and verifies it against its map. A missing, stale or mismatched
+map, or any extra output, fails the build. With `SENTRY_AUTH_TOKEN` it uploads
+those same files to `mcpjam-gh/inspector-hono`, with the package version as
+`release`, `MCPJAM_BUILD_SURFACE` as `dist` and `app:///dist/server` as the URL
+prefix. The bundle reports the same release and `dist` (both baked in by
+`server/tsup.config.ts`), names its frames `app:///dist/server/index.js`, and
+sends the injected ID as `debug_meta`. The npm build (`release.yml`) and the
+Railway image upload. The Docker Hub image uploads its server maps with `dist`
+`local`, from an ephemeral container of the same server build stage. The release
+workflow passes the token only to that container, outside the Docker build.
+Neither the npm tarball nor the images ship the maps. The desktop app runs the server inside Electron main, mapped by `forge.config.ts`.
+
+The build log, and the step summary in Actions, says `[server-sourcemaps]
+uploaded <file> <debug id>, ...` or `[server-sourcemaps] NOT uploaded`. Only the
+first counts, and only Sentry can say the artifacts were stored.
+
+**Two-build check (local, no token):** `npm run test -w @mcpjam/inspector --
+server/__tests__/server-sourcemaps.test.ts` builds a fixture twice through
+`server/tsup.config.ts`, the second shifted by a banner, and checks that each
+build's transport `debug_meta` names its own map, that the thrown frame maps
+to the same source line in both, and that a shifted, mismatched, missing or
+uninjected map fails. For the real bundle, run `npm run build:server` twice
+with different `MCPJAM_BUILD_SURFACE` values and compare the printed IDs.
+
+**Staging acceptance (operator):** deploy two staging builds that differ only by
+a harmless bundle offset, with a token. A build log without the `uploaded` line
+fails acceptance. Find both debug IDs under the project's Settings → Source
+Maps → Artifact Bundles. Send the same controlled server error from each build
+and record both event IDs: each event's frame must resolve to the same
+`server/` file and line with no processing error, and both must land in one
+issue (record its ID). Then send a different controlled error, which must open
+a different issue.
+
+## Process-level handlers
+
+| Signal              | Capture                                           | Log                                     |
+| ------------------- | ------------------------------------------------- | --------------------------------------- |
+| `uncaughtException` | `onUncaughtExceptionIntegration`, then **exits**  | `process.uncaught_exception` → Axiom    |
+| `unhandledRejection`| our handler, via `{ sentry: true }`               | `process.unhandled_rejection` → Axiom   |
+
+The integration is registered **explicitly** with
+`exitEvenIfOtherHandlersAreRegistered: true`, and this is load-bearing.
+@sentry/node 8 computes `processWouldExit = userProvidedListenersCount === 0`
+and only terminates when `exitEvenIfOtherHandlersAreRegistered ||
+processWouldExit`. Because `server/index.ts` registers its own
+`uncaughtException` listener (to mirror the crash into Axiom), the v8 default
+of `false` would have captured the exception and then let the process keep
+running in an undefined state — turning a fail-fast crash into a zombie server
+no supervisor restarts. If you ever add another `uncaughtException` listener,
+this flag is what keeps the crash fatal.
+
+`OnUnhandledRejection` is filtered out of the default integrations on purpose.
+`server/index.ts` installs its own handler that deliberately swallows the MCP
+SDK's `"Connection closed"` rejections — the SDK rejects every pending promise
+when a connection drops, which is routine, not a bug. The default integration
+would capture all of them.
+
+`OnUncaughtException` stays: its capture-then-exit behavior is what we want.
+Our own `uncaughtException` handler exists only so the crash also lands in
+Axiom, and it deliberately does **not** pass `sentry: true`.
+
+## Init ordering
+
+`initServerSentry()` is an explicit call from `server/index.ts`, made
+immediately after `loadInspectorEnv()`. It cannot be an import side-effect:
+imports are hoisted above the env load, so the init would read an empty
+environment.
+
+It is **not** called under Electron — `@sentry/electron/main` already owns the
+global carrier there and the embedded server inherits that client.
+
+## Knobs
+
+| Variable                   | Effect                                                    |
+| -------------------------- | --------------------------------------------------------- |
+| `DO_NOT_TRACK=1` / `=true` | Disables Sentry **and** Axiom log shipping                 |
+| `SENTRY_ERROR_SAMPLE_RATE` | `[0,1]`; defaults to 1. Quota brake, no deploy required.   |
+| `ENVIRONMENT`              | Sentry `environment` tag, via `resolveEnvironment()`       |
+| `VITE_MCPJAM_HOSTED_MODE`  | `deployment` tag: `hosted` vs `self_hosted`                |
+
+`DO_NOT_TRACK` is checked in three places — `server/sentry.ts`,
+`server/utils/logger.ts` (Axiom), and `server/utils/analytics.ts` (PostHog).
+All three, because the startup notice says "error reporting disabled" and that
+has to be true of every sink, not just the one whose init printed it.
+
+An **empty-string** value counts as unset for the version and sample-rate
+reads. Container platforms materialize declared-but-unset variables as `""`,
+and `Number("")` is `0` — without that normalization an empty
+`SENTRY_ERROR_SAMPLE_RATE` would silently drop 100% of error events.
+
+Performance tracing is off (`tracesSampleRate: 0`). This init lands on every
+self-hosted install at once; spans would multiply the quota exposure of a
+change whose whole point is to see errors.
+
+## Rollout risk plan
+
+This is the first time the OSS server actually reports — the previous
+`Sentry.init` was dead code (an import side-effect hoisted above the env load).
+Volume is genuinely unknown.
+
+1. **Watch the `inspector-hono` project for 48h** after deploy.
+2. If volume is uncomfortable, dial `SENTRY_ERROR_SAMPLE_RATE` down, or set a
+   per-project rate limit in Sentry. Both are config, not deploys.
+3. If self-hosted MCP-connection noise dominates, add a `beforeSend` that drops
+   `/Connection closed|McpError|ECONNREFUSED/` **only** when
+   `deployment: self_hosted` — hosted must keep reporting those.
+
+The `deployment` tag exists precisely so step 3 can be scoped rather than
+blanket.
+
+## Actor identity
+
+Request captures carry `user.id` and `actor_kind` from the verified signed-in
+user, then the verified guest. The request uses AsyncLocalStorage; stream
+reporters and request loggers also bind delayed callbacks to that context.
+Session-authenticated local Electron requests snapshot the desktop actor at
+request start, so changing accounts cannot relabel a running request.
+Unknown hosted requests remain anonymous.
+
+Electron main and renderer start with a random `installation:<uuid>` ID saved
+in the app's user-data directory. Sign-in and guest changes update main through
+IPC accepted only from the app window's main frame and origin. Sign-out, reload,
+and window replacement restore the installation fallback. Native crash reports
+keep the scope stored at crash time. New server and main paths send only the ID
+and actor kind; desktop diagnostic and updater filters retain only `user.id`.
+
+After hosted deployment and the desktop release, check new events for `user.id`
+and `actor_kind`. Historical events stay unchanged. User counts represent
+accounts, guests, or installations, rather than an exact number of people.
+This change does not alter HTTP/database APIs or the 256 KiB request limit.

@@ -1,0 +1,185 @@
+---
+title: "Projects"
+description: "Group your MCP servers into projects, with the ability to share them with your team"
+icon: "folder"
+---
+
+Each project saves its own set of MCP servers. Switch between projects with one click, connect multiple servers in each, and share any project with teammates so everyone works with the same configuration.
+
+## Key Features
+
+- **Multiple Servers** - Connect to several MCP servers within a single project
+- **Save Your Setup** - Store all your server configurations in one place
+- **Share Instantly** - Invite team members via email to access the same project
+- **Real-Time Sync** - Changes update automatically for all project members
+- **Switch Contexts** - Jump between different project setups with one click
+
+## Getting Started
+
+The combined org and project switcher sits at the top of the sidebar. The trigger shows your active **organization** in bold on the first line and the active **project** beneath it.
+
+1. **Click the switcher** at the top of the sidebar to open the context menu
+2. **Create a project** - Click **Create project** at the bottom of the list, give it a name, and choose which organization it belongs to
+3. **Add your servers** - Configure your MCP servers in the Connect tab
+4. **Auto-connect** - The **Auto-connect** switch in the Connect tab header (on by default) connects every project server for you in the Playground and debugger tabs. It is a personal setting for your browser — anyone can flip it, and it does not change the project
+5. **Share with your team** - Click the share button and invite collaborators
+
+<Info>
+When you switch projects, all servers disconnect automatically to give you a clean slate.
+</Info>
+
+## Switching Organizations
+
+Opening the switcher lands on the **projects view** for your active organization. The organization name appears as a header row at the top of the list.
+
+- **Drill into the org list** — click the organization header row to replace the projects view with a list of all your organizations. Click any row to switch to that organization; the URL updates to a project in the new org and the sidebar reloads with its projects.
+- **Back** — click the **Organizations** back header to return to the projects view without switching.
+- **New organization** — appears at the bottom of the org list when you can create another.
+- Organization settings are accessed through **Settings › Organization**, not from the switcher.
+
+If you were invited to a paid-seat organization but the seat hasn't been paid for yet, that organization appears greyed out in the list with a **Seat not paid yet** tooltip. You cannot open it until the org owner completes payment for your seat.
+
+<Info>
+After completing an OAuth flow, you are returned to the organization you were in when the flow started, so you never land on the wrong organization after authenticating.
+</Info>
+
+## Creating and deleting projects
+
+### Creating a project
+
+Click **Create project** at the bottom of the switcher's projects view. A dialog opens with:
+
+- **Name** — prefilled with a free name (e.g. "Project 3"). Edit it before confirming.
+- **Organization** — a dropdown to choose which organization the project belongs to. Organizations where you don't have permission to create projects, or where your seat is still pending, are not shown.
+
+Click **Create** (or press Enter) to create the project and switch to it automatically.
+
+### Deleting a project
+
+Hover over any project row in the switcher to reveal the **trash icon**. Clicking it opens a confirmation dialog showing the project name. Click **Delete** to confirm — this removes the project and all its servers permanently.
+
+<Warning>
+Deleting a project is irreversible. All servers, sessions, and eval suites in the project are removed.
+</Warning>
+
+## Credits
+
+A **See credits** row in the sidebar footer shows your organization's credit usage. Clicking it opens the organization billing page where you can see the full breakdown, your plan, and reset timing. The row is only visible when you are signed in and belong to an organization. When your credit balance drops to 10% or below, the meter turns red and a **Low credits** label appears next to it.
+
+<iframe
+  className="w-full aspect-video rounded-xl"
+  src="https://www.youtube.com/embed/p27gp_OuyMA"
+  title="Projects demo"
+  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+  allowFullScreen
+></iframe>
+
+## Leaving an organization
+
+If you are a member (not an owner or admin) of an organization, you will see an **Access restricted** screen when you open the organization settings. From that screen you can leave the organization:
+
+1. Click **Leave organization** below the "Go to Servers" button.
+2. Confirm in the dialog that appears.
+
+You will lose access to the organization immediately and be redirected to the Servers page. To rejoin, you need to be re-invited by an admin or owner.
+
+<Note>
+Owners cannot leave an organization — transfer ownership or delete the organization instead.
+</Note>
+## Sharing Projects
+
+Project sharing lets your entire team work with the same servers. Set up your project once, invite your team by email, and everyone gets access to the same servers with the same configurations instantly.
+
+### What Gets Shared
+
+Members get access to every server in the project with the same configuration. Per-server overrides (headers, timeout, protocol version) set from the Servers tab apply across every host in the project. Auto-connect is not shared: each member decides for their own browser whether servers connect automatically.
+
+<Note>
+For security, authorization headers and OAuth tokens are never shared. Each team member authenticates with their own credentials when connecting to servers that require authentication.
+</Note>
+
+## Secret storage for env vars and headers
+
+When you save a server that has **environment variables** (stdio) or **custom HTTP headers**, those values are stored as encrypted secrets. The next time you open the server's edit form, each row shows its name with the value masked behind a fixed placeholder.
+
+### Viewing a saved value
+
+Click the **eye icon** on a row to reveal that row's value. The eye toggles the value back to masked when you click it again. Only the row you click is uncovered — other rows stay masked.
+
+When you first expand the Environment Variables or Connection overrides section on a saved server, the inspector fetches the variable and header names so each row can show which keys are configured. No values are fetched at that point; a value only travels to the browser when you click its eye.
+
+<Warning>
+If you want to change the **authentication type** (for example, switching from Bearer Token to a different method) on an HTTP server that has hidden headers, you must reveal the relevant header rows first. Saving an auth change without revealing will show a validation error to prevent accidentally overwriting hidden headers.
+</Warning>
+
+### How updates work
+
+- **Env vars**: Any edit to the env vars section (add, remove, or change a value) replaces the stored secret with the new set of values on save.
+- **Custom headers**: Any edit to headers or the authentication type replaces the stored headers secret on save.
+- If you save without revealing or editing a secret section, the existing stored secret is left unchanged.
+
+### Changing a server's destination
+
+Two edits cause the backend to clear a server's stored credentials: changing an HTTP server's **origin**, or changing a stdio server's **command**.
+
+**HTTP servers — origin changes**
+
+Editing the path portion of a server's URL (for example, `/mcp` to `/mcp/v2`) keeps all saved credentials intact.
+
+Changing the **origin** — the scheme, host, or port — clears every credential saved against that server: request headers, environment variables, the bearer token, and any OAuth access token, refresh token, and client secret. The edit form warns you before this happens and names both the old and new origin. You must check the acknowledgement box before Save becomes available.
+
+**Stdio servers — command changes**
+
+Changing the **command** (or its arguments) on a stdio server that has stored environment variables clears those variables. The edit form warns you before this happens and shows both the old and new invocation. You must check the acknowledgement box before Save becomes available.
+
+**Both cases**
+
+The warning applies to credentials that other project members may have added and that you may not be able to see. After the save, each member who had credentials saved for that server needs to re-enter them.
+
+### Destination history
+
+The server detail panel includes a **Destination history** section that shows every time the server's destination was changed, who made the change, and whether saved credentials were cleared as a result. This covers HTTP origin changes, stdio command swaps, and switches between transport types. It is visible to all project members regardless of plan, so anyone whose credentials were removed can see what happened and who made the edit.
+
+### Real-Time Sync
+
+Changes sync instantly between all project members. New servers and configuration changes update automatically for everyone.
+
+### How to Share a Project
+
+1. **Sign in** - Sharing requires authentication
+2. **Click the member avatars** in the header (or the share button)
+3. **Enter an email address** of the person you want to invite
+4. **Click "Invite"** to send the invitation
+
+Once they sign in with that email address, the shared project will appear in their project list.
+
+### Managing Members
+
+If you created the project, you can remove any member by clicking the X next to their name.
+
+If you're not the creator, you can leave the project at any time. The creator can also remove you from the project.
+
+## Project Settings
+
+Open **Project Settings** (gear icon in the header) to manage project-level configuration.
+
+### Default host config
+
+The **Default Host Config** section sets the seed configuration applied to new scenarios, eval suites, and direct chat tabs when they are created. It controls the default model, system prompt, temperature, tool approval, connection settings, capabilities, and host context for anything new in the project.
+
+Editing the default host config does **not** change existing scenarios or eval suites — each owns its own config once created.
+
+The editor is only visible when you are signed in and have a saved project. Members without manage permissions see the editor in read-only mode.
+
+#### Personal computer
+
+When your deployment exposes computer-backed tools (such as **Bash**), a **Personal computer** toggle appears in the built-in tools section of the host config editor. Turning it on attaches a per-member cloud workstation — a persistent Linux sandbox — to the host.
+
+- **Computer-backed tools are disabled until a computer is attached.** The checkbox for tools like Bash is greyed out with a hint ("Requires a personal computer") until you turn the toggle on.
+- **Detaching the computer also removes computer-backed tool ids** from the config, so the saved config is always consistent.
+- The toggle is hidden until the deployment enables at least one computer-backed tool, so it won't appear as a dead control before launch.
+
+## What's Next
+
+- **[Servers](/inspector/connecting-servers)** - Configure MCP servers to add to your projects
+- **[Playground](/inspector/playground)** - Chat with the servers in your project across frontier models

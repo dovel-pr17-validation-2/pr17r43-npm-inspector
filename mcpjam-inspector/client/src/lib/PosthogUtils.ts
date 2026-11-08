@@ -1,0 +1,477 @@
+import type { CaptureResult } from "posthog-js";
+import { POSTHOG_PROJECT_KEY } from "../../../shared/posthog-project";
+import type { ClientFeatureFlagValues } from "../../../shared/client-feature-flags";
+import {
+  scrubTelemetryValue,
+} from "../../../shared/credential-urls";
+import { isInjectedScriptException } from "../../../shared/injected-script-frames";
+import { getCachedGuestSession } from "./guest-session";
+import { getPostHogTabStorageOptions } from "./posthog-tab-storage";
+import { VANITY_LANDING_HOSTS } from "./vanity-landing-hosts";
+import { HOSTED_MODE } from "./config";
+import { getRuntimeDoNotTrack } from "./runtime-config";
+import { scrubSensitiveUrl } from "../../../shared/credential-url";
+import { stampPostHogEvent } from "./telemetry-context";
+import {
+  isErrorCaptureSurface,
+  MASKED_SESSION_RECORDING_OPTIONS,
+  shouldMaskAnalytics,
+} from "./session-privacy";
+
+export { POSTHOG_PROJECT_KEY as VITE_PUBLIC_POSTHOG_KEY };
+
+// posthog-js talks to the same-origin /relay reverse proxy (server/routes/
+// relay.ts) instead of *.posthog.com directly: ad blockers block PostHog by
+// hostname, which drops events AND breaks feature-flag evaluation for
+// blocker users. Same-origin works on every platform — hosted web, local
+// npm, and packaged Electron are all served by the Hono server that hosts
+// /relay; Vite dev (web and Electron renderer) proxies /relay to it.
+export function getPostHogApiHost(): string {
+  if (
+    typeof window !== "undefined" &&
+    window.location?.origin?.startsWith("http")
+  ) {
+    // `/tlm`, not `/relay`: Railway's edge in front of the hosted app 403s
+    // GETs under `/relay/static/*` and `/relay/array/*` (block is scoped to
+    // the /relay prefix — verified with decoy-prefix probes), which starved
+    // posthog-js of its remote config and kept session recording `disabled`.
+    // The server mounts the same proxy on both prefixes; see
+    // RELAY_MOUNT_PREFIXES in server/routes/relay.ts.
+    return `${window.location.origin}/tlm`;
+  }
+  // Unknown origins have no approved serializer; never fall back to the vendor.
+  return "/tlm";
+}
+
+// Guest identity bootstrap. Without it, posthog-js mints a random anonymous
+// distinct_id at init and only converges on the guestId when
+// usePostHogIdentify's async actor resolution calls identify() — every cold
+// load that races that fetch attributes early events to a throwaway id and
+// inflates guest DAU. In hosted prod the server injects the guest session
+// into the page (window.__MCP_GUEST_BOOTSTRAP__, seeded synchronously into
+// getCachedGuestSession at module import), so the guestId is known before
+// PostHogProvider mounts.
+//
+// isIdentifiedID is deliberately FALSE: the bootstrap guestId seeds the
+// ANONYMOUS distinct_id, not an identified person. This matters because the
+// hosted document handler injects the guest blob for every allow-listed
+// request — including the first load of a signed-in user whose PostHog
+// persistence is empty. If we marked it identified, the subsequent
+// usePostHogIdentify() call to identify(workosUserId) would run from an
+// already-identified state and posthog-js would refuse the switch (no
+// $identify merge), stranding that user's early events under the guest id.
+// As anonymous, identify() correctly merges the pre-identify guest activity
+// into the real actor: guests stay stably keyed on guestId (fixing DAU
+// inflation), and signed-in users' events migrate onto their WorkOS id.
+// A returning user with existing persistence keeps their stored id either
+// way — bootstrap only seeds when persistence is empty. Local/npm has no
+// blob, so this returns {} and the async identify path is unchanged.
+//
+// `serverFlags` are the values GET /api/web/flags evaluated for this visitor
+// (lib/server-feature-flags.ts). They are only bootstrapped when present: an
+// empty `featureFlags` object would make posthog-js/react report every flag
+// as unresolved instead of falling back to the persisted values.
+function getPostHogBootstrap(serverFlags?: ClientFeatureFlagValues | null) {
+  const guestId = getCachedGuestSession()?.guestId;
+  const featureFlags =
+    serverFlags && Object.keys(serverFlags).length > 0
+      ? serverFlags
+      : undefined;
+  if (!guestId && !featureFlags) return {};
+  return {
+    bootstrap: {
+      ...(guestId ? { distinctID: guestId, isIdentifiedID: false } : {}),
+      ...(featureFlags ? { featureFlags } : {}),
+    },
+  };
+}
+
+// Flag values come only from our server (MJ-015): posthog-js never requests
+// them from PostHog. Remote config (/array/<token>/config) still loads, so
+// replay and the other remotely configured features are unaffected.
+const SERVER_EVALUATED_FLAG_OPTIONS = {
+  ...getPostHogTabStorageOptions(),
+  advanced_disable_feature_flags: true,
+  advanced_disable_feature_flags_on_first_load: true,
+} as const;
+
+/** The parts of a posthog-js instance whose stored state is scrubbed. */
+interface PostHogPersistenceLike {
+  props?: Record<string, unknown>;
+  save?: () => void;
+}
+interface PostHogWithPersistence {
+  persistence?: PostHogPersistenceLike | null;
+  sessionPersistence?: PostHogPersistenceLike | null;
+}
+
+let persistedPostHog: PostHogWithPersistence | null = null;
+
+/**
+ * Credentials out of what posthog-js STORES, not only what it sends: on the
+ * first capture of a visit it records the landing URL as
+ * `$initial_person_info` (`u`, `r`) straight from `location.href`, into its
+ * cookie — scoped to the parent domain, so it rides every same-site request —
+ * and into localStorage. Neither `before_send` nor any URL hook sees that
+ * write. A landing on a share link would keep the token there for a year.
+ *
+ * Run from `before_send` (posthog-js writes the person info earlier in the
+ * same `capture`) and once at load, for values an older build stored. A walk
+ * that cannot finish deletes the person info rather than leaving it raw.
+ */
+export function scrubPostHogPersistence(
+  instance: PostHogWithPersistence | null = persistedPostHog,
+): void {
+  if (!instance) return;
+  for (const store of [instance.persistence, instance.sessionPersistence]) {
+    const props = store?.props;
+    if (!store || !props) continue;
+    try {
+      const scrubbed = scrubTelemetryValue(props);
+      if (scrubbed === props) continue;
+      // In place: the SDK holds this object, not a getter for it.
+      for (const key of Object.keys(props)) {
+        if (!(key in scrubbed)) delete props[key];
+      }
+      Object.assign(props, scrubbed);
+    } catch {
+      delete props.$initial_person_info;
+    }
+    try {
+      store.save?.();
+    } catch {
+      // Storage refused the write; nothing else to do here.
+    }
+  }
+}
+
+/**
+ * Drop exceptions raised entirely by code the browser injected into the page.
+ *
+ * The rule, and the evidence behind it, lives in
+ * shared/injected-script-frames.ts. Sentry's client config applies the same
+ * one, so the two reporters cannot disagree about what counts as ours.
+ *
+ * Matching on frames rather than on the message is the point: a genuine stack
+ * overflow in our own code — the markdown lexer has produced one — still has
+ * app frames, and still reports.
+ */
+export function dropInjectedScriptException(
+  event: CaptureResult | null,
+): CaptureResult | null {
+  if (event?.event !== "$exception") return event;
+  if (typeof window === "undefined") return event;
+
+  const exceptions: unknown = event.properties?.$exception_list;
+  if (!Array.isArray(exceptions)) return event;
+
+  const stacks = exceptions.map((exception) => {
+    const frames = (exception as { stacktrace?: { frames?: unknown } })
+      ?.stacktrace?.frames;
+    return Array.isArray(frames)
+      ? frames.map(
+          (frame) => (frame as { filename?: unknown } | null)?.filename,
+        )
+      : [];
+  });
+
+  return isInjectedScriptException(stacks, window.location.origin)
+    ? null
+    : event;
+}
+
+// Public vanity landings (caniuse.dev host-compare, score.mcpjam.com score
+// runner) get real Web Analytics: $pageview on SPA route changes plus
+// $pageleave, which is what makes bounce rate and session duration exist in
+// PostHog's Web Analytics tab. The app proper keeps pageviews OFF — track()
+// events already cover it, and in-app route churn would be noise and event
+// cost. The host list itself lives in lib/vanity-landing-hosts.ts, which is
+// what the guest-session skip reads too.
+export const LANDING_ANALYTICS_HOSTS = VANITY_LANDING_HOSTS;
+
+// Check if PostHog should be disabled
+export const isPostHogDisabled =
+  import.meta.env.VITE_DISABLE_POSTHOG_LOCAL === "true" ||
+  getPostHogApiHost() === "/tlm" ||
+  getRuntimeDoNotTrack();
+
+// DO_NOT_TRACK sends nothing at all, not even the remote config and survey
+// loads the opted-out branch otherwise still makes. Flags are the server's
+// bootstrap, which needs no request of its own.
+const NO_REQUEST_OPTIONS = {
+  advanced_disable_flags: true,
+  disable_surveys: true,
+  disable_external_dependency_loading: true,
+} as const;
+
+// The credential-URL sanitizer lives in shared/ so the relay can use it too.
+export { scrubSensitiveUrl };
+
+// The recording policy — surfaces, privacy levels, replay profiles — lives in
+// lib/session-privacy.ts. Re-exported here for the modules that have always
+// imported these from this file.
+export {
+  isCredentialBearingPath,
+  isErrorCaptureSurface,
+  SECRET_SURFACE_ATTRIBUTE,
+  SESSION_RECORDING_OPTIONS,
+} from "./session-privacy";
+
+export function getPageviewCaptureOptions(
+  hostname: string | undefined = typeof window === "undefined"
+    ? undefined
+    : window.location?.hostname,
+) {
+  const isLandingHost =
+    !!hostname && LANDING_ANALYTICS_HOSTS.has(hostname.toLowerCase());
+  return {
+    capture_pageview: isLandingHost ? ("history_change" as const) : false,
+    capture_pageleave: isLandingHost,
+  };
+}
+
+export const options = {
+  api_host: getPostHogApiHost(),
+  // Toolbar/app links must point at PostHog itself once api_host is proxied.
+  ui_host: "https://us.posthog.com",
+  ...getPostHogBootstrap(),
+  ...getPageviewCaptureOptions(),
+  ...SERVER_EVALUATED_FLAG_OPTIONS,
+  person_profiles: "always" as const,
+  // Fetch keeps the SDK bearer and the live-policy guard on unload batches.
+  disable_beacon: true,
+  // Capture records policy only; the relay owns the final vendor serializer.
+  before_send: [
+    dropInjectedScriptException,
+    stampPostHogEvent,
+    (event: CaptureResult | null) => { scrubPostHogPersistence(); return event; },
+  ],
+  // Fragments carry access tokens (`#token=`) and OAuth implicit responses;
+  // no event, replay URL or heatmap needs one.
+  disable_capture_url_hashes: true,
+
+  // Rageclick's quieter sibling: a click on something that looks
+  // interactive and does nothing. Cheap (no extra network calls) and safe
+  // on every platform, so it is not gated like replay/exceptions.
+  get capture_dead_clicks() {
+    return !shouldMaskAnalytics();
+  },
+  get autocapture() {
+    return !shouldMaskAnalytics();
+  },
+  get rageclick() {
+    return !shouldMaskAnalytics();
+  },
+  get disable_surveys() {
+    return shouldMaskAnalytics();
+  },
+  get enable_heatmaps() {
+    return !shouldMaskAnalytics();
+  },
+
+  // Getters, not eager calls. `options` is a module-scope literal, so calling
+  // these at literal-creation time made merely IMPORTING this module read
+  // `HOSTED_MODE` — which broke every test that partially mocks
+  // `@/lib/config` (62 files do). Getters defer the read to property access,
+  // which is when posthog-js actually reads config.
+
+  // Uncaught errors and unhandled rejections -> `$exception`, which is what
+  // feeds PostHog Error Tracking. Boundary-caught errors reach it through
+  // lib/error-reporting.ts instead, so there is no double-count.
+  get capture_exceptions() {
+    return isErrorCaptureSurface() && !shouldMaskAnalytics();
+  },
+  // Replay never starts at init, on any surface: `syncSessionRecording`
+  // (lib/session-privacy.ts) starts it once the session's privacy level is
+  // known, with that level's profile. Until then the profile and the
+  // autocapture flags below are the masked ones, so anything that slipped
+  // through early would fail closed.
+  disable_session_recording: true,
+  session_recording: MASKED_SESSION_RECORDING_OPTIONS,
+  enable_recording_console_log: false,
+  get mask_all_text() {
+    return shouldMaskAnalytics();
+  },
+  get mask_all_element_attributes() {
+    return shouldMaskAnalytics();
+  },
+
+  // Optional: Set static super properties that never change
+  loaded: (posthog: any) => {
+    persistedPostHog = posthog;
+    scrubPostHogPersistence(posthog);
+    posthog.register({
+      environment: import.meta.env.MODE, // "development" or "production"
+      platform: detectPlatform(),
+      version: __APP_VERSION__,
+      // OSS self-hosted installs (including ones that never touch
+      // app.mcpjam.com, e.g. airgapped lab VMs) share this project's key
+      // with the hosted app. `deployment` is the clean discriminator between
+      // the two going forward — see PosthogUtils.ts module docs for the
+      // relay rationale that put every install in the same project.
+      deployment: HOSTED_MODE ? "hosted" : "self_hosted",
+      // Symmetric with the server-side `source: "server"` stamp
+      // (convex/posthog.ts, server/utils/analytics.ts) — client events
+      // previously carried no `source` at all.
+      source: "client",
+    });
+    // Super properties ride EVENTS; `/flags` evaluates PERSON properties, so a
+    // registered `deployment` is invisible to flag targeting. This makes the
+    // same discriminator usable in a flag rule (e.g. rolling the local computer
+    // engine out to the self-hosted signed-in cohort) from the first request of
+    // the session, before any identify has run.
+    // Guarded: `loaded` also runs against partial posthog stand-ins (tests, and
+    // any host that pins an older posthog-js without this method). Flag
+    // targeting degrading to "no person properties" is acceptable; throwing
+    // inside `loaded` would take out the whole analytics init.
+    posthog.setPersonPropertiesForFlags?.({
+      ...(!HOSTED_MODE ? { local_browser_security_version: "1" } : {}),
+      deployment: HOSTED_MODE ? "hosted" : "self_hosted",
+      platform: detectPlatform(),
+    });
+  },
+};
+
+/** Normalize PostHog boolean flags (`useFeatureFlagEnabled` may not be strict `true` in dev). */
+export function isPostHogBooleanFlagOn(value: unknown): boolean {
+  if (value === true) return true;
+  if (value === false || value === undefined || value === null) return false;
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    return v === "true" || v === "1" || v === "yes" || v === "on";
+  }
+  return false;
+}
+
+// `options` with the server-evaluated flags bootstrapped. Copied by property
+// descriptor so the capture-surface getters above stay getters.
+function withServerFlags(
+  serverFlags: ClientFeatureFlagValues | null | undefined,
+): typeof options {
+  const bootstrap = getPostHogBootstrap(serverFlags);
+  if (!("bootstrap" in bootstrap)) return options;
+  return Object.defineProperties(
+    {},
+    {
+      ...Object.getOwnPropertyDescriptors(options),
+      bootstrap: {
+        value: bootstrap.bootstrap,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      },
+    },
+  ) as typeof options;
+}
+
+// Conditional PostHog key and options
+// Always use the real PostHog key; flag values arrive as `serverFlags`, the
+// GET /api/web/flags answer for this visitor (lib/server-feature-flags.ts).
+export const getPostHogKey = () => POSTHOG_PROJECT_KEY;
+export const getPostHogOptions = (
+  serverFlags?: ClientFeatureFlagValues | null,
+) =>
+  isPostHogDisabled
+    ? {
+        // Same relay host as the enabled branch, so dev-mode requests are not
+        // ad-blocked either.
+        api_host: getPostHogApiHost(),
+        ui_host: "https://us.posthog.com",
+        ...getPostHogBootstrap(serverFlags),
+        ...getPageviewCaptureOptions(),
+        ...SERVER_EVALUATED_FLAG_OPTIONS,
+        person_profiles: "always" as const,
+        disable_beacon: true,
+        // Explicitly off in the opt-out branch too. `opt_out_capturing_by_default`
+        // suppresses event SENDING but the recorder and the exception handlers
+        // still load — which in dev means fetching /relay/static/recorder.js on
+        // every page load for events that are then discarded.
+        disable_session_recording: true,
+        capture_exceptions: false,
+        ...(getRuntimeDoNotTrack() ? NO_REQUEST_OPTIONS : {}),
+        // Disable event capture; flags still arrive through the server bootstrap.
+        // Must be `opt_out_capturing_by_default` — `opt_out_capturing` is a method,
+        // not a config field, so passing it here was silently ignored and dev
+        // events flowed into prod PostHog from 2026-03-12 until this fix.
+        opt_out_capturing_by_default: true,
+        // Nothing is sent from here by default, but anything that opts in
+        // later still goes through the same scrubber.
+        before_send: [
+          dropInjectedScriptException,
+          stampPostHogEvent,
+    (event: CaptureResult | null) => { scrubPostHogPersistence(); return event; },
+        ],
+        disable_capture_url_hashes: true,
+        // Same flag person properties as the enabled branch.
+        loaded: (posthog: any) => {
+          posthog.setPersonPropertiesForFlags?.({
+            ...(!HOSTED_MODE ? { local_browser_security_version: "1" } : {}),
+            deployment: HOSTED_MODE ? "hosted" : "self_hosted",
+            platform: detectPlatform(),
+          });
+        },
+      }
+    : withServerFlags(serverFlags);
+
+export function detectPlatform() {
+  // Check if running in hosted/web mode
+  if (import.meta.env.VITE_MCPJAM_HOSTED_MODE === "true") {
+    return "web";
+  }
+
+  // Check if running in Docker
+  const isDocker =
+    import.meta.env.VITE_DOCKER === "true" ||
+    import.meta.env.VITE_RUNTIME === "docker";
+
+  if (isDocker) {
+    return "docker";
+  }
+
+  // Check if Electron
+  const isElectron = (window as any)?.isElectron;
+
+  if (isElectron) {
+    // Detect OS within Electron using userAgent
+    const userAgent = navigator.userAgent.toLowerCase();
+
+    if (userAgent.includes("mac") || userAgent.includes("darwin")) {
+      return "mac";
+    } else if (userAgent.includes("win")) {
+      return "win";
+    }
+    return "electron"; // fallback
+  }
+
+  // npm package running in browser
+  return "npm";
+}
+
+export function detectEnvironment() {
+  // Vite's envPrefix is "VITE_" (vite.renderer.config.mts), so the
+  // unprefixed `ENVIRONMENT` from .env.production is never replaced into
+  // the client bundle and this always read as undefined — silently
+  // clobbering the registered `environment` super-property on every
+  // track() call (see standardEventProps below). `VITE_ENVIRONMENT` is the
+  // client-visible counterpart; it stays unset for ordinary dev/prod builds
+  // (MODE already covers that split) and is set explicitly for builds that
+  // need a finer-grained label (e.g. staging).
+  return import.meta.env.VITE_ENVIRONMENT;
+}
+
+export function standardEventProps(location: string): {
+  location: string;
+  platform: string;
+  environment?: string;
+} {
+  const environment = detectEnvironment();
+  return {
+    location,
+    platform: detectPlatform(),
+    // Omit rather than send `environment: undefined` — an explicit
+    // undefined key still overrides the registered super-property when
+    // merged into the captured event, which is exactly the bug this
+    // guards against.
+    ...(environment !== undefined ? { environment } : {}),
+  };
+}

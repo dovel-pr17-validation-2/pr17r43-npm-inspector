@@ -1,0 +1,541 @@
+import {
+  createConformanceDeadline,
+  runWithConformanceSignal,
+  deadlineFetch,
+  runWithinConformanceDeadline,
+  type ConformanceDeadlineInput,
+} from "./conformance-deadline.js";
+/**
+ * Transport-agnostic conformance handlers.
+ *
+ * Both the local-mode MCP routes (`/api/mcp/conformance/*`) and the hosted-mode
+ * web routes (`/api/web/conformance/*`) resolve their server configs from
+ * different places (local uses the in-process `MCPClientManager`, hosted talks
+ * to Convex + OAuth proxy) but once a config is resolved the actual conformance
+ * run is identical. This module centralises that second half so the SDK remains
+ * the sole source of truth for check definitions AND orchestration.
+ */
+
+import {
+  MCPAppsConformanceTest,
+  MCPConformanceTest,
+  MCPTasksConformanceTest,
+  OAuthConformanceTest,
+  canRunConformance,
+  normalizeCustomHeaders,
+  type ConformanceResult as OAuthConformanceResult,
+  type MCPAppsConformanceConfig,
+  type MCPAppsConformanceResult,
+  type MCPConformanceConfig,
+  type MCPConformanceResult,
+  type MCPCheckId,
+  type MCPReadinessId,
+  type MCPServerConfig,
+  type McpProtocolVersion,
+  type MCPTasksConformanceConfig,
+  type MCPTasksConformanceResult,
+  type OAuthConformanceConfig,
+  type MCPOAuthReadinessId,
+  type OAuthConformanceProfile,
+  type OpenAISubmissionMode,
+} from "@mcpjam/sdk";
+import type { ConformanceProbes } from "./conformance-probes.js";
+import {
+  createSession,
+  deleteSession,
+  getSession,
+  touchSession,
+  setSessionError,
+  setSessionResult,
+  submitAuthorizationCode,
+  type OAuthConformanceSession,
+} from "../../services/conformance-oauth-sessions.js";
+import { createStreamingPinnedFetch } from "../../utils/pinned-fetch.js";
+import { withHostedMcpAnswerBodies } from "../../utils/hosted-mcp-base-fetch.js";
+import {
+  runDirectoryReadiness,
+  type DirectoryReadinessResult,
+  type ReadinessPublisher,
+} from "../../services/readiness/runner.js";
+
+/**
+ * DNS + connect + response headers, across every hop of one request.
+ *
+ * Matched to undici's `headersTimeout`, which is what these runs got from the
+ * global `fetch` before the transport swap. Closing an SSRF hole is not a
+ * reason to start failing servers that were graded fine yesterday, and a cold
+ * container answering its first `initialize` in forty seconds is slow, not
+ * unreachable — the suite's own per-check timeout is what bounds a slow run.
+ */
+const CONFORMANCE_CHAIN_TIMEOUT_MS = 300_000;
+/**
+ * No bytes for this long on an OPEN stream ⇒ the stream is dead, not slow.
+ *
+ * Matched to undici's `bodyTimeout` for the same reason. It cannot be tight:
+ * MCP requires no SSE keepalives, so a conforming notification stream is
+ * allowed to say nothing at all while a long check or an interactive OAuth
+ * wait runs, and killing it would fail the server for our impatience — and
+ * without resumability, drop the notifications the suite is there to observe.
+ */
+const CONFORMANCE_BODY_IDLE_TIMEOUT_MS = 300_000;
+/** Cumulative decompressed body cap for a single conformance request. */
+const CONFORMANCE_MAX_RESPONSE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The one outbound transport every hosted conformance run dials through.
+ *
+ * `createGuardedFetch` — what this used to be — resolves the hostname to
+ * classify it and then hands the URL to a client that resolves it a SECOND
+ * time, which is the DNS-rebinding window itself: pass the check with a public
+ * answer, serve `169.254.169.254` to the connection that actually happens. The
+ * pinned transport resolves once, refuses the disallowed answers, and pins the
+ * surviving addresses into the socket, re-running all of it on every redirect
+ * hop.
+ *
+ * It is handed to the suites as `fetchFn`, which each runner now also threads
+ * into the MCP transport as `baseFetch` — so the one real MCP connection a run
+ * opens is under the same guard as the raw probes beside it, rather than
+ * following its redirects unchecked as it did while this comment's predecessor
+ * documented the gap.
+ *
+ * A no-op outside hosted mode, where reaching localhost is the point.
+ */
+export function createConformanceFetch(targetLabel: string): typeof fetch {
+  const fetchFn = createStreamingPinnedFetch({
+    targetLabel,
+    // DNS + connect + headers, summed across the redirect chain. Deliberately
+    // NOT a bound on an established body: an SSE stream is long-lived by
+    // design, and killing one at 30s would fail conforming servers.
+    chainTimeoutMs: CONFORMANCE_CHAIN_TIMEOUT_MS,
+    // A stalled stream still has to die. This is the bound that can apply to
+    // SSE without punishing a healthy stream for staying open.
+    bodyIdleTimeoutMs: CONFORMANCE_BODY_IDLE_TIMEOUT_MS,
+    maxResponseBytes: CONFORMANCE_MAX_RESPONSE_BYTES,
+  });
+  // An MCP server's answers are read as MCP (hosted: see
+  // `withHostedMcpAnswerBodies`). An OAuth endpoint's are not — its error
+  // bodies are what the OAuth suite grades.
+  return targetLabel === "MCP server"
+    ? withHostedMcpAnswerBodies(fetchFn)
+    : fetchFn;
+}
+
+// ── Result shapes shared with clients ───────────────────────────────────
+
+export type StartOAuthConformanceResult =
+  | {
+      phase: "authorization_needed";
+      sessionId: string;
+      authorizationUrl: string;
+      completedSteps: OAuthConformanceSession["completedSteps"];
+    }
+  | {
+      phase: "complete";
+      result: OAuthConformanceResult;
+    };
+
+export type CompleteOAuthConformanceResult =
+  | {
+      phase: "complete";
+      result: OAuthConformanceResult;
+    }
+  | {
+      phase: "pending";
+      completedSteps: OAuthConformanceSession["completedSteps"];
+    };
+
+// ── Protocol ────────────────────────────────────────────────────────────
+
+export interface ResolvedHttpConfig extends ConformanceDeadlineInput {
+  serverUrl: string;
+  accessToken?: string;
+  customHeaders?: Record<string, string>;
+  /** Pin the run to one protocol version; absent ⇒ adopt the negotiated one. */
+  protocolVersion?: McpProtocolVersion;
+  /** Run only these checks; absent ⇒ every check the revision has. */
+  checkIds?: MCPCheckId[];
+  /** Run only this advice; absent ⇒ all of it, empty ⇒ none. */
+  readinessIds?: MCPReadinessId[];
+  /** Per-check limit in ms; absent ⇒ the SDK default. */
+  checkTimeout?: number;
+}
+
+export class UnsupportedTransportError extends Error {
+  readonly code = "unsupportedTransport" as const;
+}
+
+/** Throw if the caller handed us a non-HTTP config for an HTTP-only suite. */
+export function assertHttpSupported(
+  suite: "protocol" | "oauth",
+  config: MCPServerConfig,
+): void {
+  const support = canRunConformance(suite, config);
+  if (!support.supported) {
+    throw new UnsupportedTransportError(support.reason ?? "Unsupported transport");
+  }
+}
+
+export async function runProtocolConformance(
+  input: ResolvedHttpConfig & ConformanceProbes,
+): Promise<{ result: MCPConformanceResult }> {
+  return runWithinConformanceDeadline(input, async (signal) => {
+  const config: MCPConformanceConfig = {
+    signal,
+    serverUrl: input.serverUrl,
+    accessToken: input.accessToken,
+    customHeaders: input.customHeaders,
+    protocolVersion: input.protocolVersion,
+    ...(input.checkTimeout ? { checkTimeout: input.checkTimeout } : {}),
+    ...(input.checkIds ? { checkIds: input.checkIds } : {}),
+    ...(input.readinessIds ? { readinessIds: input.readinessIds } : {}),
+    ...(input.logProbe ? { logProbe: input.logProbe } : {}),
+    ...(input.logLevelFilteringProbe
+      ? { logLevelFilteringProbe: input.logLevelFilteringProbe }
+      : {}),
+    ...(input.inputRequiredProbe
+      ? { inputRequiredProbe: input.inputRequiredProbe }
+      : {}),
+    ...(input.toolCallProbe
+      ? { fixtures: { toolCalls: [input.toolCallProbe] } }
+      : {}),
+    // Checking the URL the caller named is not the same as checking the
+    // addresses we end up dialing: a target can answer `302 Location:
+    // http://169.254.169.254/`. This re-checks each hop. A no-op outside hosted
+    // mode, where reaching localhost is the point.
+    //
+    // SCOPE, precisely: `fetchFn` is what the raw HTTP and SSE probes use, and
+    // `mcp-conformance/runner.ts` also threads it into the client manager as
+    // `baseFetch` — so the one real MCP connection a run opens is under the
+    // same guard as the probes beside it. The deferral this comment used to
+    // record ("threading a base fetch through the client manager … does not
+    // belong in this change") was taken up by the runner, and then by every
+    // hosted connection factory when the gap it left became MJ-001.
+    fetchFn: deadlineFetch(createConformanceFetch("MCP server"), signal),
+  };
+  const test = new MCPConformanceTest(config);
+  const result = await test.run();
+  return { result };
+  });
+}
+
+/** A run pin overrides saved accept-lists without changing the main connection. */
+function pinSuiteVersion<T extends MCPServerConfig>(
+  config: T,
+  protocolVersion?: McpProtocolVersion,
+): T {
+  return protocolVersion && "url" in config && config.url != null
+    ? {
+        ...config,
+        mcpProtocolVersion: protocolVersion,
+        supportedProtocolVersions: [protocolVersion],
+      }
+    : config;
+}
+
+// ── Apps ────────────────────────────────────────────────────────────────
+
+export async function runAppsConformance({
+  protocolVersion,
+  ...serverConfig
+}: MCPAppsConformanceConfig & ConformanceDeadlineInput & {
+  protocolVersion?: McpProtocolVersion;
+}): Promise<{ result: MCPAppsConformanceResult }> {
+  return runWithinConformanceDeadline(serverConfig, async (signal) => {
+    const test = new MCPAppsConformanceTest({
+      ...pinSuiteVersion(serverConfig, protocolVersion),
+      signal,
+      baseFetch: deadlineFetch(serverConfig.baseFetch ?? createConformanceFetch("MCP server"), signal),
+    });
+    return { result: await test.run() };
+  });
+}
+
+// ── Directory readiness ─────────────────────────────────────────────────
+
+/**
+ * Run a deterministic readiness grade against a connected server.
+ *
+ * SYNCHRONOUS AND FREE, and both halves are deliberate. A local run is not
+ * persisted, holds no lease and has no payer, so there is nothing for a
+ * durable queue to own — and no `requestObservations` is passed, which means
+ * this path structurally cannot spend. The hosted path is the one with a
+ * lease, a heartbeat and a broker.
+ *
+ * The pinned transport is the same one every hosted conformance run dials
+ * through: resolve once, refuse the disallowed answers, pin the surviving
+ * addresses into the socket, re-run all of it on every redirect hop. A no-op
+ * outside hosted mode, where reaching localhost is the point.
+ */
+export async function runLocalDirectoryReadiness(input: {
+  publisher: ReadinessPublisher;
+  target: string;
+  submissionMode?: OpenAISubmissionMode;
+  accessToken?: string;
+  customHeaders?: Record<string, string>;
+}): Promise<{ result: DirectoryReadinessResult }> {
+  const headers: Record<string, string> = { ...(input.customHeaders ?? {}) };
+  if (input.accessToken) headers.authorization = `Bearer ${input.accessToken}`;
+
+  const { result } = await runDirectoryReadiness({
+    publisher: input.publisher,
+    target: input.target,
+    submissionMode: input.submissionMode,
+    mcpHeaders: Object.keys(headers).length > 0 ? headers : undefined,
+    fetchFn: createConformanceFetch("MCP server"),
+  });
+  return { result };
+}
+
+// ── Tasks ───────────────────────────────────────────────────────────────
+
+export async function runTasksConformance({
+  protocolVersion,
+  ...serverConfig
+}: MCPTasksConformanceConfig &
+  ConformanceDeadlineInput & {
+    protocolVersion?: McpProtocolVersion;
+  }): Promise<{ result: MCPTasksConformanceResult }> {
+  const deadline = createConformanceDeadline(serverConfig);
+  try {
+    const test = new MCPTasksConformanceTest({
+      ...pinSuiteVersion(serverConfig, protocolVersion),
+      signal: deadline.signal,
+      baseFetch: deadlineFetch(
+        serverConfig.baseFetch ?? createConformanceFetch("MCP server"),
+        deadline.signal,
+      ),
+    });
+    const result = await test.run();
+    deadline.signal.throwIfAborted();
+    return { result };
+  } finally {
+    deadline.dispose();
+  }
+}
+
+// ── OAuth (interactive, remote-browser) ─────────────────────────────────
+
+export interface StartOAuthConformanceInput extends ConformanceDeadlineInput {
+  /** Fallback server URL when `oauthProfile.serverUrl` is not set. */
+  defaultServerUrl: string;
+  /** Fallback headers when `oauthProfile.customHeaders` is not set. */
+  defaultCustomHeaders?: Record<string, string>;
+  /** Public callback URL that the authorization server will redirect to. */
+  redirectUrl: string;
+  oauthProfile?: OAuthConformanceProfile;
+  /** Report only this advice; absent ⇒ all of it, empty ⇒ none. */
+  readinessIds?: MCPOAuthReadinessId[];
+  /**
+   * Hosted only: the caller starting the run (`principalKey`). Only that
+   * caller can then deliver its code or read its result. Local runs omit it.
+   */
+  owner?: string;
+  /**
+   * Hosted only: runs once the session waits for the user, before the URL is
+   * returned, so later calls can reach this run from any replica. If it
+   * throws, the session is dropped and the error surfaces from this call.
+   */
+  onAuthorizationNeeded?: (session: OAuthConformanceSession) => Promise<void>;
+}
+
+export async function startOAuthConformance(
+  input: StartOAuthConformanceInput,
+): Promise<StartOAuthConformanceResult> {
+  const serverUrl = input.oauthProfile?.serverUrl || input.defaultServerUrl;
+  const customHeaders =
+    normalizeCustomHeaders(input.oauthProfile?.customHeaders) ??
+    input.defaultCustomHeaders;
+
+  const deadline = createConformanceDeadline(input);
+  const session = createSession({
+    redirectUrl: input.redirectUrl,
+    owner: input.owner,
+  });
+  session.cancelRunner = deadline.cancel;
+  const { controller } = session;
+  const onAbort = () => controller.fail(deadline.signal.reason);
+  deadline.signal.addEventListener("abort", onAbort, { once: true });
+  if (deadline.signal.aborted) onAbort();
+
+  const oauthConfig: OAuthConformanceConfig = {
+    signal: deadline.signal,
+    serverUrl,
+    protocolVersion: input.oauthProfile?.protocolVersion ?? "2025-11-25",
+    registrationStrategy: input.oauthProfile?.registrationStrategy ?? "cimd",
+    auth: {
+      mode: "interactive",
+      // openUrl is intentionally a no-op: the remote-browser controller
+      // surfaces the auth URL via `awaitAuthorizationUrl`, not by opening a
+      // local browser. The actual "open in a new window" happens client-side.
+      openUrl: async () => {},
+    },
+    client: input.oauthProfile?.clientId
+      ? {
+          preregistered: {
+            clientId: input.oauthProfile.clientId,
+            clientSecret: input.oauthProfile.clientSecret,
+          },
+        }
+      : undefined,
+    scopes: input.oauthProfile?.scopes,
+    customHeaders,
+    redirectUrl: input.redirectUrl,
+    // The negative checks (invalid client, mismatched redirect, invalid token,
+    // http:// DCR redirect) are part of the OAuth suite, not an opt-in extra:
+    // verifying the server *rejects* bad input is half of OAuth conformance.
+    // The runner only reaches them once the happy path passes end to end.
+    oauthConformanceChecks: true,
+    ...(input.readinessIds ? { readinessIds: input.readinessIds } : {}),
+    // The OAuth suite dials URLs it DISCOVERS — authorization, token,
+    // registration and metadata endpoints all come out of the target's own
+    // documents — so the profile URL it was handed is the one address here that
+    // was ever checkable up front. Every request goes through the hop-checking
+    // fetch instead. Requests that ask for `redirect: "manual"` keep their 3xx:
+    // this suite grades redirects, and following one would erase the evidence.
+    fetchFn: deadlineFetch(createConformanceFetch("OAuth endpoint"), deadline.signal),
+  };
+
+  const test = new OAuthConformanceTest(oauthConfig, {
+    createInteractiveAuthorizationSession: () => controller.createSession(),
+  });
+
+  const runnerPromise = runWithConformanceSignal(deadline.signal, () => test.run()).then(
+    (result) => {
+      setSessionResult(session.id, result);
+      return result;
+    },
+    (err) => {
+      setSessionError(
+        session.id,
+        err instanceof Error ? err.message : String(err),
+      );
+      throw err;
+    },
+  ).finally(() => {
+    session.cancelRunner = undefined;
+    deadline.dispose();
+    deadline.signal.removeEventListener("abort", onAbort);
+  });
+  session.runnerPromise = runnerPromise;
+  // Don't let an unhandled rejection propagate while we wait.
+  runnerPromise.catch(() => undefined);
+
+  // Race the runner against `awaitAuthorizationUrl`: whichever settles first
+  // tells us whether user authorization is needed. No deadline: slow discovery
+  // must still hand back the URL, or the runner waits out the consent window.
+  const outcome = await Promise.race([
+    controller.awaitAuthorizationUrl.then(() => "authorization_needed" as const),
+    runnerPromise.then(() => "complete" as const, () => "complete" as const),
+  ]);
+
+  if (outcome === "authorization_needed" && session.authorizationUrl) {
+    if (input.onAuthorizationNeeded) {
+      try {
+        await input.onAuthorizationNeeded(session);
+      } catch (error) {
+        deleteSession(session.id);
+        throw error;
+      }
+    }
+    return {
+      phase: "authorization_needed",
+      sessionId: session.id,
+      authorizationUrl: session.authorizationUrl,
+      completedSteps: session.completedSteps,
+    };
+  }
+
+  // The runner finished without needing user auth: awaiting it either gives us
+  // a result or surfaces its error.
+  const result = await runnerPromise;
+  return { phase: "complete", result };
+}
+
+export function cancelOAuthConformance(input: { sessionId: string; owner?: string }): void {
+  if (getSession(input.sessionId, input.owner)) deleteSession(input.sessionId);
+}
+
+export interface SubmitOAuthConformanceCodeInput {
+  sessionId: string;
+  code: string;
+  state?: string;
+  /** The caller that started the run; see `StartOAuthConformanceInput.owner`. */
+  owner?: string;
+}
+
+/** Returns whether a session accepted the code (false when unknown/expired). */
+export function submitOAuthConformanceCode(
+  input: SubmitOAuthConformanceCodeInput,
+): boolean {
+  return submitAuthorizationCode(
+    input.sessionId,
+    input.code,
+    input.state,
+    input.owner,
+  );
+}
+
+export interface CompleteOAuthConformanceInput {
+  sessionId: string;
+  /** The caller that started the run; see `StartOAuthConformanceInput.owner`. */
+  owner?: string;
+  /** How long to long-poll before returning `pending`. Defaults to 25s. */
+  pollTimeoutMs?: number;
+  /** Interval between polls. Defaults to 500ms. */
+  pollIntervalMs?: number;
+}
+
+export class OAuthConformanceSessionNotFoundError extends Error {
+  readonly code = "notFound" as const;
+}
+
+/** What the user sees when their session is gone: it expired while idle. */
+export const OAUTH_SESSION_EXPIRED_MESSAGE =
+  "Authorization took too long. Run the checks again.";
+
+export class OAuthConformanceSessionFailedError extends Error {
+  readonly code = "runnerFailed" as const;
+}
+
+export async function completeOAuthConformance(
+  input: CompleteOAuthConformanceInput,
+): Promise<CompleteOAuthConformanceResult> {
+  const session = getSession(input.sessionId, input.owner);
+  if (!session) {
+    throw new OAuthConformanceSessionNotFoundError(
+      OAUTH_SESSION_EXPIRED_MESSAGE,
+    );
+  }
+  touchSession(input.sessionId);
+  if (session.result) {
+    return { phase: "complete", result: session.result };
+  }
+  if (session.error) {
+    throw new OAuthConformanceSessionFailedError(session.error);
+  }
+
+  const pollTimeoutMs = input.pollTimeoutMs ?? 25_000;
+  const pollIntervalMs = input.pollIntervalMs ?? 500;
+  const deadline = Date.now() + pollTimeoutMs;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    const current = getSession(input.sessionId, input.owner);
+    if (!current) {
+      throw new OAuthConformanceSessionNotFoundError(
+        OAUTH_SESSION_EXPIRED_MESSAGE,
+      );
+    }
+    if (current.result) {
+      return { phase: "complete", result: current.result };
+    }
+    if (current.error) {
+      throw new OAuthConformanceSessionFailedError(current.error);
+    }
+  }
+
+  return {
+    phase: "pending",
+    completedSteps: session.completedSteps,
+  };
+}

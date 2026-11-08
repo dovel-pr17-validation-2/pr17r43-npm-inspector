@@ -1,0 +1,866 @@
+import { BrowserActivityList } from "@/components/browser/BrowserActivityList";
+import { useBrowserEngine } from "@/hooks/useBrowserEngine";
+import { useBrowserToolIds } from "@/hooks/useBrowserToolIds";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Cloud,
+  FileText,
+  Globe,
+  Laptop,
+  Loader2,
+  PanelRightClose,
+  Plus,
+  TerminalSquare,
+  X,
+} from "lucide-react";
+import { Button } from "@mcpjam/design-system/button";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@mcpjam/design-system/dropdown-menu";
+import { useExtensionWorkspaceState } from "@/components/host-workspace/ExtensionWorkspaceProvider";
+import {
+  useExtensionRail,
+  type RailAppTab,
+} from "@/components/host-workspace/use-extension-rail";
+import { ExtensionIcon } from "@/components/host-workspace/ExtensionIcon";
+import {
+  entrypointIconSources,
+  usePluginIconDirectory,
+} from "@/components/host-workspace/plugin-icon-directory";
+import { track } from "@/lib/analytics";
+import { cn } from "@/lib/utils";
+import { LoggerView } from "@/components/logger-view";
+import { ComputerStatusChip } from "@/components/computer/ComputerStatusChip";
+import { ComputerTerminal } from "@/components/computer/ComputerTerminal";
+import { ComputerTerminalPane } from "@/components/computer/ComputerTerminalPane";
+import { PaneMessage } from "@/components/computer/PaneMessage";
+import { useComputerTerminal } from "@/components/computer/useComputerTerminal";
+import {
+  useBrowserWorkspaceEnabled,
+  useComputersEnabledState,
+  useBrowserEnabledState,
+} from "@/hooks/useComputersEnabled";
+import { useLocalBrowserRunning } from "@/hooks/useLocalBrowserRunning";
+import { LocalBrowserBody } from "@/components/browser/LocalBrowserBody";
+import { HostedBrowserBody } from "@/components/browser/HostedBrowserBody";
+import { browserPanelAvailable } from "@/components/playground/PlaygroundBrowserPanel";
+import { useMintConversationBrowserToken } from "@/hooks/useProjectComputer";
+import {
+  useComputerEngine,
+  type ComputerEngineState,
+} from "@/hooks/useComputerEngine";
+import {
+  useHarnessRanOnDisposable,
+  useHarnessWorkdir,
+} from "@/stores/harness-workdir-store";
+import { usePreferencesStore } from "@/stores/preferences/preferences-provider";
+import { mintLocalTerminalNonce } from "@/lib/local-computer-consent";
+import { LOCAL_TERMINAL_WS_PATH } from "@/lib/computer-terminal-connection";
+import { useActiveChatSessionStore } from "@/stores/active-chat-session-store";
+import { useBrowserWorkspaceStore } from "@/stores/browser-workspace-store";
+import { useBrowserComparisonStore } from "@/stores/browser-comparison-store";
+import {
+  ComparisonBrowser,
+  LocalBrowserUnavailable,
+} from "@/components/browser/ComparisonBrowser";
+import type { HostConfigDtoV2 } from "@/lib/client-config-v2";
+
+/**
+ * Playground right rail. Single-purpose log viewer by default; when the
+ * previewed host has a Project Computer attached (and computers are enabled),
+ * it becomes a Logs | Shell tabbed panel so you can drop into a live terminal
+ * on the same box the harness runs on. Mirrors `PlaygroundLeftRail`'s tab
+ * pattern; rail visibility/collapse is owned by `PlaygroundTab`.
+ */
+export function PlaygroundRightRail({
+  onClose,
+  hostConfig,
+  hostId,
+  projectId,
+  isAuthenticated,
+}: {
+  onClose: () => void;
+  hostConfig: HostConfigDtoV2 | null;
+  /** Convex host document id (previewedHostId) — the SAME id the chat stream
+   *  keys the harness workdir cache by. NOT hostConfig.id (a content-addressed
+   *  config id), which would never match the write side. */
+  hostId: string | null;
+  projectId: string | null;
+  isAuthenticated: boolean;
+}) {
+  const computersEnabled = useComputersEnabledState();
+  const browsersEnabled = useBrowserEnabledState();
+  // With plugin extensions on, the rail is always the tabbed side panel: App
+  // tabs live beside Logs, and their container must never be swapped out.
+  const extensionsEnabled =
+    useExtensionWorkspaceState((state) => state.enabled) === true;
+  if (
+    computersEnabled !== true &&
+    browsersEnabled !== true &&
+    !extensionsEnabled
+  ) {
+    return <LoggerView onClose={onClose} />;
+  }
+  return (
+    <RightRailTabbed
+      onClose={onClose}
+      projectId={projectId}
+      isAuthenticated={isAuthenticated}
+      hostConfig={hostConfig}
+      hostId={hostId}
+    />
+  );
+}
+
+/**
+ * The rail's tabs.
+ *
+ * The Browser moved out to a panel of its own beside chat — a page rendered at
+ * 30% of a workspace is a page in its mobile layout, and hiding it to read the
+ * logs hides it at the moment you most want to see what the agent just did.
+ * What belongs here is text: a log stream and a shell, which are exactly right
+ * in a narrow column.
+ *
+ * It comes BACK when the browser workspace is gated off, because the
+ * alternative is no browser at all: a flag that removed the panel and left
+ * nothing in its place would be worse than either state it is choosing
+ * between. @see BROWSER_WORKSPACE_FLAG
+ */
+type RightRailTab = "logs" | "shell" | "browser";
+
+function RightRailTabbed({
+  onClose,
+  projectId,
+  isAuthenticated,
+  hostConfig,
+  hostId,
+}: {
+  onClose: () => void;
+  projectId: string | null;
+  isAuthenticated: boolean;
+  hostConfig: HostConfigDtoV2 | null;
+  hostId: string | null;
+}) {
+  const [activeTab, setActiveTab] = useState<RightRailTab>("logs");
+  const leftBrowserForLogs = useRef(false);
+  // Plugin App tabs (this chat's thread, file and quick-action Apps, and open
+  // settings) share the header with the built-in panes. An App tab, when one
+  // is selected, wins over `activeTab`; choosing a built-in pane deselects it
+  // and the App stays retained.
+  const rail = useExtensionRail();
+  const appActive = rail.enabled && rail.activeId !== null;
+  const railRef = useRef(rail);
+  railRef.current = rail;
+  const computersEnabled = useComputersEnabledState();
+  const browsersEnabled = useBrowserEnabledState();
+  // No Shell for a harness client: it runs on a throwaway per-conversation box,
+  // not the personal computer this tab would open.
+  const shellAvailable =
+    computersEnabled === true && !!hostConfig?.computer && !hostConfig?.harness;
+  // Which engine serves this project's computer work. The rail is an INDICATOR
+  // only — switching lives on the Computer tab, which owns the consent gate.
+  //
+  // NOTE: `projectId` here is `sharedProjectId ?? activeProjectId`, while
+  // PlaygroundMain's engine reads `sharedProjectId` only. The divergence is
+  // harmless (the engine hooks no-op without a shared project) and deliberate.
+  const engine = useComputerEngine(projectId);
+  const browserEngine = useBrowserEngine(projectId);
+  const browserToolIds = useBrowserToolIds(
+    hostConfig,
+    browserEngine.selectedEngine,
+    { projectId, hostId },
+  );
+  // The BODY follows `selectedEngine` (consent-blind), mirroring the Computer
+  // tab's face choice: someone who picked "This machine" but hasn't authorized
+  // it yet must see the local body's pointer, not a cloud terminal they didn't
+  // ask for. The CHIP follows the resolved `engine`, so it can never claim
+  // "This machine" while commands actually run in the cloud.
+  const isLocalShell = engine.selectedEngine === "local";
+  // THE FALLBACK BROWSER, and only that. While the workspace flag is on the
+  // browser lives in its own panel beside chat and this tab does not exist;
+  // with the flag off it is the rail's third tab again, exactly as it was.
+  const comparisonWorkspaceId = useActiveChatSessionStore(
+    (state) => state.sessionId,
+  );
+  const hasComparison = useBrowserComparisonStore((state) =>
+    Object.values(state.clients).some(
+      (client) =>
+        client.workspaceId === comparisonWorkspaceId &&
+        client.projectId === projectId,
+    ),
+  );
+  const comparisonHasBrowser = useBrowserComparisonStore((state) =>
+    Object.values(state.clients).some(
+      (client) =>
+        client.workspaceId === comparisonWorkspaceId &&
+        client.projectId === projectId &&
+        client.started,
+    ),
+  );
+  const restoredHasBrowser = useActiveChatSessionStore(
+    (state) => !!state.restoredSession?.browser,
+  );
+  const sessionHasBrowser = restoredHasBrowser || comparisonHasBrowser;
+  const workspaceEnabled = useBrowserWorkspaceEnabled();
+  const localBrowserRunning = useLocalBrowserRunning(
+    !workspaceEnabled && browserEngine.selectedEngine === "local",
+  );
+  const hasBrowser =
+    browsersEnabled === true &&
+    !workspaceEnabled &&
+    browserPanelAvailable({
+      sessionHasBrowser,
+      hostHasBrowser: !!browserToolIds?.includes("browser"),
+      selectedEngine: browserEngine.selectedEngine,
+      isAuthenticated,
+      localBrowserRunning,
+    });
+  // Which body. Follows `selectedEngine` like the Shell above, so someone who
+  // picked "This machine" but has not authorized it yet sees the local body's
+  // pointer rather than a cloud browser they did not ask for.
+  const isLocalBrowser = browserEngine.selectedEngine === "local";
+  const mintConversationBrowserToken = useMintConversationBrowserToken();
+  const activeChatSessionId = useActiveChatSessionStore(
+    (state) => state.sessionId,
+  );
+  const browserSessionId = activeChatSessionId ?? undefined;
+  const browseRevealSeq = useBrowserWorkspaceStore((state) => state.revealSeq);
+  const browseRevealId = useBrowserWorkspaceStore(
+    (state) => state.revealConversationId,
+  );
+  const mintHostedBrowserToken = useCallback(
+    ({ projectId: tokenProjectId }: { projectId: string }) => {
+      if (!browserSessionId)
+        throw new Error("The conversation is still loading.");
+      return mintConversationBrowserToken({
+        projectId: tokenProjectId,
+        conversationId: browserSessionId,
+      });
+    },
+    [browserSessionId, mintConversationBrowserToken],
+  );
+
+  // A tab that disappears cannot stay selected: leaving `activeTab` on a
+  // hidden pane hides all of them and the rail looks broken.
+  useEffect(() => {
+    if (
+      (!hasBrowser && activeTab === "browser") ||
+      (!shellAvailable && activeTab === "shell")
+    )
+      setActiveTab("logs");
+  }, [hasBrowser, shellAvailable, activeTab]);
+
+  useEffect(() => {
+    leftBrowserForLogs.current = false;
+  }, [browserSessionId]);
+
+  // Follow the work until the person looks away. A live browser tool opens
+  // this tab the first time; switching to Logs (or Shell) is a choice we
+  // keep until they come back, or until this conversation is no longer
+  // the one browsing.
+  useEffect(() => {
+    if (!hasBrowser || !browserSessionId) return;
+    if (browseRevealId !== browserSessionId) return;
+    if (leftBrowserForLogs.current) return;
+    railRef.current.deselect();
+    setActiveTab("browser");
+  }, [browseRevealSeq, browseRevealId, browserSessionId, hasBrowser]);
+
+  const handleTabClick = useCallback(
+    (next: RightRailTab) => {
+      if (railRef.current.activeId !== null) railRef.current.deselect();
+      if (next === activeTab) return;
+      leftBrowserForLogs.current = next !== "browser";
+      track("playground_right_rail_tab_changed", {
+        location: "playground_right_rail",
+        from: activeTab,
+        to: next,
+      });
+      setActiveTab(next);
+    },
+    [activeTab],
+  );
+
+  const browserActivity =
+    projectId && isLocalBrowser && browserEngine.consent.granted ? (
+      <BrowserActivityList
+        key={projectId}
+        title="Browser activity"
+        collapsible
+        projectId={projectId}
+        consentToken={browserEngine.consent.token}
+        active={activeTab === "logs"}
+        className="max-h-[40%] shrink-0 border-t"
+      />
+    ) : null;
+
+  // Browser-only hosts must reach the tabbed rail (and its consent gate)
+  // without mounting a shell or requiring a Computer attachment.
+  if (!shellAvailable && !hasBrowser && !rail.enabled) {
+    return (
+      <div className="flex h-full min-h-0 flex-col">
+        <div className="min-h-0 flex-1">
+          <LoggerView onClose={onClose} />
+        </div>
+        {browserActivity}
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex h-full min-h-0 flex-col bg-background">
+      <div className="flex shrink-0 items-center gap-0.5 border-b border-border px-2 py-1">
+        <div
+          role="tablist"
+          aria-label="Side panel"
+          className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto [scrollbar-width:none]"
+        >
+          <TabButton
+            icon={FileText}
+            label="Logs"
+            isActive={!appActive && activeTab === "logs"}
+            onClick={() => handleTabClick("logs")}
+          />
+          {shellAvailable ? (
+            <TabButton
+              icon={TerminalSquare}
+              label="Shell"
+              isActive={!appActive && activeTab === "shell"}
+              onClick={() => handleTabClick("shell")}
+            />
+          ) : null}
+          {hasBrowser ? (
+            <TabButton
+              icon={Globe}
+              label="Browser"
+              isActive={!appActive && activeTab === "browser"}
+              onClick={() => handleTabClick("browser")}
+            />
+          ) : null}
+          {rail.tabs.map((tab) => (
+            <AppTabButton
+              key={tab.id}
+              tab={tab}
+              isActive={rail.activeId === tab.id}
+              onSelect={() => rail.select(tab.id)}
+              onClose={() => rail.close(tab.id)}
+            />
+          ))}
+          {rail.enabled ? (
+            <NewTabMenu
+              builtIns={[
+                { id: "logs", label: "Logs", icon: FileText },
+                ...(shellAvailable
+                  ? [{ id: "shell" as const, label: "Shell", icon: TerminalSquare }]
+                  : []),
+                ...(hasBrowser
+                  ? [{ id: "browser" as const, label: "Browser", icon: Globe }]
+                  : []),
+              ]}
+              onBuiltIn={handleTabClick}
+              entrypoints={rail.entrypoints}
+              onEntrypoint={(entry) => void rail.launch(entry)}
+            />
+          ) : null}
+        </div>
+        <div className="ml-auto flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Collapse panel"
+            className="rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+          >
+            <PanelRightClose className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
+      {/* Keep BOTH bodies mounted — toggling tabs must not drop the live
+          terminal WebSocket or the log stream. */}
+      <div
+        hidden={appActive || activeTab !== "logs"}
+        className={cn(
+          "min-h-0 flex-1",
+          !appActive && activeTab === "logs" ? "flex flex-col" : "hidden",
+        )}
+      >
+        <div className="min-h-0 flex-1">
+          <LoggerView isCollapsable={false} />
+        </div>
+        {browserActivity}
+      </div>
+      {hasBrowser ? (
+        <div
+          className={cn(
+            "min-h-0 flex-1 flex-col",
+            !appActive && activeTab === "browser" ? "flex" : "hidden",
+          )}
+        >
+          {/* Mounted-hidden like the others: switching tabs must not drop the
+              frame socket, which would stop the screencast and make the agent's
+              browser go dark every time somebody glanced at the logs. `active`
+              is what makes that safe — a pane behind the Logs tab must stop
+              claiming somebody is watching, and on the hosted engine that claim
+              keeps a METERED box awake. */}
+          {hasComparison && projectId && browserSessionId ? (
+            <ComparisonBrowser
+              key={`${projectId}:${browserSessionId}`}
+              projectId={projectId}
+              workspaceId={browserSessionId}
+              active={activeTab === "browser"}
+            />
+          ) : !browserSessionId ? (
+            <p role="status" className="p-4 text-sm text-muted-foreground">
+              Loading conversation…
+            </p>
+          ) : isLocalBrowser && browserEngine.localAvailable === false ? (
+            <LocalBrowserUnavailable engine={browserEngine} />
+          ) : isLocalBrowser ? (
+            <LocalBrowserBody
+              key={`${projectId}:${browserSessionId}:local`}
+              projectId={projectId}
+              sessionId={browserSessionId}
+              consentGranted={browserEngine.consent.granted}
+              consentToken={browserEngine.consent.token}
+              hostId={hostId}
+              active={activeTab === "browser"}
+            />
+          ) : (
+            <HostedBrowserBody
+              key={`${projectId}:${browserSessionId}:hosted`}
+              projectId={projectId}
+              sessionId={browserSessionId}
+              mintToken={mintHostedBrowserToken}
+              hostId={hostId}
+              active={activeTab === "browser"}
+            />
+          )}
+        </div>
+      ) : null}
+      {shellAvailable ? (
+        <div
+          className={cn(
+            "min-h-0 flex-1 flex-col",
+            !appActive && activeTab === "shell" ? "flex" : "hidden",
+          )}
+        >
+          {/* The local body deliberately does NOT mount the cloud terminal
+            controller: `useComputerTerminal` reserves (and wakes) a cloud box
+            on open, which would be a real machine started behind the user's
+            back while their chat bash runs on this laptop. Swapping bodies
+            mid-session drops a live cloud socket — the reserved box stays up
+            until the idle sweep, and switching back reconnects with a fresh
+            token mint. */}
+          {isLocalShell ? (
+            <LocalShellBody engine={engine} projectId={projectId} />
+          ) : (
+            <CloudShellBody
+              engine={engine}
+              projectId={projectId}
+              isAuthenticated={isAuthenticated}
+              hostConfig={hostConfig}
+              hostId={hostId}
+            />
+          )}
+        </div>
+      ) : null}
+      {rail.enabled ? (
+        // Thread, file and quick-action Apps (and settings) are portaled in
+        // here. Mounted once and never moved: a new parent reloads an iframe.
+        <div
+          ref={rail.setSlot}
+          data-testid="right-rail-app-area"
+          className={cn("min-h-0 flex-1 flex-col", appActive ? "flex" : "hidden")}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/** One App tab: icon, title and a close button (reference: Codex side panel). */
+function AppTabButton({
+  tab,
+  isActive,
+  onSelect,
+  onClose,
+}: {
+  tab: RailAppTab;
+  isActive: boolean;
+  onSelect: () => void;
+  onClose: () => void;
+}) {
+  const themeMode = usePreferencesStore((state) => state.themeMode);
+  const theme = themeMode === "dark" ? "dark" : "light";
+  const label = tab.ambiguous ? `${tab.title} · ${tab.serverName}` : tab.title;
+  return (
+    <div
+      className={cn(
+        "group flex min-w-0 max-w-48 shrink-0 items-center rounded-md text-xs font-medium transition-colors",
+        isActive
+          ? "bg-accent text-foreground"
+          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+      )}
+    >
+      <button
+        type="button"
+        role="tab"
+        aria-selected={isActive}
+        onClick={onSelect}
+        title={`${tab.title} · ${tab.serverName}`}
+        className="flex min-w-0 items-center gap-1.5 py-1 pl-2 pr-1"
+      >
+        {tab.loading ? (
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin" aria-hidden />
+        ) : (
+          <ExtensionIcon
+            kind="sidebar"
+            theme={theme}
+            size={14}
+            sources={tab.icons ?? {}}
+          />
+        )}
+        <span className="truncate">{label}</span>
+      </button>
+      <button
+        type="button"
+        onClick={onClose}
+        aria-label={`Close ${tab.title}`}
+        className="mr-1 rounded p-0.5 opacity-70 hover:bg-accent hover:opacity-100"
+      >
+        <X className="h-3 w-3" />
+      </button>
+    </div>
+  );
+}
+
+/**
+ * The "+" at the end of the tab strip: the built-in panes, then this chat's
+ * thread entrypoints under "Plugins and MCPs".
+ */
+function NewTabMenu({
+  builtIns,
+  onBuiltIn,
+  entrypoints,
+  onEntrypoint,
+}: {
+  builtIns: { id: RightRailTab; label: string; icon: typeof FileText }[];
+  onBuiltIn: (id: RightRailTab) => void;
+  entrypoints: ReturnType<typeof useExtensionRail>["entrypoints"];
+  onEntrypoint: (
+    entry: ReturnType<typeof useExtensionRail>["entrypoints"][number],
+  ) => void;
+}) {
+  const themeMode = usePreferencesStore((state) => state.themeMode);
+  const theme = themeMode === "dark" ? "dark" : "light";
+  const iconDirectory = usePluginIconDirectory();
+  const titles = new Map<string, number>();
+  for (const entry of entrypoints)
+    titles.set(
+      entry.declaration.title,
+      (titles.get(entry.declaration.title) ?? 0) + 1,
+    );
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          type="button"
+          aria-label="Open a panel"
+          className="shrink-0 rounded-md p-1 text-muted-foreground transition-colors hover:bg-accent/60 hover:text-foreground"
+        >
+          <Plus className="h-3.5 w-3.5" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start" className="min-w-56">
+        {builtIns.map((item) => (
+          <DropdownMenuItem key={item.id} onSelect={() => onBuiltIn(item.id)}>
+            <item.icon className="h-3.5 w-3.5" />
+            {item.label}
+          </DropdownMenuItem>
+        ))}
+        <DropdownMenuSeparator />
+        <DropdownMenuLabel className="text-xs text-muted-foreground">
+          Plugins and MCPs
+        </DropdownMenuLabel>
+        {entrypoints.length === 0 ? (
+          <DropdownMenuItem disabled>No side panels in this chat</DropdownMenuItem>
+        ) : (
+          entrypoints.map((entry) => (
+            <DropdownMenuItem
+              key={`${entry.server.serverId}:${entry.declaration.toolName}`}
+              onSelect={() => onEntrypoint(entry)}
+            >
+              <ExtensionIcon
+                kind="sidebar"
+                theme={theme}
+                size={14}
+                sources={entrypointIconSources(
+                  iconDirectory,
+                  entry.server,
+                  entry.declaration,
+                )}
+              />
+              <span className="truncate">{entry.declaration.title}</span>
+              {(titles.get(entry.declaration.title) ?? 0) > 1 ? (
+                <span className="ms-auto truncate text-xs text-muted-foreground">
+                  {entry.server.name}
+                </span>
+              ) : null}
+            </DropdownMenuItem>
+          ))
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+/** Which machine this project's computer work runs on. Indicator only. */
+function RailEngineChip({ engine }: { engine: "local" | "cloud" }) {
+  const isLocal = engine === "local";
+  const Icon = isLocal ? Laptop : Cloud;
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-2 py-0.5 text-[10px] font-medium text-muted-foreground"
+      data-testid="rail-engine-chip"
+      title="Switch engines from the Computer tab"
+    >
+      <Icon className="size-3" aria-hidden />
+      {isLocal ? "This machine" : "Cloud computer"}
+    </span>
+  );
+}
+
+/**
+ * The Shell body for the local engine: no cloud controller, no reserve — the
+ * same bare `ComputerTerminal` the Computer tab's local face mounts, behind
+ * the same explicit "Open terminal" gesture the cloud body uses. Explicit
+ * because a PTY is a real shell on the user's machine: both rail bodies stay
+ * mounted across Logs ⇄ Shell toggles, so mounting eagerly would open a shell
+ * the moment the Playground loads, without the user asking for one.
+ */
+function LocalShellBody({
+  engine,
+  projectId,
+}: {
+  engine: ComputerEngineState;
+  projectId: string | null;
+}) {
+  const { consent, localTerminalAvailable } = engine;
+  const themeMode = usePreferencesStore((state) => state.themeMode);
+  const [terminalOpen, setTerminalOpen] = useState(false);
+
+  // A fresh nonce per (re)connect — single-use by construction, so the
+  // reconnect button in `ComputerTerminal` must mint again rather than replay.
+  const consentToken = consent.token;
+  const mintToken = useCallback(
+    () => mintLocalTerminalNonce({ projectId: projectId ?? "", consentToken }),
+    [projectId, consentToken],
+  );
+
+  const canOpenTerminal =
+    consent.granted && localTerminalAvailable && !!projectId;
+  const showTerminal = terminalOpen && canOpenTerminal;
+
+  // One `computer_terminal_opened` per opened SESSION, keyed like the Computer
+  // tab's local face: a project switch remounts the terminal (new shell, new
+  // workspace) and must be counted even though this component didn't remount.
+  const lastReportedRef = useRef<string | null>(null);
+  useEffect(() => {
+    const key = showTerminal ? `open:${projectId}` : null;
+    if (lastReportedRef.current === key) return;
+    lastReportedRef.current = key;
+    if (key === null) return;
+    track("computer_terminal_opened", { location: "playground_rail_local" });
+  }, [showTerminal, projectId]);
+
+  return (
+    <>
+      <div className="flex shrink-0 items-center justify-between gap-2 px-3 py-2">
+        {/* Same `toggleVisible` gate as the cloud body: with only one engine
+            available there is no choice to indicate, and the body copy below
+            already names the machine. */}
+        {engine.toggleVisible ? (
+          <RailEngineChip engine={engine.engine} />
+        ) : null}
+        {!terminalOpen && canOpenTerminal ? (
+          <Button size="sm" onClick={() => setTerminalOpen(true)}>
+            <TerminalSquare className="mr-1.5 h-3.5 w-3.5" />
+            Open terminal
+          </Button>
+        ) : null}
+      </div>
+      <div className="min-h-0 flex-1 px-3 pb-3">
+        {!consent.granted ? (
+          // A pointer, NOT a second consent gate: the Computer tab owns the
+          // grant (and the blunt copy that goes with it).
+          <PaneMessage dashed>
+            <span data-testid="rail-local-unconsented">
+              This machine isn&apos;t authorized yet. Open the Computer tab to
+              allow agent commands here.
+            </span>
+          </PaneMessage>
+        ) : showTerminal ? (
+          // `uploadEnabled={false}` for the same reason as the Computer tab's
+          // local pane: the drag-and-drop upload posts to the CLOUD box's
+          // upload route, and writing dropped files onto the user's real
+          // filesystem is a separate consent question.
+          <ComputerTerminal
+            // Keyed by project: `ComputerTerminal` connects from a MOUNT-ONLY
+            // effect, so a project switch must remount into the new project's
+            // workspace (and journal under it).
+            key={projectId}
+            mintToken={mintToken}
+            themeMode={themeMode === "dark" ? "dark" : "light"}
+            wsPath={LOCAL_TERMINAL_WS_PATH}
+            uploadEnabled={false}
+            className="h-full"
+          />
+        ) : canOpenTerminal ? (
+          <PaneMessage dashed>
+            <span data-testid="rail-local-terminal-pointer">
+              Open the terminal to use a shell on this machine.
+            </span>
+          </PaneMessage>
+        ) : (
+          <PaneMessage dashed>
+            <span data-testid="rail-local-terminal-unavailable">
+              The terminal for this machine isn&apos;t available. Agents can
+              still run bash commands here from chat.
+            </span>
+          </PaneMessage>
+        )}
+      </div>
+    </>
+  );
+}
+
+/** The Shell body for the cloud engine — unchanged behavior. */
+function CloudShellBody({
+  engine,
+  projectId,
+  isAuthenticated,
+  hostConfig,
+  hostId,
+}: {
+  engine: ComputerEngineState;
+  projectId: string | null;
+  isAuthenticated: boolean;
+  hostConfig: HostConfigDtoV2 | null;
+  hostId: string | null;
+}) {
+  // One controller for the rail so the terminal session survives Logs ⇄ Shell
+  // toggles (both bodies stay mounted; we only show/hide).
+  const ct = useComputerTerminal({ projectId, isAuthenticated });
+  // Open the terminal in the harness session workdir — but only for harness
+  // hosts (plain computer hosts have no such dir → home).
+  const isHarnessHost = !!hostConfig?.harness;
+  // Read with the SAME key the chat stream writes (previewedHostId), not
+  // hostConfig.id — those are different identifiers and would never match.
+  const streamedWorkdir = useHarnessWorkdir(projectId, hostId);
+  // The latest turn of the conversation on screen ran on its DISPOSABLE
+  // computer (a harness that signs in with your own account), not the one this
+  // terminal opens. Per conversation: a compare column or another chat on the
+  // same host says nothing about this one.
+  const activeChatSessionId = useActiveChatSessionStore(
+    (state) => state.sessionId,
+  );
+  const ranOnDisposable = useHarnessRanOnDisposable(activeChatSessionId);
+  // COMP-16: open the terminal in the configured working directory. For a
+  // harness host use the streamed per-session dir; for a plain computer host
+  // fall back to the host-configured `computer.workdir` (the same dir the bash
+  // tool runs in) so the Shell opens where the model works.
+  const harnessCwd = isHarnessHost
+    ? ranOnDisposable
+      ? undefined
+      : streamedWorkdir
+    : hostConfig?.computer?.workdir;
+  // Only offer "Open terminal" once the data-plane config has resolved to a
+  // usable plane — opening while it's still loading mounts the terminal at the
+  // page origin; opening with no plane reserves a computer it can't reach.
+  const canOpenTerminal =
+    ct.dataPlaneResolved &&
+    !ct.dataPlaneUnavailable &&
+    isAuthenticated &&
+    !!projectId;
+
+  return (
+    <>
+      <div className="flex shrink-0 items-center justify-between gap-2 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <ComputerStatusChip
+            status={ct.liveStatus}
+            hibernatedReason={ct.status?.hibernatedReason}
+          />
+          {engine.toggleVisible ? <RailEngineChip engine="cloud" /> : null}
+        </div>
+        {!ct.terminalOpen && canOpenTerminal ? (
+          <Button
+            size="sm"
+            onClick={() => void ct.openTerminal()}
+            disabled={ct.starting}
+          >
+            {ct.starting ? (
+              <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <TerminalSquare className="mr-1.5 h-3.5 w-3.5" />
+            )}
+            Open terminal
+          </Button>
+        ) : null}
+      </div>
+      {isHarnessHost && ranOnDisposable ? (
+        <p
+          data-testid="shell-rail-disposable-notice"
+          className="mx-3 mb-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          The last turn ran on a disposable computer for this conversation, not
+          your personal computer. This terminal is your personal computer, so
+          the turn's files aren't here.
+        </p>
+      ) : null}
+      {/* The Shell is there to watch where the harness works, so it FOLLOWS
+          the harness's workdir: cwd only applies at connect time, and keying
+          the pane on it reconnects the terminal there as soon as the dir is
+          known or a new harness session moves it. Within a conversation the
+          dir is stable, so an open terminal is not disturbed between turns. */}
+      <ComputerTerminalPane
+        key={harnessCwd ?? ""}
+        controller={ct}
+        className="px-3 pb-3"
+        {...(harnessCwd ? { cwd: harnessCwd } : {})}
+      />
+    </>
+  );
+}
+
+function TabButton({
+  icon: Icon,
+  label,
+  isActive,
+  onClick,
+}: {
+  icon: typeof FileText;
+  label: string;
+  isActive: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "flex items-center gap-1.5 rounded-md px-2 py-1 text-xs font-medium transition-colors",
+        isActive
+          ? "bg-accent text-foreground"
+          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+      )}
+      aria-pressed={isActive}
+    >
+      <Icon className="h-3.5 w-3.5" />
+      {label}
+    </button>
+  );
+}

@@ -1,0 +1,516 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "maple",
+  "icons": {
+    "library": "lucide"
+  },
+  "name": "MCPJam Inspector",
+  "colors": {
+    "primary": "#e07856",
+    "light": "#f08c6b",
+    "dark": "#c96442"
+  },
+  "background": {
+    "color": {
+      "light": "#faf9f5",
+      "dark": "#262624"
+    }
+  },
+  "appearance": {
+    "default": "light",
+    "strict": false
+  },
+  "fonts": {
+    "heading": {
+      "family": "Geist",
+      "weight": 500,
+      "source": "/fonts/geist-latin-500-normal.woff2",
+      "format": "woff2"
+    },
+    "body": {
+      "family": "Geist",
+      "weight": 400,
+      "source": "/fonts/geist-latin-400-normal.woff2",
+      "format": "woff2"
+    }
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": "css-variables"
+    }
+  },
+  "favicon": "/mcp_jam.svg",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Get Started",
+        "pages": [
+          "index",
+          "getting-started",
+          "installation",
+          "hosted/overview",
+          "hosted/slack",
+          "hosted/claude-connector",
+          "hosted/sso",
+          "hosted/network",
+          "github-checks",
+          "troubleshooting/common-errors",
+          "troubleshooting/error-codes",
+          "changelog/overview"
+        ]
+      },
+      {
+        "tab": "Inspector",
+        "groups": [
+          {
+            "group": "Connect",
+            "icon": "plug",
+            "pages": [
+              "inspector/home",
+              "inspector/clients",
+              "inspector/connecting-servers",
+              "inspector/projects",
+              "inspector/plugins",
+              "inspector/protocol-versions",
+              "inspector/host-compat",
+              "inspector/skills"
+            ]
+          },
+          {
+            "group": "MCP Apps",
+            "icon": "layout-dashboard",
+            "pages": [
+              "inspector/playground",
+              "inspector/evals",
+              "inspector/compatibility",
+              "inspector/view-origins",
+              "inspector/host-templates"
+            ]
+          },
+          {
+            "group": "Authentication",
+            "icon": "shield-check",
+            "pages": [
+              "inspector/guided-oauth",
+              "inspector/xaa-debugger",
+              "inspector/lazy-authentication"
+            ]
+          },
+          {
+            "group": "Primitives",
+            "icon": "puzzle",
+            "pages": [
+              "inspector/tools-prompts-resources",
+              "inspector/events",
+              "inspector/debugging"
+            ]
+          },
+          {
+            "group": "Privacy",
+            "icon": "eye-off",
+            "pages": [
+              "inspector/telemetry-privacy"
+            ]
+          },
+          {
+            "group": "Embedding",
+            "icon": "code",
+            "pages": ["inspector/launch-from-code", "inspector/docs-server"]
+          },
+          {
+            "group": "Recipes",
+            "icon": "map",
+            "pages": ["guides/first-mcp-app", "guides/first-chatgpt-app-react"]
+          }
+        ]
+      },
+      {
+        "tab": "CLI",
+        "groups": [
+          {
+            "group": "Guides",
+            "icon": "map",
+            "pages": [
+              "cli/overview",
+              "cli/migration",
+              "cli/local-evals",
+              "cli/mcp-server",
+              "cli/server-inspection",
+              "cli/oauth-conformance",
+              "cli/oauth-login",
+              "cli/xaa",
+              "cli/apps-conformance",
+              "cli/tasks",
+              "cli/tasks-conformance",
+              "cli/events",
+              "cli/tools-resources-prompts",
+              "cli/ci",
+              "cli/self-hosted",
+              "cli/telemetry"
+            ]
+          },
+          {
+            "group": "Reference",
+            "icon": "book",
+            "pages": ["cli/reference"]
+          }
+        ]
+      },
+      {
+        "tab": "SDK",
+        "tag": "v9",
+        "groups": [
+          {
+            "group": "Get Started",
+            "icon": "rocket",
+            "pages": ["sdk/index", "sdk/quickstart", "sdk/migrating-to-v9", "sdk/migrating-to-v3"]
+          },
+          {
+            "group": "Concepts",
+            "icon": "map",
+            "pages": [
+              "sdk/concepts/connecting-servers",
+              "sdk/concepts/testing-with-llms",
+              "sdk/concepts/running-evals",
+              "sdk/concepts/enterprise-evals",
+              "sdk/concepts/user-value-chain",
+              "sdk/concepts/saving-results",
+              "sdk/concepts/multi-provider"
+            ]
+          },
+          {
+            "group": "Reference",
+            "icon": "book",
+            "pages": [
+              "sdk/reference/mcp-client-manager",
+              "sdk/reference/host-runner",
+              "sdk/reference/prompt-result",
+              "sdk/reference/eval-test",
+              "sdk/reference/eval-suite",
+              "sdk/reference/eval-reporting",
+              "sdk/reference/run-suite-file",
+              "sdk/reference/validators",
+              "sdk/reference/llm-providers",
+              "sdk/reference/protocol-conformance",
+              "sdk/reference/oauth-conformance",
+              "sdk/reference/oauth-emulation",
+              "sdk/reference/apps-conformance",
+              "sdk/reference/tasks-conformance",
+              "sdk/reference/events",
+              "sdk/reference/host-compat",
+              "sdk/reference/muse-readiness"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API",
+        "tag": "Preview",
+        "groups": [
+          {
+            "group": "API Guides",
+            "icon": "map",
+            "pages": ["reference/public-api", "reference/api-keys"]
+          },
+          {
+            "group": "Endpoints",
+            "icon": "braces",
+            "openapi": "reference/openapi.json"
+          }
+        ]
+      }
+    ],
+    "global": {
+      "anchors": [
+        {
+          "anchor": "Discord",
+          "href": "https://discord.gg/JEnDtz8X6z",
+          "icon": "discord"
+        },
+        {
+          "anchor": "GitHub",
+          "href": "https://github.com/MCPJam/inspector",
+          "icon": "github"
+        },
+        {
+          "anchor": "Website",
+          "href": "https://mcpjam.com",
+          "icon": "globe"
+        }
+      ]
+    }
+  },
+  "logo": {
+    "light": "/logo/mcp_jam_light.png",
+    "dark": "/logo/mcp_jam_dark.png"
+  },
+  "redirects": [
+    {
+      "source": "/inspector/workspaces",
+      "destination": "/inspector/projects"
+    },
+    {
+      "source": "/inspector/chat",
+      "destination": "/inspector/playground"
+    },
+    {
+      "source": "/inspector/app-builder",
+      "destination": "/inspector/playground"
+    },
+    {
+      "source": "/inspector/test-cases",
+      "destination": "/inspector/evals"
+    },
+    {
+      "source": "/inspector/xaa-test-idp",
+      "destination": "/inspector/xaa-debugger"
+    },
+    {
+      "source": "/inspector/views",
+      "destination": "/inspector/playground"
+    },
+    {
+      "source": "/inspector/llm-playground",
+      "destination": "/inspector/playground"
+    },
+    {
+      "source": "/inspector/elicitation",
+      "destination": "/inspector/playground"
+    },
+    {
+      "source": "/inspector/server",
+      "destination": "/inspector/connecting-servers"
+    },
+    {
+      "source": "/sdk/reference/test-agent",
+      "destination": "/sdk/reference/host-runner"
+    },
+    {
+      "source": "/api-reference/chatboxes/get-a-chatbox",
+      "destination": "/api-reference/studies/get-a-study"
+    },
+    {
+      "source": "/api-reference/chatboxes/list-a-projects-chatboxes",
+      "destination": "/api-reference/studies/list-a-projects-scenarios"
+    },
+    {
+      "source": "/api-reference/computer-environments/boot-your-computer-from-an-environment",
+      "destination": "/api-reference/sandbox-images/boot-your-computer-from-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/build-a-computer-environment",
+      "destination": "/api-reference/sandbox-images/build-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/create-a-computer-environment",
+      "destination": "/api-reference/sandbox-images/create-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/delete-a-computer-environment",
+      "destination": "/api-reference/sandbox-images/delete-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/get-a-computer-environment",
+      "destination": "/api-reference/sandbox-images/get-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/list-a-projects-computer-environments",
+      "destination": "/api-reference/sandbox-images/list-a-projects-sandbox-images"
+    },
+    {
+      "source": "/api-reference/computer-environments/list-an-environments-builds",
+      "destination": "/api-reference/sandbox-images/list-a-sandbox-images-builds"
+    },
+    {
+      "source": "/api-reference/computer-environments/reset-your-computer-to-its-image",
+      "destination": "/api-reference/sandbox-images/reset-your-computer-to-its-image"
+    },
+    {
+      "source": "/api-reference/computer-environments/share-an-environment-with-the-project",
+      "destination": "/api-reference/sandbox-images/share-a-sandbox-image-with-the-project"
+    },
+    {
+      "source": "/api-reference/computer-environments/update-a-computer-environment",
+      "destination": "/api-reference/sandbox-images/update-a-sandbox-image"
+    },
+    {
+      "source": "/api-reference/hosts/create-a-host-from-a-template-or-a-full-config",
+      "destination": "/api-reference/clients/create-a-client-from-a-template-or-a-full-config"
+    },
+    {
+      "source": "/api-reference/hosts/delete-a-host",
+      "destination": "/api-reference/clients/delete-a-client"
+    },
+    {
+      "source": "/api-reference/hosts/duplicate-a-host",
+      "destination": "/api-reference/clients/duplicate-a-client"
+    },
+    {
+      "source": "/api-reference/hosts/get-a-host",
+      "destination": "/api-reference/clients/get-a-client"
+    },
+    {
+      "source": "/api-reference/hosts/list-a-projects-hosts",
+      "destination": "/api-reference/clients/list-a-projects-clients"
+    },
+    {
+      "source": "/api-reference/hosts/replace-a-hosts-server-attachments",
+      "destination": "/api-reference/clients/replace-a-clients-servers"
+    },
+    {
+      "source": "/api-reference/hosts/update-a-host",
+      "destination": "/api-reference/clients/update-a-client"
+    },
+    {
+      "source": "/api-reference/scenarios/get-a-scenario",
+      "destination": "/api-reference/studies/get-a-study"
+    },
+    {
+      "source": "/api-reference/scenarios/list-a-projects-scenarios",
+      "destination": "/api-reference/studies/list-a-projects-scenarios"
+    },
+    {
+      "source": "/api-reference/swarm-insights/cancel-a-pending-wave-insights-generation",
+      "destination": "/api-reference/swarm-insights/cancel-a-pending-swarm-run-insights-generation"
+    },
+    {
+      "source": "/api-reference/swarm-insights/get-wave-insights",
+      "destination": "/api-reference/swarm-insights/get-swarm-run-insights"
+    },
+    {
+      "source": "/api-reference/swarm-insights/request-wave-insights",
+      "destination": "/api-reference/swarm-insights/request-swarm-run-insights"
+    },
+    {
+      "source": "/api-reference/user-testing/cancel-a-windows-generation",
+      "destination": "/api-reference/studies/cancel-a-windows-generation"
+    },
+    {
+      "source": "/api-reference/user-testing/current-window-signals",
+      "destination": "/api-reference/studies/current-window-signals"
+    },
+    {
+      "source": "/api-reference/user-testing/dismiss-a-finding",
+      "destination": "/api-reference/studies/dismiss-a-finding"
+    },
+    {
+      "source": "/api-reference/user-testing/get-a-scenario",
+      "destination": "/api-reference/studies/get-a-study"
+    },
+    {
+      "source": "/api-reference/user-testing/get-a-session-transcript",
+      "destination": "/api-reference/studies/get-a-session-transcript"
+    },
+    {
+      "source": "/api-reference/user-testing/invite-a-member",
+      "destination": "/api-reference/studies/invite-a-member"
+    },
+    {
+      "source": "/api-reference/user-testing/list-a-scenarios-sessions",
+      "destination": "/api-reference/studies/list-a-scenarios-sessions"
+    },
+    {
+      "source": "/api-reference/user-testing/list-scenario-findings",
+      "destination": "/api-reference/studies/list-scenario-findings"
+    },
+    {
+      "source": "/api-reference/user-testing/point-a-scenario-at-a-different-environment",
+      "destination": "/api-reference/studies/point-a-scenario-at-a-different-environment"
+    },
+    {
+      "source": "/api-reference/user-testing/publish-an-environment-for-user-testing",
+      "destination": "/api-reference/studies/publish-an-environment-for-user-testing"
+    },
+    {
+      "source": "/api-reference/user-testing/read-a-windows-insights",
+      "destination": "/api-reference/studies/read-a-windows-insights"
+    },
+    {
+      "source": "/api-reference/user-testing/remove-a-member",
+      "destination": "/api-reference/studies/remove-a-member"
+    },
+    {
+      "source": "/api-reference/user-testing/request-insights-for-the-current-window",
+      "destination": "/api-reference/studies/request-insights-for-the-current-window"
+    },
+    {
+      "source": "/api-reference/user-testing/restore-a-dismissed-finding",
+      "destination": "/api-reference/studies/restore-a-dismissed-finding"
+    },
+    {
+      "source": "/api-reference/user-testing/rotate-the-share-link",
+      "destination": "/api-reference/studies/rotate-the-share-link"
+    },
+    {
+      "source": "/api-reference/user-testing/session-metrics",
+      "destination": "/api-reference/studies/session-metrics"
+    },
+    {
+      "source": "/api-reference/user-testing/set-the-guest-execution-caps",
+      "destination": "/api-reference/studies/set-the-guest-execution-caps"
+    },
+    {
+      "source": "/api-reference/user-testing/unpublish-an-environment",
+      "destination": "/api-reference/studies/unpublish-an-environment"
+    },
+    {
+      "source": "/api-reference/user-testing/update-a-scenario",
+      "destination": "/api-reference/studies/update-a-scenario"
+    },
+    {
+      "source": "/api-reference/user-testing/usage-breakdown",
+      "destination": "/api-reference/studies/usage-breakdown"
+    }
+  ],
+  "navbar": {
+    "links": [
+      {
+        "label": "GitHub",
+        "href": "https://github.com/MCPJam/inspector"
+      }
+    ]
+  },
+  "contextual": {
+    "options": [
+      "copy",
+      "view",
+      "chatgpt",
+      "claude",
+      "perplexity",
+      "mcp",
+      "cursor",
+      "vscode"
+    ]
+  },
+  "footer": {
+    "socials": {
+      "discord": "https://discord.gg/JEnDtz8X6z",
+      "github": "https://github.com/MCPJam/inspector",
+      "website": "https://mcpjam.com",
+      "linkedin": "https://www.linkedin.com/company/109011364/",
+      "x": "https://x.com/mcpjams"
+    },
+    "links": [
+      {
+        "header": "Legal",
+        "items": [
+          {
+            "label": "Privacy Policy",
+            "href": "https://www.mcpjam.com/privacy-policy"
+          },
+          {
+            "label": "Terms of Use",
+            "href": "https://www.mcpjam.com/terms-of-use"
+          }
+        ]
+      }
+    ]
+  },
+  "errors": {
+    "404": {
+      "redirect": false,
+      "title": "Lost in the inspector?",
+      "description": "Try the [getting started guide](/getting-started), the [CLI overview](/cli/overview), or the [SDK reference](/sdk/index). Related pages are listed below."
+    }
+  }
+}

@@ -1,0 +1,473 @@
+/**
+ * Picker row → saved {@link ModelSelection}.
+ *
+ * A picker row (`ModelDefinition`) knows whose credentials it runs on — the
+ * hosted catalog, an organization provider connection, or a key on this
+ * machine — but a bare model id does not, and that knowledge used to be
+ * dropped at every save. These helpers turn the row into the saved selection
+ * shape (`@mcpjam/sdk`) so the choice survives save → reload → run.
+ *
+ * Pure: no React, no network, no secrets. A selection names a connection
+ * (`connectionRef`), never a key.
+ *
+ * ## Model id rule
+ *
+ * A selection's `modelId` is a canonical `provider/model` id: lowercase
+ * provider segment (it may contain `:`), canonical vendor spellings
+ * (`x-ai/`, `z-ai/`, `meta-llama/`, `mistralai/`, `qwen/` — never the Gateway
+ * wire spellings `xai/`, `zai/`, `meta/`, `mistral/`, `alibaba/`).
+ * {@link canonicalSelectionModelId} derives it from the picker row:
+ *
+ *  - an id that already has a lowercase `provider/` prefix is kept, with a
+ *    Gateway-spelled prefix rewritten (`xai/grok-4` → `x-ai/grok-4`) — hosted
+ *    catalog rows, OpenRouter rows, static Azure rows;
+ *  - a bare own-provider id gets the canonical id `canonicalModelIdForNative`
+ *    (`shared/canonical-model-id.ts`) derives: a reviewed exception first
+ *    (Anthropic's dashed `claude-sonnet-4-5` → `anthropic/claude-sonnet-4.5`),
+ *    then the catalog's own `<vendor>/<id>` entry (`grok-4.5` (xai) →
+ *    `spacexai/grok-4.5`), else the provider's vendor prefix (`gpt-5.1`
+ *    (openai) → `openai/gpt-5.1`, a Bedrock model id → `bedrock/<id>`);
+ *  - local namespaces that name no catalog model: Ollama `llama3.2:latest` →
+ *    `ollama/llama3.2:latest`, custom `custom:<slug>:<model>` →
+ *    `custom:<slug>/<model>`.
+ *
+ * Whenever the canonical id differs from the row id on an own-provider row,
+ * the row id goes in `nativeModelId` — it is what the provider API is called
+ * with, and what the runner executes. A row that names its native id
+ * explicitly (`ModelDefinition.nativeModelId`: an org Azure row's deployment
+ * name) puts that in `nativeModelId` instead. Anything that still fails the SDK
+ * validator yields `null` (keep the legacy id).
+ *
+ * ## Persisting beside a legacy id
+ *
+ * Every storage boundary keeps its legacy id field (`model`, `modelId`,
+ * `judgeModel`) and requires `selection.modelId` to equal it exactly. A
+ * writer that stores a selection therefore stores `selection.modelId` as the
+ * legacy id too ({@link storedModelChoice}); readers map it back to the picker
+ * row with {@link findModelForStoredChoice}.
+ */
+import {
+  defaultFallbackForPurpose,
+  selectionKey,
+  validateModelSelection,
+  type ModelConnectionRef,
+  type LegacyModelSelection,
+  type ModelSelection,
+  type ModelSelectionPurpose,
+  type RequestedModelSelection,
+} from "@mcpjam/sdk/browser";
+import { getCanonicalModelId, type ModelDefinition } from "@/shared/types";
+import {
+  PROVIDER_SEGMENT,
+  canonicalModelIdForNative,
+  canonicalPrefix,
+} from "@/shared/canonical-model-id";
+import {
+  isMCPJamProvidedModelMenuItem,
+  type OrgVisibleConfig,
+} from "./model-helpers";
+
+/** A row MCPJam's own credentials serve (the hosted catalog). */
+export function isHostedRow(model: ModelDefinition): boolean {
+  return model.hosted === true || isMCPJamProvidedModelMenuItem(model);
+}
+
+/** `custom:<slug>` for custom rows, else the row's provider. */
+export function providerKeyForModelDefinition(model: ModelDefinition): string {
+  const provider = String(model.provider);
+  if (provider === "custom" && model.customProviderName) {
+    return `custom:${model.customProviderName}`;
+  }
+  return provider;
+}
+
+/**
+ * A picker row's identity: `${source}:${connectionRef?.id ?? providerKey}:${modelId}`.
+ *
+ * The raw row id alone collides: one id can be listed by the hosted catalog
+ * and again under an org OpenRouter connection (or two org connections), and
+ * a picker keyed by id checks, highlights and toggles both rows as one. The
+ * source and connection part keeps them apart. `source` is `hosted` for
+ * MCPJam rows, `org` for rows stamped with an org provider, else `local`;
+ * the connection is the org provider row id when the stamp carries one, else
+ * the provider key (`custom:<slug>` for custom providers).
+ */
+export function modelRowKey(model: ModelDefinition): string {
+  const source = isHostedRow(model)
+    ? "hosted"
+    : model.orgProvider
+      ? "org"
+      : "local";
+  const connection =
+    model.orgProvider?.id?.trim() || providerKeyForModelDefinition(model);
+  return `${source}:${connection}:${String(model.id)}`;
+}
+
+/**
+ * Canonical selection `modelId` for a picker row (see the module comment), or
+ * `null` when none can be formed.
+ */
+export function canonicalSelectionModelId(
+  model: ModelDefinition,
+): string | null {
+  let raw = String(model.id ?? "").trim();
+  if (!raw) return null;
+  if (isHostedRow(model)) {
+    raw = getCanonicalModelId(raw, String(model.provider));
+  }
+  const slash = raw.indexOf("/");
+  if (slash > 0 && PROVIDER_SEGMENT.test(raw.slice(0, slash))) {
+    return `${canonicalPrefix(raw.slice(0, slash))}${raw.slice(slash)}`;
+  }
+  if (isHostedRow(model)) return null;
+  const provider = String(model.provider ?? "").toLowerCase();
+  if (provider === "custom") {
+    const name = model.customProviderName;
+    if (!name) return null;
+    const prefix = `custom:${name}:`;
+    const native = raw.startsWith(prefix) ? raw.slice(prefix.length) : raw;
+    return native ? `custom:${name.toLowerCase()}/${native}` : null;
+  }
+  if (provider === "ollama") return `ollama/${raw}`;
+  return canonicalModelIdForNative(provider, raw);
+}
+
+/**
+ * The org provider row that serves this picker row, when the list came from
+ * an org config. Mirrors `buildAvailableModelsFromOrgConfig`: one row per
+ * provider key; an org Ollama row only serves the ids it lists (a locally
+ * detected Ollama model appended to an org list is the user's own).
+ */
+export function findOrgProviderForModel(
+  model: ModelDefinition,
+  orgConfig: OrgVisibleConfig | undefined,
+): OrgVisibleConfig["providers"][number] | undefined {
+  if (!orgConfig?.providers?.length) return undefined;
+  const key = providerKeyForModelDefinition(model);
+  const row = orgConfig.providers.find(
+    (provider) => provider.providerKey === key && provider.enabled,
+  );
+  if (!row) return undefined;
+  if (key === "ollama") {
+    return row.modelIds?.includes(String(model.id)) ? row : undefined;
+  }
+  return row;
+}
+
+function localConnectionRef(model: ModelDefinition): ModelConnectionRef {
+  const provider = String(model.provider);
+  if (provider === "custom" && model.customProviderName) {
+    return {
+      kind: "localProvider",
+      providerKey: "custom",
+      customProviderName: model.customProviderName,
+    };
+  }
+  return { kind: "localProvider", providerKey: provider };
+}
+
+/**
+ * Build the saved selection for a picker row.
+ *
+ *  - hosted rows → `source: "hosted"`, no connection;
+ *  - own-provider rows served by an org provider config (the row's
+ *    `orgProvider` stamp, else a lookup in `orgConfig`) → `source: "org"`
+ *    with `{ kind: "orgProvider", id }`. When the org config does not expose
+ *    the provider row's id, returns `null`: a provider NAME cannot stand in for
+ *    the connection, so the caller keeps the legacy id;
+ *  - every other own-provider row (the user's local keys, locally detected
+ *    Ollama, local custom providers) → `source: "local"` with
+ *    `{ kind: "localProvider", providerKey, customProviderName? }`.
+ *
+ * `fallback` is the purpose's default (`defaultFallbackForPurpose`). Returns
+ * `null` when the row cannot be expressed as a valid selection. The result is
+ * validated by the SDK, which rejects any field outside the shape — a key can
+ * never ride along.
+ */
+export function modelSelectionFromDefinition(
+  model: ModelDefinition,
+  orgConfig: OrgVisibleConfig | undefined,
+  purpose: ModelSelectionPurpose,
+): ModelSelection | null {
+  const modelId = canonicalSelectionModelId(model);
+  if (!modelId) return null;
+  const fallback = defaultFallbackForPurpose(purpose);
+
+  let candidate: ModelSelection;
+  if (isHostedRow(model)) {
+    candidate = { modelId, source: "hosted", fallback };
+  } else {
+    const rowId = String(model.id).trim();
+    // An explicit native id on the row (an org Azure row's deployment name)
+    // wins: it is chosen, not derived from the row id.
+    const explicitNativeId = model.nativeModelId?.trim();
+    const nativeModelId = explicitNativeId
+      ? { nativeModelId: explicitNativeId }
+      : rowId !== modelId
+        ? { nativeModelId: rowId }
+        : undefined;
+    // The row's own stamp (rows built from an org config carry it) wins;
+    // otherwise look the row up in the org config the caller passed.
+    const orgRow =
+      model.orgProvider ?? findOrgProviderForModel(model, orgConfig);
+    if (orgRow) {
+      const id = typeof orgRow.id === "string" ? orgRow.id.trim() : "";
+      if (!id) return null;
+      candidate = {
+        modelId,
+        source: "org",
+        connectionRef: { kind: "orgProvider", id },
+        ...nativeModelId,
+        fallback,
+      };
+    } else {
+      candidate = {
+        modelId,
+        source: "local",
+        connectionRef: localConnectionRef(model),
+        ...nativeModelId,
+        fallback,
+      };
+    }
+  }
+
+  const result = validateModelSelection(candidate);
+  return result.ok ? result.selection : null;
+}
+
+/**
+ * What a writer stores for a picked row: the legacy id field plus, when the
+ * row can be expressed as one, the selection. With a selection the legacy id
+ * IS `selection.modelId` (every storage boundary requires the two to agree);
+ * without one it is the row id, exactly as before.
+ */
+export type StoredModelChoice = {
+  modelId: string;
+  selection?: ModelSelection;
+};
+
+export function storedModelChoice(
+  model: ModelDefinition,
+  orgConfig: OrgVisibleConfig | undefined,
+  purpose: ModelSelectionPurpose,
+): StoredModelChoice {
+  const selection = modelSelectionFromDefinition(model, orgConfig, purpose);
+  return selection
+    ? { modelId: selection.modelId, selection }
+    : { modelId: String(model.id) };
+}
+
+/**
+ * The own-key rows a stored legacy selection ("own key only") may run on: the
+ * rows with its id, never a hosted one, narrowed by the provider hint when it
+ * has one. A locked row (an org connection out of credits beside a personal
+ * key) cannot run the model, so enabled rows win when there are any. The
+ * caller decides what more than one candidate means: the hosts page takes
+ * none (an effort pick mints a selection from the row, so it must be the
+ * right one), a compare card takes the first (its picker stores twins
+ * identically, so a pick must still render).
+ */
+export function ownKeyRowsForLegacySelection(
+  selection: LegacyModelSelection,
+  models: readonly ModelDefinition[],
+): ModelDefinition[] {
+  const id = selection.modelId.trim();
+  const hint = selection.provider;
+  const own = models.filter(
+    (model) => String(model.id) === id && !isHostedRow(model),
+  );
+  const named = hint
+    ? own.filter((model) => String(model.provider) === hint)
+    : own;
+  const enabled = named.filter((model) => model.disabled !== true);
+  return enabled.length > 0 ? enabled : named;
+}
+
+/**
+ * The picker row a stored choice refers to.
+ *
+ * With a selection: the row whose own selection has the same `selectionKey`
+ * (same source, same connection, same model) — so an id listed both in the
+ * hosted catalog and under an org OpenRouter connection resolves to the row
+ * that was actually picked — else, for an org selection, the row on the same
+ * connection with the same native id ({@link orgRowForNativeModel}). With a
+ * stored legacy selection ("own key only"):
+ * the one own-key row with that id (narrowed by the provider hint when it
+ * has one; a disabled row does not count against an enabled one); none when
+ * several qualify, since the legacy fields cannot say which connection ran
+ * it, and none rather than the hosted twin, which would move the model onto
+ * MCPJam credits. With no selection at all (a bare id saved before
+ * selections): the row with that id, hosted rows first, exactly as the
+ * legacy read did.
+ *
+ * Set `exactSelection` while the organization requires its own keys. A choice
+ * must name a saved selection with that same source and connection; no
+ * legacy id fallback is allowed. Otherwise a hosted or legacy choice would
+ * look allowed whenever an org connection lists its id.
+ */
+export function findModelForStoredChoice(
+  choice: { modelId: string; selection?: RequestedModelSelection | null },
+  models: readonly ModelDefinition[],
+  orgConfig: OrgVisibleConfig | undefined,
+  { exactSelection = false }: { exactSelection?: boolean } = {},
+): ModelDefinition | undefined {
+  const id = choice.modelId.trim();
+  if (choice.selection?.source === "legacy") {
+    // A legacy selection names no connection, so a strict lookup has nothing
+    // to match it against.
+    if (exactSelection) return undefined;
+    const rows = ownKeyRowsForLegacySelection(choice.selection, models);
+    return rows.length === 1 ? rows[0] : undefined;
+  }
+  if (choice.selection) {
+    const wanted = selectionKey(choice.selection);
+    const match = models.find((model) => {
+      const own = modelSelectionFromDefinition(model, orgConfig, "chat");
+      return own !== null && selectionKey(own) === wanted;
+    });
+    if (match) return match;
+    const sameModel = orgRowForNativeModel(choice.selection, models, orgConfig);
+    if (sameModel || exactSelection) return sameModel;
+  }
+  if (exactSelection) return undefined;
+  return (
+    models.find((model) => String(model.id) === id && isHostedRow(model)) ??
+    models.find((model) => String(model.id) === id)
+  );
+}
+
+/**
+ * The org row a saved org selection names by connection and native id, when
+ * no row derives that selection's canonical id any more. A canonical id that
+ * was the provider's prefix plus the native id (`x-ai/grok-4.5`) can later
+ * get the catalog's spelling (`spacexai/grok-4.5`) or a reviewed exception;
+ * the connection and the id the provider is called with do not change, so
+ * the saved choice still finds its model. Only such a prefix-derived id
+ * qualifies: a saved canonical id that names another model than its native
+ * id stays unmatched.
+ */
+function orgRowForNativeModel(
+  saved: ModelSelection,
+  models: readonly ModelDefinition[],
+  orgConfig: OrgVisibleConfig | undefined,
+): ModelDefinition | undefined {
+  const ref = saved.connectionRef;
+  if (saved.source !== "org" || ref?.kind !== "orgProvider") return undefined;
+  const native = saved.nativeModelId;
+  if (!native || !saved.modelId.endsWith(`/${native}`)) return undefined;
+  return models.find((model) => {
+    const own = modelSelectionFromDefinition(model, orgConfig, "chat");
+    return (
+      own?.source === "org" &&
+      own.connectionRef?.kind === "orgProvider" &&
+      own.connectionRef.id === ref.id &&
+      (own.nativeModelId ?? own.modelId) === native
+    );
+  });
+}
+
+/**
+ * The selection a writer may store beside the row's UNCHANGED legacy id: only
+ * when `selection.modelId` is the row id itself (hosted rows, OpenRouter and
+ * Azure rows — including one id listed both in the hosted catalog and on an
+ * org OpenRouter connection). `undefined` for rows whose id is bare
+ * (`gpt-4o`, `llama3.2:latest`, `custom:…`): surfaces that key their chips
+ * and option lists by the raw row id keep saving the legacy id alone for
+ * those until they can read a stored canonical id back
+ * ({@link findModelForStoredChoice}).
+ */
+export function selectionBesideLegacyId(
+  model: ModelDefinition,
+  purpose: ModelSelectionPurpose,
+  orgConfig?: OrgVisibleConfig,
+): ModelSelection | undefined {
+  const selection = modelSelectionFromDefinition(model, orgConfig, purpose);
+  return selection && selection.modelId === String(model.id).trim()
+    ? selection
+    : undefined;
+}
+
+/** A test case's `models[]` entry, with its saved selection when it has one. */
+export type CaseModelEntry = {
+  provider: string;
+  model: string;
+  selection?: ModelSelection;
+};
+
+/**
+ * The `models[]` entry a case model chip writes: the legacy `{ provider,
+ * model }` pair plus the picked row's selection when it can be saved beside
+ * that unchanged id ({@link selectionBesideLegacyId}). The row is the one the
+ * chip names — same provider, same id — so an org OpenRouter row and the
+ * hosted row of the same id (different providers) stay distinct.
+ *
+ * `orgCanonicalIds` (set while the organization requires its own keys): an
+ * organization row whose id is bare (`gpt-5` on an org OpenAI connection)
+ * is saved with its canonical id and its org connection,
+ * `{ provider, model: "openai/gpt-5", selection }`. Without that the entry
+ * would be the bare pair, which runs as a legacy id and is refused under
+ * the policy. {@link caseModelEntryValue} reads it back as the same row.
+ */
+export function caseModelEntry(
+  entry: { provider: string; model: string },
+  models: readonly ModelDefinition[],
+  /** The deployment stores selections; false ⇒ the legacy pair alone. */
+  saveSelection = true,
+  options: { orgCanonicalIds?: boolean } = {},
+): CaseModelEntry {
+  const legacy = { provider: entry.provider, model: entry.model };
+  if (!saveSelection) return legacy;
+  const row = models.find(
+    (model) =>
+      String(model.provider) === entry.provider &&
+      String(model.id) === entry.model,
+  );
+  if (!row) return legacy;
+  const selection = selectionBesideLegacyId(row, "evalTarget");
+  if (selection) return { ...legacy, selection };
+  if (options.orgCanonicalIds) {
+    const canonical = modelSelectionFromDefinition(
+      row,
+      undefined,
+      "evalTarget",
+    );
+    if (canonical?.source === "org") {
+      return {
+        provider: entry.provider,
+        model: canonical.modelId,
+        selection: canonical,
+      };
+    }
+  }
+  return legacy;
+}
+
+/**
+ * The picker value (`provider/rowId`) a saved case `models[]` entry reads
+ * back as. An entry saved with an organization row's canonical id
+ * ({@link caseModelEntry}'s `orgCanonicalIds`) names no row directly, so it
+ * reads back as the row whose own selection it is: same connection, same
+ * model. Every other entry reads as `provider/model`, exactly as before.
+ */
+export function caseModelEntryValue(
+  entry: {
+    provider: string;
+    model: string;
+    selection?: RequestedModelSelection | null;
+  },
+  models: readonly ModelDefinition[],
+): string {
+  const direct = `${entry.provider}/${entry.model}`;
+  const selection = entry.selection;
+  if (!selection || selection.source !== "org") return direct;
+  if (models.some((row) => `${row.provider}/${String(row.id)}` === direct)) {
+    return direct;
+  }
+  const row = findModelForStoredChoice(
+    { modelId: entry.model, selection },
+    models,
+    undefined,
+    { exactSelection: true },
+  );
+  return row ? `${row.provider}/${String(row.id)}` : direct;
+}

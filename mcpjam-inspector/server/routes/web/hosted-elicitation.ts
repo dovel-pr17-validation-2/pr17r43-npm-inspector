@@ -1,0 +1,874 @@
+/**
+ * Hosted-mode MCP elicitation bridge (MCP 2025-11-25, form + URL modes).
+ *
+ * ## Why a bridge at all
+ *
+ * An MCP server can send `elicitation/create` in the middle of a `tools/call`.
+ * Answering it means asking a HUMAN, which takes minutes — and the hosted plane
+ * is horizontally scaled, so the answer arrives as a *separate* HTTP request the
+ * load balancer may route to any replica.
+ *
+ * The split that makes this tractable:
+ *
+ * - **Delivery (server → user) needs no coordination.** Hosted chat builds a
+ *   per-request `MCPClientManager` and tears it down at end of turn, so the MCP
+ *   connection, the blocked tool call, and the browser's stream all live on THIS
+ *   replica for the turn. The request rides the turn's own UI message stream as
+ *   a transient `data-elicitation` part — inherently scoped to the one user who
+ *   asked, with no broadcast surface.
+ * - **The answer (user → blocked replica) is the only cross-replica leg.** It
+ *   rendezvouses through Convex: the browser writes the answer with its own live
+ *   Convex auth; this replica polls until answered/expired/aborted. Node cannot
+ *   subscribe to Convex (HTTP client only), hence polling.
+ *
+ * ## Ordering guarantee (do not "optimize" this)
+ *
+ * poll (read, side-effect-free) → resolve the ElicitResult to the MCP server →
+ * ack (scrub the payload). Scrubbing during the poll read is a CORRECTNESS BUG:
+ * if that response is lost in flight, the retry returns `answered` with the
+ * content already destroyed, and this bridge cannot distinguish that from a
+ * legitimately contentless accept (URL mode carries none; an empty form accept
+ * is valid) — it would fabricate a cancel over a real accept, or an empty accept
+ * over real content. If a replica dies before acking, the payload simply waits
+ * for the backend's 24h cleanup; retention is unchanged.
+ *
+ * ## Fail-fast before the writer exists
+ *
+ * The stream writer only arrives at `onStreamWriterReady`, which fires after MCP
+ * connect + tool discovery (`prepareChatV2`). An elicitation raised during that
+ * window has nowhere to render AND its consumer (the stream) is created by the
+ * very code path it would block — buffering it would deadlock until TTL. Every
+ * legitimate elicitation happens during tool execution, when the writer exists,
+ * so ordinary chat requests raised before the writer resolve as `cancel`.
+ * An admitted plugin workspace instead delivers through the existing actor-owned
+ * pending query; it can render independently of a chat writer. Both paths reuse
+ * the same answer, poll, acknowledgement, cancellation and expiry lifecycle.
+ */
+
+import { PLUGIN_LEGACY_INLINE_SCHEMA_MAX_BYTES } from "../../../shared/plugin-form-payload-limits.js";
+import { ConvexHttpClient } from "convex/browser";
+import { convexToJson, type Value } from "convex/values";
+import type { UIMessageChunk } from "ai";
+import type { ElicitResult } from "@modelcontextprotocol/client";
+import type { ElicitationCallback } from "@mcpjam/sdk";
+import {
+  ELICITATION_FORM_TTL_MS,
+  ELICITATION_POLL_INTERVAL_MS,
+  ELICITATION_POLL_JITTER_MS,
+  ELICITATION_POLL_MAX_FAILURES,
+  ELICITATION_SERVICE_ROUTE_TIMEOUT_MS,
+  ELICITATION_URL_CONSENT_TTL_MS,
+} from "../../config.js";
+import { logger } from "../../utils/logger.js";
+import {
+  HOSTED_ELICITATION_DATA_PART_TYPE,
+  HOSTED_ELICITATION_VERSION,
+  type HostedElicitationEvent,
+  type HostedElicitationMode,
+} from "@/shared/hosted-elicitation";
+import {
+  SCOPE_STEP_UP_DATA_PART_TYPE,
+  type ScopeStepUpRequiredEvent,
+} from "@/shared/scope-step-up";
+import { hasServiceCredential, requireServiceCredential } from "../../services/service-credential.js";
+
+export type ElicitationChunkWriter = {
+  write: (chunk: UIMessageChunk) => void;
+};
+
+/** The optional challenge fields a `403 insufficient_scope` can carry. */
+export interface InsufficientScopeInfo {
+  serverId: string;
+  toolCallId?: string;
+  requiredScope?: string;
+  resourceMetadataUrl?: string;
+  errorDescription?: string;
+}
+
+/**
+ * Single source of truth for the display-only `insufficient_scope` event shape.
+ * Returns `null` when there is nothing actionable (no challenge field), so both
+ * the bridge and the writer-only fallback drop empty notices identically.
+ */
+export function buildInsufficientScopeEvent(
+  serverName: string | undefined,
+  info: InsufficientScopeInfo,
+): HostedElicitationEvent | null {
+  if (
+    !info.requiredScope &&
+    !info.resourceMetadataUrl &&
+    !info.errorDescription
+  ) {
+    return null;
+  }
+  return {
+    kind: "insufficient_scope",
+    serverId: info.serverId,
+    ...(serverName ? { serverName } : {}),
+    ...(info.toolCallId ? { toolCallId: info.toolCallId } : {}),
+    ...(info.requiredScope ? { requiredScope: info.requiredScope } : {}),
+    ...(info.resourceMetadataUrl
+      ? { resourceMetadataUrl: info.resourceMetadataUrl }
+      : {}),
+    ...(info.errorDescription
+      ? { errorDescription: info.errorDescription }
+      : {}),
+  } as HostedElicitationEvent;
+}
+
+/**
+ * Surface a SEP-2350 `403 insufficient_scope` on the raw stream writer, WITHOUT
+ * a `HostedElicitationBridge`. The chat tool loop uses this so a host that never
+ * advertised elicitation (hence has no bridge) still emits the display-only
+ * scope step-up notice. Safe no-op when `writer` is absent or the challenge is
+ * empty — the emit is purely for display; the failed tool call already stands.
+ */
+export function emitInsufficientScopeChunk(
+  writer: ElicitationChunkWriter | null | undefined,
+  serverName: string | undefined,
+  info: InsufficientScopeInfo,
+): void {
+  if (!writer) return;
+  const event = buildInsufficientScopeEvent(serverName, info);
+  if (!event) return;
+  try {
+    writer.write({
+      type: HOSTED_ELICITATION_DATA_PART_TYPE,
+      data: event,
+      transient: true,
+    } as unknown as UIMessageChunk);
+  } catch (error) {
+    logger.warn("[elicitation] insufficient_scope stream write failed", {
+      error,
+    });
+  }
+}
+
+/**
+ * Emit the resumable SEP-2350 suspension contract. Unlike the legacy
+ * `data-elicitation` notice, this event identifies a stored operation whose
+ * unresolved tool call can be resumed after OAuth without another user turn.
+ */
+export function emitScopeStepUpRequiredChunk(
+  writer: ElicitationChunkWriter | null | undefined,
+  event: ScopeStepUpRequiredEvent,
+): void {
+  if (!writer) {
+    throw new Error("scope step-up stream writer is unavailable");
+  }
+  writer.write({
+    type: SCOPE_STEP_UP_DATA_PART_TYPE,
+    data: event,
+    transient: true,
+  } as unknown as UIMessageChunk);
+}
+
+/** Terminal states the rendezvous row can report. */
+type PollStatus = "pending" | "answered" | "cancelled" | "expired";
+
+type PollResult = {
+  status: PollStatus;
+  action?: "accept" | "decline" | "cancel";
+  content?: Record<string, unknown>;
+};
+
+export interface HostedElicitationBridgeOptions {
+  /**
+   * A CONVEX-VALID bearer, i.e. the output of `getConvexBearerForRequest(c)` —
+   * not the raw Authorization header, which for WorkOS API-key callers is an
+   * `sk_…` key Convex cannot verify.
+   */
+  convexBearer: string;
+  getConvexBearer?: () => Promise<string>;
+  projectId: string;
+  chatSessionId?: string;
+  /** Remote harness requests are delivered by the actor-owned chat query. */
+  delivery?: "stream" | "owned-chat-query";
+  /** Display labels only; `serverId` stays the trusted anchor. */
+  serverNamesById: Record<string, string>;
+  /** The turn's abort signal — a closed stream must not leave a pending row. */
+  abortSignal?: AbortSignal;
+  /** Owned plugin operations use the existing actor-scoped pending query for delivery. */
+  pluginWorkspaceId?: string;
+  /** Installed only by the owned execution port, never from server/app metadata. */
+  bindPluginForm?: (input: {
+    rendezvousId: string;
+    serverId: string;
+    schema: unknown;
+    expiresAt: number;
+  }) => Promise<{
+    token: string;
+    release: () => void;
+    /** Owned target delivery before presentation/source disposal, never metadata. */
+    deliver?: (result: ElicitResult) => Promise<ElicitResult>;
+  }>;
+}
+
+function stripBearer(token: string): string {
+  return token.replace(/^Bearer\s+/i, "").trim();
+}
+
+function requireConvexUrl(): string {
+  const url = process.env.CONVEX_URL;
+  if (!url) throw new Error("CONVEX_URL is not configured");
+  return url;
+}
+
+function requireConvexHttpUrl(): string {
+  const url = process.env.CONVEX_HTTP_URL;
+  if (!url) throw new Error("CONVEX_HTTP_URL is not configured");
+  return url;
+}
+
+function serviceToken(): string {
+  return requireServiceCredential("Hosted elicitation");
+}
+
+const CANCEL: ElicitResult = { action: "cancel" };
+
+/**
+ * Build the ElicitResult for an answered row.
+ *
+ * `content` rides ONLY on a form-mode accept. The backend already validates the
+ * shape, and the MCP server re-validates against its own schema; we simply must
+ * not invent a `content` key where the spec says there is none (URL accepts,
+ * declines, cancels).
+ */
+function toElicitResult(
+  poll: PollResult,
+  mode: HostedElicitationMode,
+): ElicitResult {
+  const action = poll.action ?? "cancel";
+  if (action === "accept" && mode === "form") {
+    return { action: "accept", content: poll.content ?? {} } as ElicitResult;
+  }
+  return { action } as ElicitResult;
+}
+
+export class HostedElicitationBridge {
+  private writer: ElicitationChunkWriter | null = null;
+  /** Rendezvous ids still awaiting an answer — cancelled on dispose. */
+  private readonly pending = new Set<string>();
+  /** Creation can commit before its response reaches this worker. */
+  private readonly creations = new Set<Promise<void>>();
+  private readonly cancellations = new Map<string, Promise<void>>();
+  private disposal: Promise<void> | undefined;
+  private disposed = false;
+
+  constructor(private readonly options: HostedElicitationBridgeOptions) {
+    if (options.delivery === "owned-chat-query" && !options.chatSessionId)
+      throw new Error("Owned elicitation delivery requires a chat session");
+  }
+
+  attachStreamWriter(writer: ElicitationChunkWriter): void {
+    this.writer = writer;
+  }
+
+  /**
+   * The SDK global elicitation callback. Registered on the per-turn manager
+   * ONLY when the host declares the capability (see `chat-v2.ts`), because the
+   * SDK gates advertisement on a handler being present — registering is what
+   * makes `elicitation` appear in `initialize`.
+   */
+  readonly callback = async (
+    request: Parameters<ElicitationCallback>[0],
+    requestSignal?: AbortSignal,
+  ): Promise<ElicitResult> => {
+    const signal = requestSignal && this.options.abortSignal
+      ? AbortSignal.any([requestSignal, this.options.abortSignal])
+      : requestSignal ?? this.options.abortSignal;
+    const mode: HostedElicitationMode = request.mode === "url" ? "url" : "form";
+    const serverId = request.serverId ?? "unknown";
+
+    // Pre-writer: nothing can render this, and its consumer is the very stream
+    // that hasn't been created yet. Fail fast rather than deadlock to TTL.
+    if ((!this.writer && !this.options.pluginWorkspaceId &&
+      this.options.delivery !== "owned-chat-query") || this.disposed) {
+      logger.warn(
+        "[elicitation] request arrived with no live stream; cancelling",
+        { serverId, mode, disposed: this.disposed },
+      );
+      return CANCEL;
+    }
+
+    // URL mode is a consent decision (seconds); form mode is data entry.
+    const ttlMs =
+      mode === "url" ? ELICITATION_URL_CONSENT_TTL_MS : ELICITATION_FORM_TTL_MS;
+    const rendezvousId = crypto.randomUUID();
+    const expiresAt = Date.now() + ttlMs;
+
+    let hasPrivateSchema = false;
+    let source:
+      | Awaited<
+          ReturnType<
+            NonNullable<HostedElicitationBridgeOptions["bindPluginForm"]>
+          >
+        >
+      | undefined;
+    let finishCreation!: () => void;
+    const creation = new Promise<void>((resolve) => {
+      finishCreation = resolve;
+    });
+    this.creations.add(creation);
+    try {
+      let rowAttempted = false;
+      try {
+        if (this.options.bindPluginForm) {
+          if (!this.options.pluginWorkspaceId || mode !== "form")
+            throw new Error("Unavailable plugin form source");
+          source = await this.options.bindPluginForm({
+            rendezvousId,
+            serverId,
+            schema: request.schema,
+            expiresAt,
+          });
+        }
+        if (this.disposed || signal?.aborted) {
+          source?.release();
+          return CANCEL;
+        }
+        rowAttempted = true;
+        hasPrivateSchema = await this.createRow({
+          rendezvousId,
+          request,
+          mode,
+          ttlMs,
+          serverId,
+          pluginFormSourceToken: source?.token,
+        });
+      } catch (error) {
+        source?.release();
+        if (rowAttempted) await this.cancelRow(rendezvousId);
+        // A broken rendezvous must never hang a tool call: without a row there is
+        // nothing for the browser to answer, so the only honest outcome is cancel.
+        logger.error(
+          "[elicitation] failed to create rendezvous row; cancelling",
+          error,
+          { serverId, mode },
+        );
+        return CANCEL;
+      }
+
+      // Storage creation may settle after the request was disposed. Withdraw the
+      // newly created row rather than publishing an orphaned, answerable form.
+      if (this.disposed || signal?.aborted) {
+        source?.release();
+        await this.cancelRow(rendezvousId);
+        return CANCEL;
+      }
+      this.pending.add(rendezvousId);
+      this.emit({
+        kind: "request",
+        rendezvousId,
+        serverId,
+        serverName: this.options.serverNamesById[serverId],
+        mode,
+        message: request.message,
+        ...(source ? { pluginFormSourceToken: source.token } : {}),
+        ...(this.options.pluginWorkspaceId
+          ? {
+              pluginWorkspaceId: this.options.pluginWorkspaceId,
+              formDialect: "openai" as const,
+            }
+          : {}),
+        ...(hasPrivateSchema
+          ? { hasPrivateSchema: true as const }
+          : mode === "form"
+            ? { requestedSchema: request.schema }
+            : {}),
+        ...(mode === "url" && request.url ? { url: request.url } : {}),
+        ...(request.elicitationId
+          ? { serverElicitationId: request.elicitationId }
+          : {}),
+        expiresAt,
+        ...(this.options.chatSessionId
+          ? { chatSessionId: this.options.chatSessionId }
+          : {}),
+      });
+    } finally {
+      this.creations.delete(creation);
+      finishCreation();
+    }
+
+    try {
+      const result = await this.awaitAnswer({ rendezvousId, expiresAt, mode, signal });
+      return source?.deliver ? await source.deliver(result) : result;
+    } finally {
+      this.pending.delete(rendezvousId);
+      source?.release();
+    }
+  };
+
+  /**
+   * Surface a `-32042 URLElicitationRequiredError` raised by a failed
+   * `tools/call`. Display-only: the call already failed, so no JSON-RPC response
+   * is owed and there is nothing to rendezvous on.
+   */
+  emitUrlRequired(info: {
+    serverId: string;
+    toolCallId?: string;
+    elicitations: Array<{
+      url: string;
+      elicitationId: string;
+      message?: string;
+    }>;
+  }): void {
+    if (info.elicitations.length === 0) return;
+    this.emit({
+      kind: "url_required",
+      serverId: info.serverId,
+      serverName: this.options.serverNamesById[info.serverId],
+      ...(info.toolCallId ? { toolCallId: info.toolCallId } : {}),
+      elicitations: info.elicitations,
+    });
+  }
+
+  /**
+   * Surface a runtime `403 insufficient_scope` (SEP-2350) raised by a failed
+   * `tools/call` inside the chat/agent tool loop. Display-only: the call already
+   * failed, so no JSON-RPC response is owed and there is nothing to rendezvous
+   * on. The client drives the union-scope step-up re-authorization.
+   */
+  emitInsufficientScope(info: InsufficientScopeInfo): void {
+    // Shared builder drops empty notices; `serverName` enriches from the
+    // per-turn id→name map the writer-only fallback can't see.
+    const event = buildInsufficientScopeEvent(
+      this.options.serverNamesById[info.serverId],
+      info,
+    );
+    if (event) this.emit(event);
+  }
+
+  /**
+   * End-of-turn cleanup. Withdraws any row still pending so a closed stream
+   * can't leave an answerable prompt behind for its TTL.
+   */
+  dispose(): Promise<void> {
+    if (this.disposal) return this.disposal;
+    this.disposed = true;
+    this.writer = null;
+    const creations = [...this.creations];
+    this.disposal = (async () => {
+      await Promise.all(creations);
+      const outstanding = Array.from(this.pending);
+      this.pending.clear();
+      await Promise.all([
+        ...outstanding.map((rendezvousId) => this.cancelRow(rendezvousId)),
+        ...this.cancellations.values(),
+      ]);
+    })();
+    return this.disposal;
+  }
+
+  // ── internals ────────────────────────────────────────────────────────────
+
+  private emit(event: HostedElicitationEvent): void {
+    if (!this.writer) return;
+    try {
+      this.writer.write({
+        type: HOSTED_ELICITATION_DATA_PART_TYPE,
+        data: event,
+        transient: true,
+      } as unknown as UIMessageChunk);
+    } catch (error) {
+      // A dead writer means the browser is gone; the poll loop's abort/TTL
+      // paths still resolve the blocked call, so this is not fatal.
+      logger.warn("[elicitation] stream write failed", { error });
+      this.writer = null;
+    }
+  }
+
+  /**
+   * Written with the USER's bearer (not the service token) so the backend
+   * derives ownership from verified identity via `ctx.actor` — the row is never
+   * told who owns it. Works identically for guests.
+   */
+  private async createRow(args: {
+    rendezvousId: string;
+    request: Parameters<ElicitationCallback>[0];
+    mode: HostedElicitationMode;
+    ttlMs: number;
+    serverId: string;
+    pluginFormSourceToken?: string;
+  }): Promise<boolean> {
+    // Keep storage creation/body reads bounded while observing the committed
+    // response after owner close. Cancellation uses the minted rendezvous ID.
+    const controller = new AbortController();
+    const deadline = setTimeout(
+      () =>
+        controller.abort(new Error("elicitation creation deadline exceeded")),
+      ELICITATION_SERVICE_ROUTE_TIMEOUT_MS,
+    );
+    try {
+      const client = new ConvexHttpClient(requireConvexUrl(), {
+        fetch: (url, init) =>
+          fetch(url, {
+            ...init,
+            signal: init?.signal
+              ? AbortSignal.any([init.signal, controller.signal])
+              : controller.signal,
+          }),
+      });
+      client.setAuth(
+        stripBearer(this.options.getConvexBearer
+          ? await this.options.getConvexBearer()
+          : this.options.convexBearer),
+      );
+      const input = {
+        rendezvousId: args.rendezvousId,
+        projectId: this.options.projectId,
+        ...(this.options.chatSessionId
+          ? { chatSessionId: this.options.chatSessionId }
+          : {}),
+        serverId: args.serverId,
+        ...(this.options.serverNamesById[args.serverId]
+          ? { serverName: this.options.serverNamesById[args.serverId] }
+          : {}),
+        mode: args.mode,
+        message: args.request.message,
+        ...(args.pluginFormSourceToken
+          ? { pluginFormSourceToken: args.pluginFormSourceToken }
+          : {}),
+        ...(this.options.pluginWorkspaceId
+          ? {
+              pluginWorkspaceId: this.options.pluginWorkspaceId,
+              formDialect: "openai",
+            }
+          : {}),
+        ...(args.mode === "form"
+          ? { requestedSchema: args.request.schema ?? {} }
+          : {}),
+        ...(args.mode === "url" && args.request.url
+          ? { url: args.request.url }
+          : {}),
+        ...(args.request.elicitationId
+          ? { serverElicitationId: args.request.elicitationId }
+          : {}),
+        ttlMs: args.ttlMs,
+      };
+      let convexSchema = true;
+      if (args.mode === "form" && this.options.pluginWorkspaceId) {
+        try {
+          convexToJson(input.requestedSchema as Value);
+        } catch {
+          convexSchema = false;
+        }
+      }
+      const privateSchema =
+        args.mode === "form" &&
+        !!this.options.pluginWorkspaceId &&
+        (!convexSchema ||
+          new TextEncoder().encode(JSON.stringify(input.requestedSchema))
+            .length > PLUGIN_LEGACY_INLINE_SCHEMA_MAX_BYTES);
+      if (privateSchema) {
+        const {
+          mode: _mode,
+          formDialect: _dialect,
+          requestedSchema,
+          ...ownedInput
+        } = input;
+        await client.action("pluginFormSchemas:create" as any, {
+          ...ownedInput,
+          requestedSchemaJson: JSON.stringify(requestedSchema),
+        });
+      } else
+        await client.mutation("elicitations:createElicitation" as any, input);
+      return privateSchema;
+    } finally {
+      clearTimeout(deadline);
+    }
+  }
+
+  /**
+   * Service-token routes: the wait spans human time and can outlive a WorkOS
+   * access token, so the poll leg must not depend on the user's bearer staying
+   * fresh. Safe because `rendezvousId` is a replica-minted UUID and these routes
+   * are read/withdraw-only.
+   */
+  /**
+   * @param bindToTurn abort this call when the TURN aborts, on top of the
+   *   per-call deadline. True for polling — a closed stream has no use for the
+   *   answer. **False for cancel/ack**: those run *because* the turn is ending,
+   *   so binding them to its signal would abort the very request meant to
+   *   withdraw the row, and the prompt would stay answerable for its whole TTL.
+   */
+  private async serviceRoute<T>(
+    path: string,
+    body: unknown,
+    opts: { bindToTurn: boolean; signal?: AbortSignal },
+  ): Promise<T> {
+    // Every service call is bounded. Without a deadline a stalled Convex
+    // request would park the poll loop forever: the tool call would outlive its
+    // TTL (nothing else can resolve it — the deadline check only runs between
+    // polls), and `dispose()` would await a cancel that never returns, blocking
+    // end-of-stream cleanup. A timed-out call surfaces as a poll failure, which
+    // the loop already tolerates and eventually resolves as `cancel`.
+    //
+    // setTimeout rather than `AbortSignal.timeout()`: the latter is driven by
+    // the platform's own clock, which fake timers don't control — the deadline
+    // would be untestable.
+    const controller = new AbortController();
+    const deadline = setTimeout(
+      () => controller.abort(new Error("service route deadline exceeded")),
+      ELICITATION_SERVICE_ROUTE_TIMEOUT_MS,
+    );
+    const onTurnAbort = () => controller.abort();
+    const turnSignal = opts.bindToTurn ? opts.signal ?? this.options.abortSignal : undefined;
+    if (turnSignal) {
+      if (turnSignal.aborted) controller.abort();
+      else turnSignal.addEventListener("abort", onTurnAbort, { once: true });
+    }
+
+    try {
+      const response = await fetch(
+        new URL(path, requireConvexHttpUrl()).toString(),
+        {
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "x-inspector-service-token": serviceToken(),
+          },
+          body: JSON.stringify(body),
+          signal: controller.signal,
+        },
+      );
+      if (!response.ok) {
+        throw new Error(`${path} returned ${response.status}`);
+      }
+      return (await response.json()) as T;
+    } finally {
+      clearTimeout(deadline);
+      turnSignal?.removeEventListener("abort", onTurnAbort);
+    }
+  }
+
+  private async poll(rendezvousId: string, signal?: AbortSignal): Promise<PollResult | null> {
+    const payload = await this.serviceRoute<{
+      ok: boolean;
+      elicitation: PollResult | null;
+    }>("/elicitations/poll", { rendezvousId }, { bindToTurn: true, signal });
+    return payload.elicitation ?? null;
+  }
+
+  /** Fire-and-forget: scrubs the payload once we've resolved to the server. */
+  private ackRow(rendezvousId: string): void {
+    // Not bound to the turn: the ack usually fires as the turn is wrapping up.
+    void this.serviceRoute(
+      "/elicitations/ack",
+      { rendezvousId },
+      { bindToTurn: false },
+    ).catch((error) => {
+      // Harmless: the backend's 24h cleanup is the real retention bound.
+      logger.warn("[elicitation] ack failed; payload waits for cleanup", {
+        error,
+        rendezvousId,
+      });
+    });
+  }
+
+  private cancelRow(rendezvousId: string): Promise<void> {
+    const prior = this.cancellations.get(rendezvousId);
+    if (prior) return prior;
+    const cancellation = this.serviceRoute(
+      "/elicitations/cancel",
+      { rendezvousId },
+      { bindToTurn: false },
+    )
+      .then(() => {})
+      .catch((error) => {
+        logger.warn("[elicitation] cancel failed; TTL will expire the row", {
+          error,
+          rendezvousId,
+        });
+      })
+      .finally(() => {
+        if (this.cancellations.get(rendezvousId) === cancellation)
+          this.cancellations.delete(rendezvousId);
+      });
+    this.cancellations.set(rendezvousId, cancellation);
+    return cancellation;
+  }
+
+  private async awaitAnswer(args: {
+    rendezvousId: string;
+    expiresAt: number;
+    mode: HostedElicitationMode;
+    signal?: AbortSignal;
+  }): Promise<ElicitResult> {
+    const { rendezvousId, expiresAt, mode, signal } = args;
+    let consecutiveFailures = 0;
+
+    for (;;) {
+      if (signal?.aborted || this.disposed) {
+        void this.cancelRow(rendezvousId);
+        if (!this.options.abortSignal?.aborted && !this.disposed)
+          this.emit({ kind: "resolved", rendezvousId, outcome: "cancelled" });
+        return CANCEL;
+      }
+
+      if (Date.now() >= expiresAt) {
+        // Enforce the deadline locally rather than waiting on the 1-min cron.
+        void this.cancelRow(rendezvousId);
+        this.emit({ kind: "resolved", rendezvousId, outcome: "expired" });
+        return CANCEL;
+      }
+
+      let result: PollResult | null;
+      try {
+        result = await this.poll(rendezvousId, signal);
+        if (signal?.aborted || this.disposed) continue;
+        consecutiveFailures = 0;
+      } catch (error) {
+        if (signal?.aborted || this.disposed) continue;
+        consecutiveFailures += 1;
+        if (consecutiveFailures >= ELICITATION_POLL_MAX_FAILURES) {
+          logger.error(
+            "[elicitation] poll failed repeatedly; cancelling",
+            error,
+            { rendezvousId },
+          );
+          void this.cancelRow(rendezvousId);
+          this.emit({ kind: "resolved", rendezvousId, outcome: "cancelled" });
+          return CANCEL;
+        }
+        await this.waitOnePollInterval(signal);
+        continue;
+      }
+
+      if (!result || result.status === "pending") {
+        await this.waitOnePollInterval(signal);
+        continue;
+      }
+
+      if (result.status === "answered") {
+        const elicitResult = toElicitResult(result, mode);
+        // Ack only AFTER we hold the answer (see the ordering note up top).
+        this.ackRow(rendezvousId);
+        this.emit({
+          kind: "resolved",
+          rendezvousId,
+          outcome: "answered",
+          action: result.action,
+        });
+        return elicitResult;
+      }
+
+      // expired | cancelled — terminal, no answer to deliver.
+      this.emit({
+        kind: "resolved",
+        rendezvousId,
+        outcome: result.status === "expired" ? "expired" : "cancelled",
+      });
+      return CANCEL;
+    }
+  }
+
+  /**
+   * Jittered so concurrent turns don't lock-step onto Convex (mirrors the
+   * scheduled-evals worker). Wakes early on abort so a closed stream resolves
+   * immediately instead of sleeping out the interval.
+   */
+  private waitOnePollInterval(signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) return Promise.resolve();
+    const delay =
+      ELICITATION_POLL_INTERVAL_MS + Math.random() * ELICITATION_POLL_JITTER_MS;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, delay);
+      function onAbort() {
+        clearTimeout(timer);
+        resolve();
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+}
+
+/**
+ * True when a host's declared client capabilities enable elicitation.
+ *
+ * Lenient by design: bare `{}` is form-only per the spec's back-compat rule,
+ * and the catalog ships both `{}` and `{form:{}}`. Presence of the key — in any
+ * object shape — is the toggle.
+ */
+export function hostDeclaresElicitation(clientCapabilities: unknown): boolean {
+  if (!clientCapabilities || typeof clientCapabilities !== "object") {
+    return false;
+  }
+  const elicitation = (clientCapabilities as Record<string, unknown>)
+    .elicitation;
+  return (
+    typeof elicitation === "object" &&
+    elicitation !== null &&
+    !Array.isArray(elicitation)
+  );
+}
+
+/**
+ * Decide (a) whose client capabilities go on the initialize wire and (b) whether
+ * this turn may honor elicitation at all.
+ *
+ * Two independent gates, both required:
+ *
+ * 1. **Capability, from the right authority.** When the execution context is
+ *    server-resolved — a scenario, or a Project Environment — the resolved host
+ *    wins. A share-link visitor controls the request body, so reading
+ *    capabilities from it would let anyone switch elicitation on for a host
+ *    whose owner has it off; and an environment's whole point is that the
+ *    server decides what it resolves to. A backend predating
+ *    `clientCapabilities` on runtime-config omits it → treated as absent →
+ *    fail closed. For a plain host-preview or ad-hoc turn the body IS the
+ *    owner's own host config, sent by their own client.
+ *
+ *    NOTE this is a CAPABILITY declaration, not a user preference. It is
+ *    deliberately host-authoritative for environments even though model /
+ *    prompt / temperature / approval stay body-overridable there (ephemeral
+ *    Playground tweaks) — advertising `elicitation` changes what the SDK puts
+ *    on the initialize wire, which is not a per-turn preference to tweak.
+ *
+ * 2. **Client handshake.** Catalog hosts (claude-code, cursor, vscode, …)
+ *    ALREADY declare `elicitation`, so honoring it for every client would make
+ *    stale browser bundles — which cannot render the prompt — hang for a full
+ *    TTL on any server that elicits. Only clients that announce the version get
+ *    the callback; everyone else keeps today's fail-fast behavior.
+ */
+export function resolveElicitationGate(args: {
+  /**
+   * True when the execution context was resolved server-side (scenario or
+   * Project Environment) and its host config is therefore authoritative.
+   */
+  hostAuthoritative: boolean;
+  /** `clientCapabilities` from the scenario/host runtime-config (authoritative). */
+  hostClientCapabilities: unknown;
+  /** `clientCapabilities` from the request body (owner-supplied on direct turns). */
+  bodyClientCapabilities: unknown;
+  /** `hostedElicitationVersion` from the request body. */
+  clientVersion: number | undefined;
+  /**
+   * Whether this server holds the service credential the rendezvous routes
+   * need. Hosted-only feature: without it the callback is never registered,
+   * so the SDK does not advertise `elicitation` and a server that elicits
+   * fails fast — instead of the bridge throwing mid-prompt. Defaults to this
+   * process's credential.
+   */
+  serviceCredentialAvailable?: boolean;
+}): {
+  effectiveClientCapabilities: Record<string, unknown> | undefined;
+  enabled: boolean;
+} {
+  const effectiveClientCapabilities = (
+    args.hostAuthoritative
+      ? args.hostClientCapabilities
+      : args.bodyClientCapabilities
+  ) as Record<string, unknown> | undefined;
+
+  return {
+    effectiveClientCapabilities: effectiveClientCapabilities ?? undefined,
+    enabled:
+      (args.serviceCredentialAvailable ?? hasServiceCredential()) &&
+      hostDeclaresElicitation(effectiveClientCapabilities) &&
+      args.clientVersion === HOSTED_ELICITATION_VERSION,
+  };
+}

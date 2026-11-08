@@ -1,0 +1,227 @@
+---
+title: "MCP Apps Conformance SDK"
+description: "Programmatic MCP Apps surface validation with MCPAppsConformanceTest"
+icon: "app-window"
+---
+
+The MCP Apps Conformance SDK lets you validate the server-side MCP Apps surface your server exposes through tools and `ui://` resources.
+
+Use it when you want the same checks as the CLI's [`apps conformance`](/cli/apps-conformance) command, but inside your own test runner or CI pipeline.
+
+<Note>
+  This currently validates the **server-side** MCP Apps surface only. It does
+  not prove full host-side SEP-1865 behavior such as `ui/initialize`,
+  sandbox-proxy forwarding, or host notification ordering.
+</Note>
+
+## Import
+
+```typescript
+import {
+  MCPAppsConformanceSuite,
+  MCPAppsConformanceTest,
+  renderConformanceReportJUnitXml,
+  renderConformanceReportJson,
+  toConformanceReport,
+} from "@mcpjam/sdk";
+```
+
+## Basic usage
+
+```typescript
+const test = new MCPAppsConformanceTest({
+  url: "https://your-server.com/mcp",
+  timeout: 30_000,
+});
+
+const result = await test.run();
+
+console.log(result.passed);   // true
+console.log(result.outcome);  // "passed" | "failed" | "incomplete"
+console.log(result.summary);  // "7/7 checks passed, 0 failed, 0 could not run, 0 not applicable"
+console.log(result.discovery.uiToolCount);
+```
+
+For a stdio server:
+
+```typescript
+const test = new MCPAppsConformanceTest({
+  command: "node",
+  args: ["server.js"],
+  timeout: 30_000,
+});
+```
+
+## Suite usage
+
+```typescript
+import { writeFileSync } from "node:fs";
+
+const suite = new MCPAppsConformanceSuite({
+  name: "Apps CI",
+  target: {
+    url: "https://your-server.com/mcp",
+    timeout: 30_000,
+  },
+  defaults: {
+    checkIds: [
+      "ui-tools-present",
+      "ui-tool-metadata-valid",
+    ],
+  },
+  runs: [
+    {},
+    {
+      label: "resources",
+      checkIds: [
+        "ui-resources-readable",
+        "ui-resource-contents-valid",
+        "ui-resource-meta-valid",
+      ],
+    },
+  ],
+});
+
+const result = await suite.run();
+const report = toConformanceReport(result);
+
+writeFileSync(
+  "apps-conformance.junit.xml",
+  renderConformanceReportJUnitXml(report),
+);
+writeFileSync(
+  "apps-conformance.report.json",
+  JSON.stringify(renderConformanceReportJson(report), null, 2),
+);
+```
+
+`MCPAppsConformanceSuiteConfig` is shaped for CI matrices:
+
+| Property | Type | Required | Description |
+|----------|------|----------|-------------|
+| `name` | `string` | No | Suite label shown in summaries and JUnit XML |
+| `target` | `MCPServerConfig` | Yes | Shared HTTP or stdio target |
+| `defaults` | `Partial<Omit<MCPAppsConformanceConfig, keyof MCPServerConfig>>` | No | Shared defaults applied to every run |
+| `runs` | `Array<... & { label?: string }>` | Yes | Individual check selections and labels |
+
+## MCPAppsConformanceConfig
+
+`MCPAppsConformanceConfig` extends the standard `MCPServerConfig`, so it accepts the same HTTP and stdio connection settings as `MCPClientManager`.
+
+Additional property:
+
+| Property | Type | Required | Default | Description |
+|----------|------|----------|---------|-------------|
+| `checkIds` | `MCPAppsCheckId[]` | No | all checks | Run only the selected MCP Apps checks |
+
+Example with custom headers and a focused check set:
+
+```typescript
+const test = new MCPAppsConformanceTest({
+  url: "https://your-server.com/mcp",
+  requestInit: {
+    headers: {
+      Authorization: `Bearer ${process.env.TOKEN}`,
+    },
+  },
+  checkIds: [
+    "ui-resources-readable",
+    "ui-resource-contents-valid",
+  ],
+});
+```
+
+## Check ids
+
+Available checks:
+
+- `ui-tools-present`
+- `ui-tool-metadata-valid`
+- `ui-tool-input-schema-valid`
+- `ui-listed-resources-valid`
+- `ui-resources-readable`
+- `ui-resource-contents-valid`
+- `ui-resource-meta-valid`
+
+## Result shape
+
+`run()` returns an `MCPAppsConformanceResult`.
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `passed` | `boolean` | True only when `outcome` is `"passed"`. A check that could not run keeps this `false`. |
+| `outcome` | `"passed" \| "failed" \| "incomplete"` | `"failed"` on any violation; `"incomplete"` when nothing failed but a selected check never ran. |
+| `incompleteReason` | `string \| undefined` | Present when `outcome` is `"incomplete"`: which checks did not run and what to change. |
+| `target` | `string` | URL or stdio command under test |
+| `checks` | `MCPAppsCheckResult[]` | Individual check results |
+| `summary` | `string` | Human-readable summary (`N/M checks passed, X failed, Y could not run, Z not applicable`) |
+| `durationMs` | `number` | Total duration |
+| `categorySummary` | `Record<"tools" \| "resources", ...>` | Per-category `total`, `passed`, `failed`, `skipped`, and `couldNotRun` counts |
+| `discovery` | object | Counts for tools and UI resources discovered during the run |
+| `readiness` | `MCPAppsReadinessWarning[] \| undefined` | Advice beside the verdict, absent when there is none. Each item has an `id` from `MCP_APPS_READINESS_IDS`, the `checkId` that produced it, a `title`, a `specStrength` and a `message`. It never changes `outcome` or `passed`. |
+
+Each `MCPAppsCheckResult` includes:
+
+- `id`
+- `category`
+- `title`
+- `description`
+- `status` — `"passed"`, `"failed"`, or `"skipped"`
+- `skipReason` — set whenever `status` is `"skipped"`: `"not-applicable"` (no MCP Apps tools or UI resources to check) or `"could-not-run"` (tools/list did not complete, connection failed)
+- `durationMs`
+- optional `details`
+- optional `warnings`
+- optional `error`
+
+`MCPAppsConformanceSuite.run()` returns an `MCPAppsConformanceSuiteResult`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `name` | `string` | Suite name |
+| `target` | `string` | Shared target under test |
+| `passed` | `boolean` | `true` iff every run passed |
+| `results` | `Array<MCPAppsConformanceResult & { label: string }>` | Per-run results |
+| `summary` | `string` | Human-readable suite summary |
+| `durationMs` | `number` | Total suite duration |
+
+## Outcomes: passed, failed, incomplete
+
+A run reports one of three outcomes, and `passed` is `true` only for the first:
+
+| `outcome` | CLI exit code | Meaning |
+|---|---|---|
+| `passed` | `0` | Every selected check either ran and passed, or does not apply to this server. |
+| `failed` | `1` | At least one check found a violation. |
+| `incomplete` | `3` | Nothing failed, but at least one selected check could not be run, so the run does not establish conformance. |
+
+An incomplete run carries a root `incompleteReason` naming the checks that did not run and what to change; non-quiet CLI runs also print it to stderr. For a suite, the exit code is the worst of all runs (failure outranks incomplete).
+
+## CI reporting
+
+All three conformance domains use the same shared reporting helpers:
+
+- `toConformanceReport(result)` normalizes protocol, OAuth, and apps runs into a single report shape.
+- `renderConformanceReportJUnitXml(report)` emits redacted JUnit XML for CI dashboards.
+- `renderConformanceReportJson(report)` returns the redacted JSON-ready object for artifact uploads.
+
+That makes the SDK and CLI JUnit output byte-identical for the same result.
+
+## What the runner validates
+
+The current runner checks:
+
+1. At least one tool advertises MCP Apps UI metadata.
+2. Tool metadata uses a valid `ui://` resource URI and valid `visibility` values.
+3. Tool `inputSchema` is a non-null JSON Schema object.
+4. Listed UI resources use `ui://` and `text/html;profile=mcp-app`.
+5. Referenced UI resources are readable via `resources/read`.
+6. Resource payloads provide exactly one HTML document through `text` or `blob`.
+7. `_meta.ui.csp`, `permissions`, `domain`, and `prefersBorder` use valid shapes.
+
+## Notes
+
+- The runner always advertises the MCP Apps UI extension capability so servers do not hide their MCP Apps surface when custom `clientCapabilities` are supplied.
+- Deprecated `_meta["ui/resourceUri"]` is accepted. Tools that still use it are reported in `readiness` as one `apps-readiness-deprecated-resource-uri` item with `specStrength: "Deprecation Notice"` (the spec marks the field deprecated and due for removal before GA, with no SHOULD or MAY). It is informational and costs no points.
+- Tool name conventions (length, character set, uniqueness) are core MCP rules, so this suite does not check them. The protocol suite reports them on every tool as the advice item `readiness-tool-name-conventions`, on protocol 2025-11-25 and later.
+- HTML validation is intentionally lightweight. It verifies the expected MIME type and document-style HTML payload, not the full browser lifecycle.
+- For a runnable project that writes JUnit XML from Vitest, see [`examples/conformance/basic/`](https://github.com/MCPJam/inspector/tree/main/examples/conformance/basic).

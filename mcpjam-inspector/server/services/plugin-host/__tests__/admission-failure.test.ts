@@ -1,0 +1,197 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { ConvexError } from "convex/values";
+import { resolvePluginExtensions } from "@mcpjam/sdk/host-config/internal";
+
+const f = vi.hoisted(() => ({ query: vi.fn() }));
+vi.mock("../../evals/route-helpers.js", () => ({
+  createConvexClient: () => ({ query: f.query }),
+}));
+
+import {
+  admitPluginWorkspace,
+  assertPluginWorkspaceRuntime,
+  pluginAdmissionFailure,
+  PluginWorkspaceAdmissionError,
+  readPluginExecutionContext,
+} from "../admission.js";
+import { pluginChatRefusal } from "../../../routes/web/chat-v2-plugin-refusal.js";
+import { PluginInvocationError } from "../invocation.js";
+import { PluginModelContextError } from "../../../../shared/plugin-model-context.js";
+
+const descriptor = { version: 1, workspaceId: "playground:chat" } as never;
+const fetchFailed = () =>
+  Object.assign(new TypeError("fetch failed"), {
+    cause: Object.assign(new Error("getaddrinfo ENOTFOUND"), {
+      code: "ENOTFOUND",
+    }),
+  });
+
+describe("plugin workspace admission failures", () => {
+  beforeEach(() => f.query.mockReset());
+
+  it("names an unreachable backend instead of denying the project", async () => {
+    f.query.mockRejectedValueOnce(fetchFailed());
+    const error = await admitPluginWorkspace({
+      descriptor,
+      projectId: "project",
+      bearer: "token",
+    }).catch((caught: unknown) => caught);
+    expect(error).toBeInstanceOf(PluginWorkspaceAdmissionError);
+    expect(error).toMatchObject({
+      status: 503,
+      code: "PLUGIN_WORKSPACE_UNREACHABLE",
+      failure: "unreachable",
+    });
+  });
+
+  it("keeps a backend refusal a denial", async () => {
+    f.query.mockRejectedValueOnce(
+      new ConvexError({ code: "FORBIDDEN", message: "rollout off" }),
+    );
+    await expect(
+      admitPluginWorkspace({ descriptor, projectId: "project", bearer: "t" }),
+    ).rejects.toMatchObject({ status: 403, code: "PLUGIN_WORKSPACE_DENIED" });
+  });
+
+  it("says when the sign-in lapsed rather than denying", async () => {
+    f.query.mockRejectedValueOnce(
+      new Error('{"code":"Unauthenticated","message":"Token expired"}'),
+    );
+    await expect(
+      readPluginExecutionContext({
+        projectId: "project",
+        bearer: "t",
+        expectedActorId: "actor",
+        serverIds: ["server"],
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      code: "PLUGIN_WORKSPACE_SIGN_IN_EXPIRED",
+    });
+  });
+
+  it("treats the admission deadline as unreachable and caller aborts as cancelled", () => {
+    const cancelled = new PluginWorkspaceAdmissionError(true);
+    expect(pluginAdmissionFailure(cancelled, true).code).toBe(
+      "PLUGIN_WORKSPACE_UNREACHABLE",
+    );
+    expect(pluginAdmissionFailure(cancelled, false)).toBe(cancelled);
+    expect(pluginAdmissionFailure(new Error("Server Error"), false).code).toBe(
+      "PLUGIN_WORKSPACE_DENIED",
+    );
+    // A ConvexError payload is the backend deciding, whatever its wording.
+    expect(
+      pluginAdmissionFailure(
+        new ConvexError({ code: "UNAUTHENTICATED_JWT", message: "jwt" }),
+        false,
+      ).code,
+    ).toBe("PLUGIN_WORKSPACE_DENIED");
+  });
+
+  it("answers a chat turn with the refusal's own status and plain words", () => {
+    expect(
+      pluginChatRefusal(new PluginWorkspaceAdmissionError("unreachable")),
+    ).toEqual({
+      status: 503,
+      code: "INTERNAL_ERROR",
+      message: expect.stringContaining("couldn't reach its backend"),
+      details: { pluginCode: "PLUGIN_WORKSPACE_UNREACHABLE" },
+    });
+    expect(
+      pluginChatRefusal(new PluginInvocationError("INSTANCE_MESSAGE_UNAVAILABLE")),
+    ).toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      message: expect.stringContaining("can't send chat messages"),
+    });
+    expect(pluginChatRefusal(new Error("other"))).toBeUndefined();
+  });
+
+  it("answers a turn over the client's context budget as a refused request", () => {
+    expect(
+      pluginChatRefusal(
+        new PluginModelContextError("PLUGIN_CONTEXT_TURN_TOO_LARGE", {
+          budget: "turnMaxBytes",
+          actual: 9_000_000,
+          allowed: 8_388_608,
+        }),
+      ),
+    ).toEqual({
+      status: 413,
+      code: "VALIDATION_ERROR",
+      message: expect.stringContaining("Remove an App's context"),
+      details: { pluginCode: "PLUGIN_CONTEXT_TURN_TOO_LARGE" },
+    });
+    // Any other context error isn't about size, so it isn't answered as one.
+    expect(
+      pluginChatRefusal(
+        new PluginModelContextError("PLUGIN_CONTEXT_USER_TURN_MISSING"),
+      ),
+    ).toBeUndefined();
+  });
+});
+
+
+describe("plugin workspace runtime identity", () => {
+  const plain = { hostPolicy: { hostStyle: "mcpjam" } };
+
+  it("admits the owned AI-SDK runtime when a non-default style explicitly opts in", () => {
+    const extensions = resolvePluginExtensions({
+      hostStyle: plain.hostPolicy.hostStyle,
+      mcpProfile: { apps: { pluginExtensions: { enabled: true } } },
+    });
+    expect(extensions).toMatchObject({ enabled: true, explicit: true });
+    expect(() => assertPluginWorkspaceRuntime(plain)).not.toThrow();
+  });
+
+  it("keeps the ordinary MCPJam style default off", () => {
+    expect(resolvePluginExtensions({ hostStyle: "mcpjam" }).enabled).toBe(false);
+    expect(
+      resolvePluginExtensions({
+        hostStyle: "mcpjam",
+        mcpProfile: { apps: { pluginExtensions: { enabled: false } } },
+      }).capabilities.forms,
+    ).toBe(false);
+  });
+
+  it.each([
+    { harness: "claude-code" },
+    { harness: "cursor" },
+    { harness: "unknown" },
+    { agentLoop: "unknown" },
+    { harness: "codex", agentLoop: "codex" },
+  ])(
+    "rejects unowned or ambiguous selectors even in ChatGPT style: %j",
+    (selectors) => {
+      expect(() => assertPluginWorkspaceRuntime({
+        ...selectors, hostPolicy: { hostStyle: "chatgpt" },
+      })).toThrow(PluginWorkspaceAdmissionError);
+    },
+  );
+
+  it.each([{ harness: "codex" }, { agentLoop: "codex" }])(
+    "preserves an already admitted owned Codex runtime: %j",
+    (selectors) => expect(() => assertPluginWorkspaceRuntime({
+      ...selectors, hostPolicy: { hostStyle: "mcpjam" },
+    })).not.toThrow(),
+  );
+
+  it.each(["membership lost", "rollout off"])(
+    "requires a fresh backend decision after runtime admission: %s",
+    async (reason) => {
+      f.query.mockReset();
+      assertPluginWorkspaceRuntime(plain);
+      f.query.mockResolvedValueOnce({ projectId: "project", actorId: "actor" });
+      const admission = await admitPluginWorkspace({
+        descriptor, projectId: "project", bearer: "token",
+      });
+      f.query.mockRejectedValueOnce(
+        new ConvexError({ code: "FORBIDDEN", message: reason }),
+      );
+      await expect(admission.revalidate()).rejects.toMatchObject({
+        status: 403, code: "PLUGIN_WORKSPACE_DENIED",
+      });
+      expect(f.query).toHaveBeenCalledTimes(2);
+    },
+  );
+});

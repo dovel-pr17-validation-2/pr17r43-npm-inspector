@@ -1,0 +1,494 @@
+/**
+ * Inspector-side adapter of the model selection contract for the eval runner.
+ *
+ * The backend resolver owns hosted and org-cloud routing: a hosted selection
+ * is admitted by the backend's own `/stream` admission and an org selection by
+ * `/stream/org` — the calls the runner already makes, so this adapter adds no
+ * round trip. What it decides locally is everything the runner can decide
+ * WITHOUT the backend, using the contract's refusal codes:
+ *
+ *  - which rail a saved selection runs on. An explicit `org` / `local`
+ *    selection NEVER matches the hosted catalog first — that hosted-first
+ *    read is what let a saved "use my own key" choice run on MCPJam's key.
+ *    Only a legacy bare id keeps today's hosted-first behaviour;
+ *  - `credential_missing` when the connection a selection names cannot be
+ *    reached from this run (no organization to resolve an org connection in,
+ *    the org config no longer lists the provider, no local key for the
+ *    provider) — refused before any request is built, never "fixed" by
+ *    running on another credential;
+ *  - `invalid_model` when a connection with a known model list does not serve
+ *    the model;
+ *  - the `fallback_prohibited` refusal shape for executors that walk a
+ *    fallback;
+ *  - `org_keys_required` when the organization requires its own provider keys
+ *    ("Use your keys for all AI features") and the selection would run on
+ *    another source: a hosted (MCPJam-provided) model, a key on this machine,
+ *    or an org connection the backend did not call eligible (its
+ *    `policyEligibility`, read through `shared/org-ai-key-policy.ts`; the
+ *    backend's own code and message when it gave one). Refused here, before
+ *    any request is built, so nothing reaches a provider; the backend refuses
+ *    the same selections on its own routes.
+ *
+ * TODO(P0-1): `harness_unsupported` / `harness_unknown` from the harness ×
+ * model support evidence (`harnessModelSupport`, inspector PR #5559). That
+ * module is not on this branch's base; wire it here once it lands instead of
+ * duplicating the evidence table.
+ *
+ * No secrets in, none out: the input carries key PRESENCE (a key map is only
+ * probed with `has`), and a refusal's `evidence` names providers and
+ * connections, never a key.
+ */
+import {
+  assertModelSelection,
+  isLegacySelection,
+  selectionFromLegacyModelId,
+  validateModelSelection,
+  type ModelConnectionRef,
+  type ModelSelection,
+  type LegacyModelSelection,
+  type ModelSelectionPurpose,
+  type RequestedModelSelection,
+} from "@mcpjam/sdk";
+import type { HarnessOrgKeyRefusalReason } from "@/shared/harness-proxy-refusal-reasons";
+import { isAiConfigurationRefusalCode } from "@/shared/ai-execution-refusal";
+import {
+  connectionPolicyEligibility,
+  type PolicyEligibility,
+} from "@/shared/org-ai-key-policy";
+
+/** Refusal codes of the model selection contract. */
+export type ModelRefusalCode =
+  | "invalid_model"
+  | "model_retired"
+  | "harness_unsupported"
+  | "harness_unknown"
+  | "capability_missing"
+  | "capability_unknown"
+  | "policy_no_zdr_endpoint"
+  | "credential_missing"
+  | "free_tier_model_restricted"
+  | "guest_model_not_allowed"
+  | "fallback_prohibited"
+  /** The org connection's provider cannot serve the selected harness. */
+  | "provider_mismatch"
+  // The harness model proxy's org-key refusals (`org_keys_required`, `byok_*`,
+  // `transport_*`), from its own vocabulary.
+  | HarnessOrgKeyRefusalReason
+  // The organization AI-key policy's configuration refusals
+  // (`shared/ai-execution-refusal.ts`). Permanent until the org's
+  // configuration or the selection changes: never retried, never paged.
+  | "org_keys_required"
+  | "org_model_unconfigured"
+  | "org_runtime_unsupported"
+  | "ai_scope_unresolved"
+  | "provider_auth_failed";
+
+export type ModelRefusal = {
+  code: ModelRefusalCode;
+  reason: string;
+  evidence?: Record<string, unknown>;
+};
+
+/** Thrown by the runner when a selection is refused before execution. */
+export class ModelResolutionRefusalError extends Error {
+  readonly code: ModelRefusalCode;
+  readonly refusals: ModelRefusal[];
+
+  constructor(refusals: ModelRefusal[]) {
+    const first = refusals[0];
+    super(
+      refusals
+        .map((refusal) => `${refusal.code}: ${refusal.reason}`)
+        .join("; "),
+    );
+    this.name = "ModelResolutionRefusalError";
+    this.code = first?.code ?? "invalid_model";
+    this.refusals = refusals;
+  }
+}
+
+/** Rail the runner executes a resolved selection on. */
+export type LocalResolutionRail =
+  /** MCPJam-hosted: backend `/stream` (its admission decides the rest). */
+  | "hosted"
+  /** Org connection: backend `/stream/org` (or the org's local runtime). */
+  | "org"
+  /** A key on this machine / in this request. */
+  | "local";
+
+export type LocalResolutionPlan = {
+  rail: LocalResolutionRail;
+  /** The id the provider is called with (`nativeModelId`, else `modelId`). */
+  wireModelId: string;
+  /** Org provider key (`openai`, `custom:<slug>`, …) or the local provider. */
+  providerKey?: string;
+  connectionRef?: ModelConnectionRef;
+  fallback: ModelSelection["fallback"];
+};
+
+export type LocalResolutionResult =
+  | { ok: true; plan: LocalResolutionPlan }
+  | { ok: false; refusals: ModelRefusal[] };
+
+/** Provider keys that run without an API key. */
+const KEYLESS_LOCAL_PROVIDERS = new Set(["ollama"]);
+
+/**
+ * The sentence a policy refusal carries. Kept in one place so the eval row,
+ * the chat error and the backend's own refusal read the same.
+ */
+export const ORG_KEYS_REQUIRED_REASON =
+  "This organization requires its own provider keys for AI features. Choose a model from an organization provider.";
+
+/**
+ * The refusal for an org connection the backend did not call eligible while
+ * the organization requires its own keys, with the backend's message when it
+ * wrote one. Its code is kept when it is a configuration refusal (today it
+ * always is: `org_keys_required` or `credential_missing`); anything else reads
+ * as `org_keys_required`, so a policy refusal is never mistaken for an outage
+ * to retry.
+ */
+export function policyIneligibleRefusal(
+  verdict: PolicyEligibility,
+  evidence: Record<string, unknown>,
+): ModelRefusal {
+  return {
+    code:
+      verdict.code && isAiConfigurationRefusalCode(verdict.code)
+        ? (verdict.code as ModelRefusalCode)
+        : "org_keys_required",
+    reason: verdict.message ?? ORG_KEYS_REQUIRED_REASON,
+    evidence,
+  };
+}
+
+export type ResolveLocalModelSelectionInput = {
+  selection: ModelSelection;
+  purpose: ModelSelectionPurpose;
+  /**
+   * The org provider key the legacy fields of the same record derive
+   * (`deriveOrgProviderKey`), used to find the org connection in a resolved
+   * org config. The org config does not carry provider row ids, so the
+   * connection's id itself is checked by the backend: the runner forwards
+   * the selection ({@link backendModelSelection}) as `modelSelection` on
+   * `/stream/org` and `/stream/org/resolve`, and a backend that understands
+   * it re-resolves the `connectionRef` before decrypting any key (a deleted
+   * or re-created connection is `credential_missing`). A backend that
+   * predates selections ignores the field, and the request runs as the
+   * legacy `providerKey` + `model` pair it always was.
+   */
+  orgProviderKey?: string;
+  /** Whether the run has an organization/project to resolve org connections in. */
+  hasOrgTarget: boolean;
+  /**
+   * The run's resolved org config, when the route resolved one: providers by
+   * key, with their known model lists. `undefined` = not resolved here (the
+   * backend decides on `/stream/org`).
+   */
+  orgProviders?: ReadonlyArray<{
+    providerKey: string;
+    modelIds?: readonly string[];
+    /**
+     * The backend's verdict on the connection under the organization's key
+     * policy. Missing (an older backend) while the policy is on reads as not
+     * eligible.
+     */
+    policyEligibility?: PolicyEligibility;
+  }>;
+  /** Presence check for a local provider key. Never returns the key. */
+  hasLocalKey: (providerKey: string) => boolean;
+  /**
+   * The organization requires its own provider keys for AI features
+   * (`aiKeyPolicy.requireOrgKeys` on the resolved org config). When set, only
+   * an `org` selection on a connection the backend calls eligible resolves;
+   * everything else is refused before any request is built.
+   */
+  requireOrgKeys?: boolean;
+};
+
+/** Provider-native id a selection is executed with. */
+export function wireModelIdForSelection(selection: ModelSelection): string {
+  return selection.nativeModelId ?? selection.modelId;
+}
+
+/** The model segment of a custom id, for matching a provider's model list. */
+function modelNameForProvider(
+  wireModelId: string,
+  providerKey: string,
+): string {
+  const prefix = `${providerKey}:`;
+  return wireModelId.startsWith(prefix)
+    ? wireModelId.slice(prefix.length)
+    : wireModelId;
+}
+
+/**
+ * Resolve a saved selection to a rail, or refuse it with the contract's
+ * codes. Pure.
+ */
+export function resolveLocalModelSelection(
+  input: ResolveLocalModelSelectionInput,
+): LocalResolutionResult {
+  const { selection } = input;
+  const wireModelId = wireModelIdForSelection(selection);
+  const fallback = selection.fallback;
+
+  if (selection.source === "hosted") {
+    if (input.requireOrgKeys) {
+      return refuse("org_keys_required", ORG_KEYS_REQUIRED_REASON, {
+        source: "hosted",
+      });
+    }
+    return { ok: true, plan: { rail: "hosted", wireModelId, fallback } };
+  }
+
+  const connectionRef = selection.connectionRef;
+  if (selection.source === "org") {
+    if (connectionRef?.kind !== "orgProvider") {
+      return refuse(
+        "credential_missing",
+        "org selection has no org connection",
+      );
+    }
+    const evidence = { connectionId: connectionRef.id };
+    if (!input.hasOrgTarget) {
+      return refuse(
+        "credential_missing",
+        "this run has no organization to resolve the saved org connection in",
+        evidence,
+      );
+    }
+    if (!input.orgProviderKey) {
+      return refuse(
+        "credential_missing",
+        "the saved org connection names no provider this model can use",
+        evidence,
+      );
+    }
+    if (!input.orgProviders && input.requireOrgKeys) {
+      // No connection rows, so no backend verdict to read: fail closed.
+      return {
+        ok: false,
+        refusals: [
+          policyIneligibleRefusal(connectionPolicyEligibility(null, true), {
+            ...evidence,
+            providerKey: input.orgProviderKey,
+          }),
+        ],
+      };
+    }
+    if (input.orgProviders) {
+      const provider = input.orgProviders.find(
+        (row) => row.providerKey === input.orgProviderKey,
+      );
+      if (!provider) {
+        return refuse(
+          "credential_missing",
+          `the saved org connection (${input.orgProviderKey}) is no longer configured for this organization`,
+          { ...evidence, providerKey: input.orgProviderKey },
+        );
+      }
+      if (input.requireOrgKeys) {
+        const verdict = connectionPolicyEligibility(provider, true);
+        if (!verdict.eligible) {
+          return {
+            ok: false,
+            refusals: [
+              policyIneligibleRefusal(verdict, {
+                ...evidence,
+                providerKey: input.orgProviderKey,
+              }),
+            ],
+          };
+        }
+      }
+      if (
+        provider.modelIds?.length &&
+        (input.orgProviderKey.startsWith("custom:") ||
+          input.orgProviderKey === "ollama") &&
+        !provider.modelIds.includes(
+          modelNameForProvider(wireModelId, input.orgProviderKey),
+        )
+      ) {
+        return refuse(
+          "invalid_model",
+          `${input.orgProviderKey} does not serve ${selection.modelId}`,
+          { ...evidence, providerKey: input.orgProviderKey },
+        );
+      }
+    }
+    return {
+      ok: true,
+      plan: {
+        rail: "org",
+        wireModelId,
+        providerKey: input.orgProviderKey,
+        connectionRef,
+        fallback,
+      },
+    };
+  }
+
+  // source === "local"
+  if (input.requireOrgKeys) {
+    return refuse("org_keys_required", ORG_KEYS_REQUIRED_REASON, {
+      source: "local",
+      ...(connectionRef?.kind === "localProvider"
+        ? { providerKey: connectionRef.providerKey }
+        : {}),
+    });
+  }
+  if (connectionRef?.kind !== "localProvider") {
+    return refuse(
+      "credential_missing",
+      "local selection has no local provider",
+    );
+  }
+  const providerKey = connectionRef.providerKey;
+  if (providerKey === "custom") {
+    return refuse(
+      "credential_missing",
+      `local custom provider "${connectionRef.customProviderName ?? ""}" is not available to this runner`,
+      { providerKey, customProviderName: connectionRef.customProviderName },
+    );
+  }
+  if (
+    !KEYLESS_LOCAL_PROVIDERS.has(providerKey) &&
+    !input.hasLocalKey(providerKey)
+  ) {
+    return refuse(
+      "credential_missing",
+      `no ${providerKey} key is configured for this run`,
+      { providerKey },
+    );
+  }
+  return {
+    ok: true,
+    plan: { rail: "local", wireModelId, providerKey, connectionRef, fallback },
+  };
+}
+
+/**
+ * The refusal an executor records instead of taking a fallback the selection
+ * does not permit. `null` when the fallback is permitted.
+ */
+export function fallbackProhibitedRefusal(
+  selection: RequestedModelSelection,
+  attempted: { rail: string; fallbackRail: string },
+): ModelRefusal | null {
+  if (isLegacySelection(selection)) return null;
+  if (selection.fallback.provider !== "none") return null;
+  return {
+    code: "fallback_prohibited",
+    reason: `the ${attempted.rail} attempt failed and this selection does not permit a ${attempted.fallbackRail} fallback`,
+    evidence: { rail: attempted.rail, fallbackRail: attempted.fallbackRail },
+  };
+}
+
+/**
+ * The selection the runner forwards to the backend as the request body's
+ * `modelSelection`: a `hosted` one to `/stream`, an `org` one to `/stream/org`
+ * and `/stream/org/resolve`, so the backend resolver re-checks it (and records
+ * it as the requested selection instead of `legacy`). A `local` selection is
+ * never sent: it runs on this request's own key and names nothing the backend
+ * could resolve. `undefined` for none.
+ *
+ * Validated (and normalized) with the SDK validator first, which rejects any
+ * field outside the selection shape, so nothing but the saved choice (never a
+ * key) can ride along. An invalid selection throws rather than being dropped:
+ * dropping it would send the request as legacy and skip the backend's
+ * connection re-check.
+ */
+export function backendModelSelection(
+  selection: ModelSelection | undefined,
+): ModelSelection | undefined {
+  if (selection === undefined) return undefined;
+  const validated = assertModelSelection(selection, "modelSelection");
+  return validated.source === "local" ? undefined : validated;
+}
+
+/**
+ * Read a stored selection off an untrusted record. Invalid → `undefined` (the
+ * record reads as legacy); valid → the normalized selection.
+ */
+export function readStoredModelSelection(
+  value: unknown,
+): ModelSelection | undefined {
+  if (value === undefined || value === null) return undefined;
+  const result = validateModelSelection(value);
+  return result.ok ? result.selection : undefined;
+}
+
+export function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+const LEGACY_KEYS: ReadonlySet<string> = new Set([
+  "source",
+  "modelId",
+  "provider",
+]);
+
+/**
+ * A STORED legacy selection (`{ source: "legacy", modelId, provider? }`), or
+ * `undefined`. Strict: an unknown key, a blank id or a non-string provider
+ * reads as no selection — a malformed row is never guessed at.
+ */
+export function readStoredLegacySelection(
+  value: unknown,
+): LegacyModelSelection | undefined {
+  if (!isPlainRecord(value) || value.source !== "legacy") return undefined;
+  for (const key of Object.keys(value)) {
+    if (!LEGACY_KEYS.has(key)) return undefined;
+  }
+  const { modelId, provider } = value;
+  if (typeof modelId !== "string" || modelId.trim() === "") return undefined;
+  if (provider !== undefined && typeof provider !== "string") return undefined;
+  return {
+    source: "legacy",
+    modelId,
+    ...(typeof provider === "string" && provider.trim() !== ""
+      ? { provider }
+      : {}),
+  };
+}
+
+/**
+ * The selection that decides a row's rail: a valid saved selection
+ * (normalized by the SDK validator), else a stored legacy one, else
+ * `undefined` (an unlabelled row, which keeps today's path).
+ */
+export function readRoutingSelection(
+  value: unknown,
+): RequestedModelSelection | undefined {
+  return readStoredModelSelection(value) ?? readStoredLegacySelection(value);
+}
+
+/** The marker a conversion stamps BESIDE the selection it chose. */
+export type ModelSelectionOrigin = "backfill";
+
+/** The conversion marker beside a selection, or `undefined`. */
+export function readSelectionOrigin(
+  value: unknown,
+): ModelSelectionOrigin | undefined {
+  return value === "backfill" ? "backfill" : undefined;
+}
+
+/** The requested selection for a record: its selection, else legacy. */
+export function requestedModelSelection(args: {
+  selection?: ModelSelection;
+  legacyModelId: string;
+}): RequestedModelSelection {
+  return args.selection ?? selectionFromLegacyModelId(args.legacyModelId);
+}
+
+function refuse(
+  code: ModelRefusalCode,
+  reason: string,
+  evidence?: Record<string, unknown>,
+): LocalResolutionResult {
+  return {
+    ok: false,
+    refusals: [{ code, reason, ...(evidence ? { evidence } : {}) }],
+  };
+}

@@ -1,0 +1,341 @@
+# Contributing
+
+First off, thank you for considering contributing to MCPJam Inspector! It's people like you that make the open source community such a great place.
+
+## Finding an issue to work on
+
+1. You can find things to work on in our [issues tab](https://github.com/MCPJam/inspector/issues).
+2. Look for issues labelled `good first issue` and `very easy`. These are great starter tasks that are low commitment.
+3. Once you find an issue you like to work on, comment on the issue and tag @chelojimenez. Then assign yourself the issue. This helps avoid multiple contributors working on the same issue.
+
+## Getting Started
+
+Before you get started, please consider giving the project a star. It helps grow the project and gives your contributions more recognition.
+
+Also join our [Discord channel](https://discord.com/invite/JEnDtz8X6z). That's where the community and other open source contributors communicate.
+
+### Prerequisites
+
+- [Node.js](https://nodejs.org/) — use the version in
+  [`mcpjam-inspector/.nvmrc`](./mcpjam-inspector/.nvmrc) (`nvm use` picks it up).
+  v22 is the floor for running the app; **Node 25 and newer cannot package the
+  desktop app** — `electron-forge make` exits 0 and writes no `out/`, so the
+  failure looks like success. Watch out for Homebrew here: its `node@24` and
+  `node@25` formulae have both symlinked to Node 26, so check `node -v` rather
+  than trusting the formula name.
+- [npm](https://www.npmjs.com/) (comes with Node.js)
+
+### Fork, Clone, and Branch
+
+1.  **Fork** the repository on GitHub.
+2.  **Clone** your fork locally:
+    ```bash
+    git clone https://github.com/YOUR_USERNAME/inspector.git
+    cd inspector
+    ```
+3.  Create a new **branch** for your changes:
+    ```bash
+    git checkout -b my-feature-branch
+    ```
+
+### Project Structure
+
+This is an **npm workspaces monorepo**. The main packages are:
+
+| Workspace           | Package                 | Description                              |
+| ------------------- | ----------------------- | ---------------------------------------- |
+| `mcpjam-inspector/` | `@mcpjam/inspector`     | Inspector app (client, server, Electron) |
+| `sdk/`              | `@mcpjam/sdk`           | MCP SDK for testing and evals            |
+| `cli/`              | `@mcpjam/cli`           | CLI tool                                 |
+| `design-system/`    | `@mcpjam/design-system` | Shared UI components                     |
+| `soundcheck/`       | `@mcpjam/soundcheck`    | Soundcheck app                           |
+| `mcp/`              | `@mcpjam/mcp`           | MCP worker                               |
+
+Most contributions target the `mcpjam-inspector/` workspace.
+
+### Setup
+
+Install dependencies for all workspaces from the repo root:
+
+```bash
+npm install
+```
+
+## Development
+
+Copy the env file inside the inspector workspace:
+
+```bash
+cp mcpjam-inspector/.env.local mcpjam-inspector/.env.development
+```
+
+Then start the inspector in dev mode:
+
+```bash
+npm run dev -w @mcpjam/inspector
+```
+
+This runs:
+
+- **Client**: Vite dev server on `:5173`
+- **Server**: Hono dev server on `:6274`
+- **Platform MCP worker**: `mcp/` via `wrangler dev --env dev` on `:8787`
+
+Open `http://localhost:5173` in your browser. The client proxies API requests to the server.
+
+The platform MCP worker backs the Home/MCPJam agent's workspace tools (`list_projects`,
+`show_servers`, eval/scenario tools). It starts automatically with `npm run dev`, and the
+agent connects to it on `:8787` — no env var to set. If you only need the UI/server and
+want to skip the worker (and its one-time UI build), use `npm run dev:app` instead.
+
+### Dev Convex configuration (for the Home agent's platform tools)
+
+The platform worker forwards your dev AuthKit token through `/api/v1` to the dev **Convex**
+deployment (the one your `.env.development` `CONVEX_HTTP_URL` points at). That deployment
+must trust the dev WorkOS app, or `list_projects` returns a 401. Set these once on the dev
+Convex deployment (in the `mcpjam-backend` repo / Convex dashboard — this is backend/infra
+config, not in this repo):
+
+```bash
+npx convex env set WORKOS_CLIENT_ID client_01KTN2EWHHJCKRB8RSR307X4SG
+npx convex env set AUTHKIT_DOMAIN  deep-vanilla-68-test.authkit.app
+npx convex env list   # verify WORKOS_CLIENT_ID / AUTHKIT_DOMAIN are the dev values
+```
+
+Do not point `GUEST_JWKS_URL` anywhere: a development deployment verifies guest
+tokens with its own `/guest/jwks` by default. (The shared OSS deployment's
+pairing with the hosted guest authority is managed by operators.)
+
+### Guest sessions
+
+The Inspector never writes configuration to a backend while it runs. Guests come
+from ONE guest authority per instance:
+
+- **Standard profile** (the committed `.env.local`, and packaged releases): the
+  hosted Inspector at `app.mcpjam.com`. Nothing to set up.
+- **Your own development deployment**: initialize it once, explicitly:
+
+  ```bash
+  npm run dev:setup-guest-auth -w @mcpjam/inspector -- --deployment dev:<deployment-name> \
+    --env-file mcpjam-inspector/.env.development.local
+  ```
+
+  This accepts only a fully qualified `dev:` selector, stops unless Convex itself
+  reports that name as a development deployment, runs the Convex CLI from an
+  isolated directory with your shell's `CONVEX_*` settings removed, initializes only
+  missing values (it never overwrites, never writes `GUEST_JWKS_URL`), and adds the
+  deployment's addresses and guest credentials to the profile you name.
+
+### Running several instances (worktrees)
+
+```bash
+npm run dev:worktree -w @mcpjam/inspector -- <N> [local|staging|preview <viteConvexUrl> <convexHttpUrl>] [--env-file <profile>]
+```
+
+Instance `N` gets client `5173+N`, server `6274+N`, platform worker `8787+N` and
+worker debugger `9229+N` (`--client-port`, `--server-port`, `--worker-port`,
+`--debugger-port` override them; `--no-worker` skips the worker). The launcher
+resolves ONE profile for the instance and passes it to the server, Vite and the
+worker, none of which then reads `.env` files on its own:
+
+- `--env-file <profile>` is the whole profile and wins over everything, except
+  with `preview`: there the two URLs name the backend and the file supplies its
+  other settings (for example its guest credentials). A relative path is
+  resolved from the directory you ran npm in.
+- `local` (default): the committed `.env.local`, overlaid by this worktree's
+  `.env.development.local` — or, only when you named no target, the main
+  worktree's, read in place (secrets are never copied between worktrees).
+- `staging` / `preview` never inherit the local profile. Both default to the
+  hosted guest authority at `staging.mcpjam.com`.
+
+Backend settings (Convex addresses, guest authority, service tokens, `COMPUTERS_*`,
+`DEPLOYMENT_SESSION_JWT_*`) and sign-in settings (WorkOS, CLI/Slack/Discord auth) are
+each taken as a group from one layer, so a profile that points at another backend never
+picks up the standard profile's credentials. Values for those settings exported in your
+shell are ignored (the launcher lists them). Callback origins (`CLI_AUTH_PUBLIC_ORIGIN`
+and the Slack/Discord link origins) follow the instance's port.
+
+Each instance keeps its own sign-in and guest cookies, so instances never sign each other
+in or out. After upgrading from an older Inspector, each instance asks you to sign in
+once; guest sessions carry over.
+
+### Electron Development
+
+One command, from a fresh clone:
+
+```bash
+npm run electron:dev -w @mcpjam/inspector
+```
+
+It runs next to `npm run dev`. The launcher (`scripts/electron-dev.mjs`) picks
+a free server port once (6274, or the next free one when another Inspector
+holds it) and hands it to both the renderer's `/api` proxy and the main
+process, so the window always talks to its own embedded server and keeps its
+own sign-in: the desktop app and the web app on the same machine never share a
+WorkOS or guest cookie. `--server-port N` pins the port
+(`npm run electron:dev -w @mcpjam/inspector -- --server-port 7000`).
+
+Its `pre` step builds the SDK if `../sdk/dist` is stale and regenerates the
+gitignored bundles (`PluginShim.bundled.ts` and friends) and telemetry catalogs
+(`*telemetry-catalog.generated.json` and friends), so there is nothing to run
+first. Then it starts:
+
+- the Electron main process, with the embedded Hono server on the chosen port
+- Vite's dev server for the renderer, which is what the window loads
+- file watchers for the main and preload bundles
+- the telemetry catalog watcher
+
+**Telemetry catalogs** are build outputs too. The names the strict telemetry
+builders may forward (log messages, error classes, routes, source files) are
+read from source by `scripts/generate-telemetry-catalogs.mjs`, which `npm
+install`, every SDK and Inspector build, test and typecheck, and the dev loops
+(`dev`, `dev:app`, `dev:server`, `dev:client`, SDK `dev`, `electron:dev`,
+`test:watch`) run for you. A new logger message, route or error class is
+catalogued on save; there is no file to commit. Error names that dependencies
+set are not in our source: add them to `DEPENDENCY_ERRORS` in that script, or
+their errors reach Sentry and Axiom as `UnknownError`.
+
+**Does my field arrive?** Telemetry forwards only fields that have a rule, so a
+new diagnostic field can be dropped without any error. Check it in the test
+that adds it: `expectTelemetryFields(sample, ["statusCode"])` from
+`mcpjam-inspector/shared/__tests__/explain-telemetry.ts` runs the sample
+through the real log-row or server-analytics builder and fails with each
+missing field's drop reason (for example, "no field rule: declare it in
+server/utils/log-events.ts"). `explainTelemetry(sample)` returns the same
+`{ forwarded, dropped }` for a look before you write the assertion. An org,
+project or server ID arrives only from the server's request context, never
+from a payload; see `mcpjam-inspector/server/utils/LOGGING.md`.
+
+**Reload semantics**, which differ by process:
+
+| You edit                            | What happens                                         |
+| ----------------------------------- | ---------------------------------------------------- |
+| `client/` (renderer)                | Vite HMR, no restart                                 |
+| `src/` (main, preload) or `server/` | bundle rebuilds, then the app restarts automatically |
+
+A restart takes a couple of seconds and prints `[hot-restart] restart #N`. A
+build error prints the error and does **not** restart, so you keep the last
+working app until you fix it. You never need to type `rs`.
+
+Four environment variables, for when you need them:
+
+| Variable                            | Effect                                                                  |
+| ----------------------------------- | ----------------------------------------------------------------------- |
+| `MCPJAM_ELECTRON_DEV_NO_RESTART=1`  | never auto-restart (holding a breakpoint in main)                       |
+| `MCPJAM_ELECTRON_DEV_SOURCEMAP=1`   | emit main-process sourcemaps (off in dev; ~47MB per rebuild)            |
+| `MCPJAM_ELECTRON_DEV_BUNDLE_DEPS=1` | bundle dependencies as packaging does, instead of leaving them external |
+| `MCPJAM_ELECTRON_DEV_TIMING=1`      | print per-build graph vs render timings                                 |
+
+In dev, `node_modules` is right there, so dependencies are left external rather
+than bundled — that is what keeps a rebuild at a few seconds instead of a
+minute. Packaging still bundles everything, because the packaged app ships no
+`node_modules`.
+
+#### Packaging
+
+`npm run electron:package` and `npm run electron:make` check their
+preconditions first and refuse to start if something would fail silently — the
+Node version, a missing `dist/client`, or (on macOS) the DMG maker's native
+addons. Each failure prints the exact command that fixes it. If the addons are
+the problem:
+
+```bash
+npm run electron:fix:dmg-deps -w @mcpjam/inspector
+```
+
+### Building the Project
+
+To build everything (SDK, CLI, and Inspector):
+
+```bash
+npm run build
+```
+
+To build individual workspaces:
+
+- `npm run build -w @mcpjam/sdk` - Build the SDK
+- `npm run build -w @mcpjam/cli` - Build the CLI
+- `npm run build -w @mcpjam/inspector` - Build the Inspector
+
+To start the production build locally:
+
+```bash
+npm run start -w @mcpjam/inspector
+```
+
+### Running Tests
+
+Run all tests and type checks:
+
+```bash
+npm run verify
+```
+
+Or run tests for a specific workspace:
+
+```bash
+npm run test -w @mcpjam/inspector
+npm run test -w @mcpjam/sdk
+npm run test -w @mcpjam/cli
+```
+
+#### WorkOS contract tests
+
+The suites named `server/**/*.emulator.test.ts` boot
+[`@workos/emulate`](https://github.com/workos/emulate) — WorkOS's own in-memory
+API server — in-process and drive the real code paths against it, rather than
+stubbing `fetch` and mocking token verification. That is what lets them assert
+things only WorkOS can settle: that a spent refresh token is refused, that a
+revoked API key stops validating immediately, that a forged JWT fails against
+the issuer's real JWKS.
+
+```bash
+npm run test -w @mcpjam/inspector -- server/routes/web/__tests__/api-keys.emulator.test.ts
+```
+
+Each file starts its own emulator on port 0 in `beforeAll`, so nothing special
+is needed in CI and the six shards cannot collide. The helper
+(`server/test/support/workos-emulator.ts`) sets `WORKOS_API_BASE_URL` and the
+other env itself — do not export that variable from your shell, and see
+`mcpjam-inspector/HOSTED_DEPLOYMENT.md` for why it is loopback-only.
+
+Requires **Node >= 22.11** (the emulator's floor; CI runs 24.x). The helper says
+so explicitly rather than failing with a stack trace on an older runtime.
+
+The pre-existing mocked suites (`api-keys.test.ts`, `bearer-auth.test.ts`,
+`workos-authkit.test.ts`) are still the right place for logic that does not need
+a server — they are faster, and they are also the regression guard proving the
+default path still points at `api.workos.com`.
+
+## Code Style
+
+We use [Prettier](https://prettier.io/) to maintain a consistent code style. Before you commit your changes, please format your code by running:
+
+```bash
+npm run prettier-fix -w @mcpjam/inspector
+```
+
+## Commit Messages
+
+We follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification. This helps us keep the commit history clean and readable.
+
+Your commit messages should be structured as follows:
+
+```
+<type>[optional scope]: <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+**Example:**
+`feat(client): add new button to the main component`
+`fix(server): resolve issue with API endpoint`
+
+## Getting Help
+
+- [Discord](https://discord.com/invite/JEnDtz8X6z)
+- [Docs](https://docs.mcpjam.com)
+
+Thank you for your contribution!

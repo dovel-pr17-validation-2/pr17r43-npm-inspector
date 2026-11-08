@@ -1,0 +1,924 @@
+import { inspectorAiRequestHeaders } from "./ai-request-headers.js";
+import {
+  verifyGithubCredentialAccess,
+  githubExecutionPolicy,
+} from "../services/github-checks/credential-policy.js";
+import type { ModelWorkload } from "./model-workload.js";
+import { createHash } from "node:crypto";
+import {
+  getModelById,
+  isBedrockModelId,
+  type ModelDefinition,
+} from "@/shared/types";
+import {
+  classifyModelIdProvider,
+  isRuntimeChosenModelSentinel,
+  runtimeChosenModelSentinelName,
+} from "@/shared/model-provider";
+import { decideTurnRail } from "./selection-rail.js";
+import type { OrgProviderResolvedConfig } from "@mcpjam/sdk/model-factory";
+import type { ModelSelection, RequestedModelSelection } from "@mcpjam/sdk";
+import type { BaseUrls, CustomProviderConfig } from "./chat-helpers";
+import { HOSTED_MODE } from "../config.js";
+import { logger } from "./logger";
+import { backendFailureText } from "./backend-failure-text.js";
+import {
+  getServiceCredential,
+  INSPECTOR_SERVICE_TOKEN_HEADER,
+  ServiceCredentialUnavailableError,
+} from "../services/service-credential.js";
+import {
+  normalizeOrgAiKeyPolicy,
+  normalizePolicyEligibility,
+  orgRequiresOwnKeys,
+  type OrgAiKeyPolicy,
+  type PolicyEligibility,
+} from "@/shared/org-ai-key-policy";
+import {
+  RESOLVE_TIMEOUT_MS,
+  assertSafeHostedOutboundUrl,
+  formatTargetForCache,
+  isUnsafeHostedOutboundUrl,
+  normalizeAuthHeader,
+  normalizeServerIds,
+} from "./org-resolve-request.js";
+import {
+  buildRuntimeCacheKey,
+  cacheRuntimeAnswer,
+  orgSelectionOnly,
+  pruneRuntimeResolveCache,
+  requestOrgProviderRuntime,
+  runtimeResolveCache,
+  type LocalOrgAttemptRequest,
+} from "./org-runtime-admission.js";
+
+// The hosted-mode SSRF guard on a provider's base URL lives with the request
+// plumbing; re-exported for callers that import it from here.
+export { isUnsafeHostedOutboundUrl };
+
+// Types
+
+export type ResolvedProviderConfig = {
+  providerKey: string;
+  apiKey?: string;
+  baseUrl?: string;
+  protocol?: string;
+  modelIds?: string[];
+  displayName?: string;
+  selectedModels?: string[];
+  /**
+   * The backend withheld this provider's key: the organization requires its
+   * own provider keys, so org models run through `/stream/org` (cloud) and are
+   * never executed locally with an exported key. `apiKey` is then absent.
+   */
+  exportDenied?: boolean;
+  /** Why the key was withheld (`org_keys_required`). */
+  exportDeniedCode?: string;
+  /**
+   * The backend's verdict on whether this connection may serve AI requests
+   * while the organization requires its own keys. Read it only through
+   * `connectionPolicyEligibility` (`shared/org-ai-key-policy.ts`), which
+   * fails closed when an older backend sent none.
+   */
+  policyEligibility?: PolicyEligibility;
+};
+
+// The policy and its reader live in `shared/org-ai-key-policy.ts`, shared
+// with the browser; re-exported for the server modules that import them here.
+export type { OrgAiKeyPolicy, PolicyEligibility };
+export { orgRequiresOwnKeys };
+
+export type ResolvedOrgModelConfig = {
+  providers: ResolvedProviderConfig[];
+  /** Saved background model, checked by each consumer before routing. */
+  defaultModel?: unknown;
+  /**
+   * Absent on a backend that predates the policy, which reads as "off". When
+   * `requireOrgKeys` is set, hosted (MCPJam-provided) and local selections are
+   * refused `org_keys_required`, and org models run only through
+   * `/stream/org`, on connections the backend calls eligible.
+   */
+  aiKeyPolicy?: OrgAiKeyPolicy;
+};
+
+/**
+ * Read one provider row off the resolve response. A row the backend marked
+ * `exportDenied` never carries a key into this process, whatever else the
+ * body says: the policy forbids local execution with an exported key, and
+ * dropping it here keeps every downstream consumer (`buildModelApiKeys…`,
+ * `buildLlmRuntimeConfig…`) honest without each re-checking the flag. The
+ * row's policy verdict is kept only when it is well formed; a malformed one
+ * reads as missing, which fails closed while the policy is on.
+ */
+function parseResolvedProvider(raw: unknown): ResolvedProviderConfig | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const row = raw as Record<string, unknown>;
+  if (typeof row.providerKey !== "string" || row.providerKey.length === 0) {
+    return null;
+  }
+  const exportDenied = row.exportDenied === true;
+  const provider = { ...(row as ResolvedProviderConfig) };
+  const policyEligibility = normalizePolicyEligibility(row.policyEligibility);
+  if (policyEligibility) {
+    provider.policyEligibility = policyEligibility;
+  } else {
+    delete provider.policyEligibility;
+  }
+  if (exportDenied) {
+    delete provider.apiKey;
+    provider.exportDenied = true;
+    if (typeof row.exportDeniedCode === "string" && row.exportDeniedCode) {
+      provider.exportDeniedCode = row.exportDeniedCode;
+    } else {
+      delete provider.exportDeniedCode;
+    }
+  } else {
+    delete provider.exportDenied;
+    delete provider.exportDeniedCode;
+  }
+  return provider;
+}
+
+export type ResolveOrgModelConfigTarget =
+  | { projectId: string }
+  | { organizationId: string };
+
+export type ResolveOrgProviderRuntimeTarget = { projectId: string };
+
+export type ResolveOrgModelConfigAuth = {
+  authHeader?: string;
+  bearerToken?: string;
+  /**
+   * Scenario identity is `scenarioId` + `accessVersion`. The cache key hashes
+   * these so a link-token rotation does not invalidate model-config cache
+   * entries, while an `accessVersion` bump (mode change, revoke, allowlist
+   * edit) does.
+   */
+  scenarioId?: string;
+  accessVersion?: number;
+  serverIds?: string[];
+};
+
+// ---------------------------------------------------------------------------
+// Local-runtime eligibility
+//
+// Mirrors LOCAL_RUNTIME_PROVIDERS in convex/organizationModelProviders.ts.
+// Used by the chat-v2 route to skip the /stream/org/resolve round-trip for
+// providers that can never run locally — those always go through the cloud
+// path, so paying for a runtime-resolution call (and inheriting its failure
+// modes) on every turn is pure overhead and a regression for the cloud path.
+// ---------------------------------------------------------------------------
+
+const LOCAL_RUNTIME_ELIGIBLE_PROVIDERS = new Set(["ollama"]);
+
+export function isLocalRuntimeEligible(providerKey: string): boolean {
+  return (
+    LOCAL_RUNTIME_ELIGIBLE_PROVIDERS.has(providerKey) ||
+    providerKey.startsWith("custom:")
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Resolution — call the Convex HTTP endpoint
+// ---------------------------------------------------------------------------
+
+const ORG_MODEL_CONFIG_FEATURE = "Organization model providers";
+/** Service-credential route (hosted Inspector). */
+export const ORG_MODEL_CONFIG_SERVICE_PATH =
+  "/internal/v1/org-model-config/resolve";
+/** Bearer-only twin of the same handler (self-hosted Inspector). */
+export const ORG_MODEL_CONFIG_BEARER_PATH = "/v1/org-model-config/resolve";
+
+// ---------------------------------------------------------------------------
+// In-process cache — avoids one 15 s HTTP call per eval test case.
+// TTL is intentionally short so key rotations propagate within a minute.
+//
+// Only an answer that withholds keys is cached (the organization requires its
+// own keys, or a provider's key was export-denied). An answer that hands this
+// process keys is re-read every time: cached, it would keep running on them
+// for up to a minute after an admin turned "Use your keys for all AI
+// features" on. A stale withholding answer only fails closed.
+// ---------------------------------------------------------------------------
+
+const CACHE_TTL_MS = 60_000;
+const resolveCache = new Map<
+  string,
+  { result: ResolvedOrgModelConfig; expiresAt: number }
+>();
+
+/**
+ * The authorization scope of one org-model-config read: target, normalized
+ * bearer, guest scenario/access version and server ids. Also keys the chat
+ * turns' shared policy answers (`own-key-turn-policy.ts`), so both caches
+ * agree on what counts as the same caller.
+ */
+export function buildCacheKey(
+  params: ResolveOrgModelConfigTarget,
+  auth: ResolveOrgModelConfigAuth | undefined,
+): string {
+  const target = formatTargetForCache(params);
+  // Cache key hashes (scenarioId, accessVersion) so a link-token rotation
+  // doesn't invalidate cache entries while an accessVersion bump (mode
+  // change, revoke, allowlist edit) does.
+  const authHash = createHash("sha256")
+    .update(
+      JSON.stringify({
+        install: process.env.CONVEX_HTTP_URL ?? "",
+        authorization: normalizeAuthHeader(auth) ?? "",
+        scenarioId: auth?.scenarioId?.trim() ?? "",
+        accessVersion:
+          auth?.scenarioId && auth.scenarioId.trim() &&
+          Number.isFinite(auth?.accessVersion)
+            ? auth.accessVersion
+            : null,
+        serverIds: normalizeServerIds(auth?.serverIds),
+      }),
+    )
+    .digest("hex");
+  return `${target}:auth:${authHash}`;
+}
+
+export async function resolveOrgModelConfig(
+  params: ResolveOrgModelConfigTarget,
+  auth?: ResolveOrgModelConfigAuth,
+): Promise<ResolvedOrgModelConfig> {
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) {
+    throw new Error("CONVEX_HTTP_URL is not set");
+  }
+
+  // With the service credential (hosted), the internal route; without it
+  // (every self-hosted build), the backend's bearer-only twin, which runs the
+  // same handler and authorizes the same user off the same bearer. Without a
+  // credential AND without a bearer there is nobody to resolve for.
+  const inspectorServiceToken = getServiceCredential();
+  const authHeader = normalizeAuthHeader(auth);
+  if (!inspectorServiceToken && !authHeader) {
+    throw new ServiceCredentialUnavailableError(ORG_MODEL_CONFIG_FEATURE);
+  }
+  const serverIds = normalizeServerIds(auth?.serverIds);
+  await verifyGithubCredentialAccess();
+  const cacheKey = buildCacheKey(params, auth);
+  const cached = resolveCache.get(cacheKey);
+  if (!githubExecutionPolicy() && cached && cached.expiresAt > Date.now()) {
+    return cached.result;
+  }
+
+  const url = `${convexHttpUrl.replace(/\/$/, "")}${
+    inspectorServiceToken
+      ? ORG_MODEL_CONFIG_SERVICE_PATH
+      : ORG_MODEL_CONFIG_BEARER_PATH
+  }`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RESOLVE_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...inspectorAiRequestHeaders("resolve"),
+        ...(inspectorServiceToken
+          ? { [INSPECTOR_SERVICE_TOKEN_HEADER]: inspectorServiceToken }
+          : {}),
+        ...(authHeader ? { Authorization: authHeader } : {}),
+      },
+      body: JSON.stringify({
+        ...params,
+        ...(auth?.scenarioId?.trim()
+          ? { scenarioId: auth.scenarioId.trim() }
+          : {}),
+        ...(auth?.scenarioId?.trim() && Number.isFinite(auth?.accessVersion)
+          ? { accessVersion: auth.accessVersion }
+          : {}),
+        ...(serverIds.length > 0 ? { serverIds } : {}),
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const body = await response.text().catch(() => "");
+      let parsed: { error?: unknown } | null = null;
+      try {
+        const value = JSON.parse(body);
+        if (value && typeof value === "object") parsed = value;
+      } catch {
+        // not JSON
+      }
+      // A 404 the handler did not write (no JSON body) is a routing miss: a
+      // backend that predates the bearer-only twin. Without the credential
+      // there is then no route at all, so answer exactly as a build with
+      // neither would — the hosted-only answer, not a route-not-found error.
+      if (!inspectorServiceToken && response.status === 404 && !parsed) {
+        throw new ServiceCredentialUnavailableError(ORG_MODEL_CONFIG_FEATURE);
+      }
+      const fallback = `Org model config resolution failed (${response.status})`;
+      throw new Error(
+        parsed
+          ? backendFailureText({
+              source: "org-model-config",
+              status: response.status,
+              detail: parsed.error,
+              fallback,
+            })
+          : fallback,
+      );
+    }
+
+    const data = (await response.json()) as {
+      ok?: boolean;
+      error?: string;
+      providers?: unknown;
+      aiKeyPolicy?: unknown;
+      defaultModel?: unknown;
+    };
+    if (!data?.ok) {
+      throw new Error(
+        backendFailureText({
+          source: "org-model-config",
+          status: response.status,
+          detail: data?.error,
+          fallback: "Failed to resolve org model config",
+        }),
+      );
+    }
+
+    let providers = (Array.isArray(data.providers) ? data.providers : [])
+      .map(parseResolvedProvider)
+      .filter((provider): provider is ResolvedProviderConfig => !!provider);
+    const aiKeyPolicy = normalizeOrgAiKeyPolicy(data.aiKeyPolicy);
+    // Hosted mode: drop org-supplied Bedrock endpoints that point at
+    // private/internal address space before they are cached and handed to
+    // the AI SDK. Uses the DNS-aware guard so a public hostname resolving
+    // to a private IP (DNS rebinding) is rejected too — mirrors the check
+    // the local-runtime path applies in resolveOrgProviderRuntime. Only the
+    // offending provider is dropped (its own requests then fail with a
+    // clear missing-config error) so one bad endpoint can't block every
+    // other provider in the org config.
+    if (HOSTED_MODE) {
+      const safeProviders: ResolvedProviderConfig[] = [];
+      for (const provider of providers) {
+        if (
+          provider.providerKey === "bedrock" &&
+          typeof provider.baseUrl === "string" &&
+          provider.baseUrl.length > 0
+        ) {
+          try {
+            await assertSafeHostedOutboundUrl(provider.baseUrl);
+          } catch (error) {
+            logger.warn(
+              "[org-model-config] Dropping bedrock provider with blocked baseUrl",
+              {
+                error: error instanceof Error ? error.message : String(error),
+              },
+            );
+            continue;
+          }
+        }
+        safeProviders.push(provider);
+      }
+      providers = safeProviders;
+    }
+
+    const result: ResolvedOrgModelConfig = {
+      providers,
+      ...(data.defaultModel !== undefined
+        ? { defaultModel: data.defaultModel }
+        : {}),
+      ...(aiKeyPolicy ? { aiKeyPolicy } : {}),
+    };
+    const withholdsKeys =
+      orgRequiresOwnKeys(result) ||
+      providers.some((provider) => provider.exportDenied === true);
+    if (!githubExecutionPolicy() && withholdsKeys) {
+      resolveCache.set(cacheKey, {
+        result,
+        expiresAt: Date.now() + CACHE_TTL_MS,
+      });
+    }
+    return result;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Map a ModelDefinition to the providerKey used by the org-managed
+// model provider config. Custom providers prefix with "custom:<name>"
+// to match convex/organizationModelProviders.ts's isCustomProviderKey.
+// Returns a discriminated result so callers can wrap the error type they
+// need (e.g. WebRouteError vs plain Error) without duplicating the logic.
+// ---------------------------------------------------------------------------
+
+export type DeriveOrgProviderKeyResult =
+  | { ok: true; key: string }
+  | { ok: false; error: string };
+
+export function deriveOrgProviderKey(
+  modelDefinition: ModelDefinition,
+): DeriveOrgProviderKeyResult {
+  // A RUNTIME-CHOSEN SENTINEL has no provider key, and inventing one is the
+  // bug: `cursor` is a registered ModelProvider so `cursor/auto` classifies
+  // honestly, but nobody can configure a BYOK `cursor` key — the request goes
+  // to Convex and comes back `provider_not_configured: cursor is not enabled
+  // for this project/workspace organization`, which reads as a setup mistake
+  // the customer could fix. They cannot. Refuse HERE, where the caller still
+  // has the context to say what actually went wrong, rather than asking the
+  // org-provider config a question about a model no provider serves.
+  const sentinelName = runtimeChosenModelSentinelName(
+    String(modelDefinition.id),
+  );
+  if (sentinelName) {
+    return {
+      ok: false,
+      error:
+        `"${String(modelDefinition.id)}" (${sentinelName}) is a placeholder ` +
+        "for a runtime that chooses its own model on your own account — it " +
+        "names no model provider, so there is no key to configure for it. " +
+        "Run this turn on a host whose harness provides that runtime, or " +
+        "pick a real model.",
+    };
+  }
+  if (modelDefinition.provider === "custom") {
+    if (!modelDefinition.customProviderName) {
+      return {
+        ok: false,
+        error: "Custom model is missing customProviderName",
+      };
+    }
+    return { ok: true, key: `custom:${modelDefinition.customProviderName}` };
+  }
+  return { ok: true, key: modelDefinition.provider };
+}
+
+// ---------------------------------------------------------------------------
+// Build modelApiKeys map (for eval routes)
+// ---------------------------------------------------------------------------
+
+export function buildModelApiKeysFromOrgConfig(
+  config: ResolvedOrgModelConfig,
+): Record<string, string> {
+  const keys: Record<string, string> = {};
+  for (const p of config.providers) {
+    // A withheld key is never used locally (the org requires its own keys:
+    // its models run through `/stream/org`).
+    if (!p.apiKey || p.exportDenied) continue;
+    // The eval runner looks up keys by built-in provider name
+    // (e.g. "openai", "anthropic"). Custom providers' API keys are
+    // resolved separately through resolveProviderForModel's
+    // customProviders array, so skip them here.
+    if (p.providerKey.startsWith("custom:")) continue;
+    keys[p.providerKey] = p.apiKey;
+  }
+  return keys;
+}
+
+export type OrgLlmRuntimeConfig = {
+  modelApiKeys: Record<string, string>;
+  baseUrls: BaseUrls;
+  customProviders: CustomProviderConfig[];
+};
+
+export function buildLlmRuntimeConfigFromOrgConfig(
+  config: ResolvedOrgModelConfig,
+): OrgLlmRuntimeConfig {
+  const runtime: OrgLlmRuntimeConfig = {
+    modelApiKeys: buildModelApiKeysFromOrgConfig(config),
+    baseUrls: {},
+    customProviders: [],
+  };
+
+  for (const provider of config.providers) {
+    if (provider.providerKey === "ollama" && provider.baseUrl) {
+      runtime.baseUrls.ollama = provider.baseUrl;
+      continue;
+    }
+
+    if (provider.providerKey === "azure" && provider.baseUrl) {
+      runtime.baseUrls.azure = provider.baseUrl;
+      continue;
+    }
+
+    if (provider.providerKey === "bedrock" && provider.baseUrl) {
+      // Hosted mode: don't promote a baseUrl that points at private/internal
+      // address space — eval-runner egress would otherwise follow it. Mirrors
+      // the guard the local-runtime path applies in resolveOrgProviderRuntime.
+      if (HOSTED_MODE && isUnsafeHostedOutboundUrl(provider.baseUrl)) {
+        continue;
+      }
+      runtime.baseUrls.bedrock = provider.baseUrl;
+      continue;
+    }
+
+    if (
+      provider.providerKey.startsWith("custom:") &&
+      provider.baseUrl &&
+      provider.modelIds
+    ) {
+      const name = provider.providerKey.replace(/^custom:/, "");
+      if (!name) continue;
+
+      runtime.customProviders.push({
+        name,
+        protocol: provider.protocol || "openai-compatible",
+        baseUrl: provider.baseUrl,
+        modelIds: provider.modelIds,
+        ...(provider.apiKey ? { apiKey: provider.apiKey } : {}),
+      });
+    }
+  }
+
+  return runtime;
+}
+
+// ---------------------------------------------------------------------------
+// Runtime resolver — calls /stream/org/resolve to determine whether the
+// provider should execute in Convex (cloud) or directly in the inspector (local).
+// ---------------------------------------------------------------------------
+
+export type OrgProviderRuntimeCloud = {
+  runtimeLocation: "cloud";
+  providerKey: string;
+};
+
+export type OrgProviderRuntimeLocal = {
+  runtimeLocation: "local";
+  provider: OrgProviderResolvedConfig;
+  /**
+   * The question this answer came from, set on every answer the resolver
+   * returns (never stored in the cache). Hand it to
+   * `admitEachLocalOrgAttempt`, which asks it again before every attempt.
+   */
+  admission?: LocalOrgAttemptRequest;
+};
+
+export type OrgProviderRuntime = OrgProviderRuntimeCloud | OrgProviderRuntimeLocal;
+
+/**
+ * Resolve the runtime location for a provider by calling /stream/org/resolve.
+ *
+ * Cloud: LLM executes in Convex — return the providerKey so the caller can
+ *   route to handleHostedOrgChatModel as before.
+ * Local: LLM executes in the inspector — return the full provider config
+ *   (including apiKey) so the caller can build the model directly.
+ *
+ * A `local` answer may come from a 60 s cache, which saves the round trip
+ * when a turn starts. It is not permission to call the provider: build the
+ * model with `admitEachLocalOrgAttempt` and the answer's `admission`, which
+ * asks again before every attempt.
+ */
+export async function resolveOrgProviderRuntime(
+  projectId: string,
+  providerKey: string,
+  model: string,
+  auth?: ResolveOrgModelConfigAuth,
+  options?: { modelSelection?: ModelSelection; modelWorkload?: ModelWorkload },
+): Promise<OrgProviderRuntime> {
+  return resolveOrgProviderRuntimeForTarget(
+    { projectId },
+    providerKey,
+    model,
+    auth,
+    options,
+  );
+}
+
+/**
+ * `options.modelSelection`: the saved org selection behind this request, sent
+ * as the body's `modelSelection` so the backend re-resolves its connection
+ * (a deleted, disabled or moved connection is refused `credential_missing`)
+ * before it decrypts any key. Only an `org` selection is sent; a backend
+ * that predates selections ignores the field and resolves the legacy way.
+ * `options.modelWorkload` carries only admission facts, never prompt content.
+ * Callers must derive it after preparing the effective tools and messages.
+ */
+export async function resolveOrgProviderRuntimeForTarget(
+  target: ResolveOrgProviderRuntimeTarget,
+  providerKey: string,
+  model: string,
+  auth?: ResolveOrgModelConfigAuth,
+  options?: { modelSelection?: ModelSelection; modelWorkload?: ModelWorkload },
+): Promise<OrgProviderRuntime> {
+  const modelSelection = orgSelectionOnly(options?.modelSelection);
+  const convexHttpUrl = process.env.CONVEX_HTTP_URL;
+  if (!convexHttpUrl) throw new Error("CONVEX_HTTP_URL is not set");
+
+  await verifyGithubCredentialAccess();
+  const cacheKey = buildRuntimeCacheKey(
+    target,
+    providerKey,
+    model,
+    auth,
+    modelSelection,
+    options?.modelWorkload,
+  );
+  const request = { target, providerKey, model, auth, options };
+  const withAdmission = (result: OrgProviderRuntime): OrgProviderRuntime =>
+    result.runtimeLocation === "local"
+      ? { ...result, admission: request }
+      : result;
+  const now = Date.now();
+  pruneRuntimeResolveCache(now);
+  const cached = runtimeResolveCache.get(cacheKey);
+  if (!githubExecutionPolicy() && cached && cached.expiresAt > now) {
+    return withAdmission(cached.result);
+  }
+
+  const result = await requestOrgProviderRuntime(convexHttpUrl, request);
+  cacheRuntimeAnswer(cacheKey, result);
+  return withAdmission(result);
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic model-source classification — single source of truth for the
+// three-way MCPJam / cloud-BYOK / local-BYOK decision the synthetic runner
+// makes per session.
+// ---------------------------------------------------------------------------
+
+/**
+ * Persisted attribution label on chatSessions / llmUsageRecord rows.
+ *
+ * `"external-account"` — the customer's own account with the RUNTIME vendor
+ * (Cursor), where MCPJam holds no model credential at all. Distinct from
+ * `"byok"` on purpose: both mean "MCPJam is not charged", but byok also asserts
+ * a configured model PROVIDER and its key, which an external-account turn does
+ * not have. Mirrors `PersistChatSessionOptions["modelSource"]`.
+ */
+export type SyntheticModelSource =
+  | "mcpjam"
+  | "byok"
+  | "local_byok"
+  | "external-account";
+
+/**
+ * Result of {@link resolveSyntheticModelSource}.
+ *
+ * `orgRuntime` is present when the source is a BYOK one, so the synthetic
+ * dispatcher can reuse the resolved runtime (cloud providerKey OR local
+ * `OrgProviderResolvedConfig`) for the actual handler call — no
+ * duplicate `resolveOrgProviderRuntime` round-trip. Absent for `"mcpjam"` and
+ * for `"external-account"`, neither of which resolves an org provider.
+ */
+export interface SyntheticModelResolution {
+  source: SyntheticModelSource;
+  orgRuntime?: OrgProviderRuntime;
+}
+
+/**
+ * Single source of truth for "what model-source class is this scenario?"
+ * Mirrors the three-way split the chat path does in `web-chat-turn.ts`,
+ * narrowed to the surfaces synthetic can target (no user-API-key direct).
+ *
+ * Two callers in this PR:
+ *   1. `drainAssistantTurn` (turn dispatch) — uses both `source` and
+ *      `orgRuntime` to pick the handler.
+ *   2. The empty-session fallback persist — uses `source` only for
+ *      attribution.
+ *
+ * Pre-extraction, both encoded the same chain inline; this helper keeps
+ * them aligned so adding a runtime location (or changing
+ * `isLocalRuntimeEligible`'s allow-list) updates both call sites at once.
+ *
+ * Throws on `deriveOrgProviderKey` failure. Callers that need a soft
+ * fallback (empty-session attribution) should wrap in try/catch and
+ * default to `"byok"` — the failure means the real turns would have
+ * failed too; we're best-effort labeling a row that exists only because
+ * the run ended before any turn completed.
+ */
+export async function resolveSyntheticModelSource(args: {
+  modelDefinition: ModelDefinition;
+  projectId: string;
+  authHeader?: string;
+  scenarioId?: string;
+  accessVersion?: number;
+  serverIds?: string[];
+  /**
+   * The saved selection behind this model. It DECIDES the source
+   * (`decideTurnRail`): `hosted` is MCPJam, `org` / `local` / a stored legacy
+   * one are never MCPJam, and absent keeps today's hosted-list check. Only an
+   * `org` one is forwarded to `/stream/org/resolve`, so the backend re-checks
+   * its connection.
+   */
+  modelSelection?: RequestedModelSelection;
+  modelWorkload?: ModelWorkload;
+}): Promise<SyntheticModelResolution> {
+  const modelIdStr = String(args.modelDefinition.id);
+  if (
+    decideTurnRail({
+      selection: args.modelSelection,
+      model: args.modelDefinition,
+    }) === "hosted"
+  ) {
+    return { source: "mcpjam" };
+  }
+  // A runtime-chosen sentinel resolves NO org provider — see
+  // `deriveOrgProviderKey`. Answered before the key derivation below so the
+  // resolver returns an attribution ("nobody billed MCPJam, and there is no
+  // configured provider either") instead of throwing on a key it must not ask
+  // for. `orgRuntime` is deliberately absent: there is no runtime to reuse.
+  if (isRuntimeChosenModelSentinel(modelIdStr)) {
+    return { source: "external-account" };
+  }
+  const keyResult = deriveOrgProviderKey(args.modelDefinition);
+  if (!keyResult.ok) {
+    throw new Error(
+      `Synthetic dispatch failed to derive org provider key: ${keyResult.error}`,
+    );
+  }
+  const orgRuntime: OrgProviderRuntime = isLocalRuntimeEligible(keyResult.key)
+    ? await resolveOrgProviderRuntime(
+        args.projectId,
+        keyResult.key,
+        modelIdStr,
+        {
+          authHeader: args.authHeader,
+          scenarioId: args.scenarioId,
+          accessVersion: args.accessVersion,
+          serverIds: args.serverIds,
+        },
+        {
+          ...(args.modelSelection?.source === "org"
+            ? { modelSelection: args.modelSelection }
+            : {}),
+          ...(args.modelWorkload ? { modelWorkload: args.modelWorkload } : {}),
+        },
+      )
+    : { runtimeLocation: "cloud", providerKey: keyResult.key };
+  return {
+    source: orgRuntime.runtimeLocation === "local" ? "local_byok" : "byok",
+    orgRuntime,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic model-definition builder — used by the synthetic runner when
+// the scenario is on a BYOK model that isn't in the static SUPPORTED_MODELS
+// catalog (Ollama BYOK, custom: providers, OpenRouter-style ids, etc.).
+// ---------------------------------------------------------------------------
+
+/**
+ * Build a `ModelDefinition` from a bare modelId string (e.g. the value
+ * `runtime.config.modelId` returns from `fetchScenarioRuntimeConfig`).
+ *
+ * Optional routing provenance comes from the pinned snapshot, never the live
+ * host. Omitted keeps legacy inference; copying avoids mutating the catalog.
+ *
+ * Resolution order:
+ *   1. Blank id — THROWS. An unpinned host persists modelId "", and without
+ *      this guard the bare-id fallback silently classifies it as an Ollama
+ *      BYOK model, with the failure surfacing many hops later as an opaque
+ *      backend "model is required".
+ *   2. `getModelById(modelId)` — MCPJam catalog hit returns the full
+ *      definition unchanged (correct provider, contextLength, curated display
+ *      name). This is the one step the shared classifier cannot do: it is pure
+ *      and has no catalog.
+ *   3. Everything else is {@link classifyModelIdProvider} — `custom:` slugs,
+ *      the `<prefix>/` map and its aliases, bare Bedrock shapes, and the
+ *      bare-id Ollama catch-all. See `shared/model-provider.ts` for the rules;
+ *      this function deliberately holds NO copy of them.
+ *
+ * Callers: the synthetic session runner (which only has
+ * `runtime.config.modelId` — the scenario runtime endpoint doesn't expose
+ * provider today) and the chat routes' host-wins merges, where the host
+ * config likewise pins a bare modelId and the provider must come from the
+ * id shape, never from the request body's model.
+ */
+export function buildSyntheticModelDefinition(
+  modelId: string,
+  routing: Pick<ModelDefinition, "hosted"> = {},
+): ModelDefinition {
+  const classification = classifyModelIdProvider(modelId);
+  // Both interactive host-wins call sites gate on a truthy modelId before
+  // reaching here, so only genuinely modelless flows throw.
+  if (!classification) {
+    throw new Error(
+      "No model selected for this chat. Pick a model on the host before running."
+    );
+  }
+
+  const supported = getModelById(modelId);
+  if (supported) {
+    return routing.hosted === undefined
+      ? supported
+      : { ...supported, hosted: routing.hosted };
+  }
+
+  return {
+    id: modelId,
+    // A runtime-chosen sentinel gets its curated label ("Cursor Auto"); every
+    // other unknown id keeps the raw string, which is all there is to show.
+    // The id itself is NEVER rewritten — it is what traces and eval metadata
+    // record, and the whole point of the sentinel is that it names no model.
+    name: runtimeChosenModelSentinelName(modelId) ?? modelId,
+    ...(routing.hosted !== undefined ? { hosted: routing.hosted } : {}),
+    provider: classification.provider,
+    ...(classification.customProviderName !== undefined
+      ? { customProviderName: classification.customProviderName }
+      : {}),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Host-pinned model lift (org-config-aware)
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the org provider whose per-provider model list explicitly contains
+ * `modelId`, and build the definition from that provider. Mirrors the
+ * client's `isOrgManagedModel` matching: openrouter/bedrock list ids in
+ * `selectedModels`; ollama and `custom:<slug>` providers list them in
+ * `modelIds` (custom ids are compared with the `custom:<slug>:` prefix
+ * stripped). Returns null when no provider lists the id.
+ */
+export function matchOrgProviderForModelId(
+  config: ResolvedOrgModelConfig,
+  modelId: string,
+): ModelDefinition | null {
+  for (const p of config.providers) {
+    if (p.providerKey === "openrouter" || p.providerKey === "bedrock") {
+      if (p.selectedModels?.includes(modelId)) {
+        return {
+          id: modelId,
+          name: modelId,
+          provider: p.providerKey,
+          hosted: false,
+        };
+      }
+    } else if (p.providerKey === "ollama") {
+      if (p.modelIds?.includes(modelId)) {
+        return { id: modelId, name: modelId, provider: "ollama", hosted: false };
+      }
+    } else if (p.providerKey.startsWith("custom:")) {
+      const slug = p.providerKey.slice("custom:".length);
+      const prefix = `custom:${slug}:`;
+      const bareId = modelId.startsWith(prefix)
+        ? modelId.slice(prefix.length)
+        : modelId;
+      if (p.modelIds?.includes(bareId)) {
+        return {
+          id: modelId,
+          name: modelId,
+          provider: "custom",
+          customProviderName: slug,
+          hosted: false,
+        };
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Lift a host-pinned bare modelId to a `ModelDefinition`, preferring the
+ * org's provider config over catalog and id-shape inference. A
+ * `vendor/model` id is intrinsically ambiguous — org OpenRouter selected
+ * models keep their vendor-prefixed ids but belong to providerKey
+ * "openrouter", while catalog/shape resolution would infer the native
+ * vendor from the prefix. When an enabled provider explicitly lists the
+ * id, that provider wins; catalog/shape inference is the fallback.
+ *
+ * `custom:`-prefixed and Bedrock-shaped ids skip the config fetch — their
+ * shape is exact, and this path sits on a live chat turn. So does a
+ * runtime-chosen sentinel, which no org provider can list.
+ */
+export async function resolveHostModelDefinition(args: {
+  modelId: string;
+  projectId?: string | null;
+  auth?: ResolveOrgModelConfigAuth;
+}): Promise<ModelDefinition> {
+  const { modelId, projectId, auth } = args;
+
+  const shapeIsExact =
+    modelId.startsWith("custom:") || isBedrockModelId(modelId);
+  // A RUNTIME-CHOSEN SENTINEL skips the fetch for a different reason than the
+  // exact shapes above: not "we already know which provider serves it" but "no
+  // provider serves it at all". `matchOrgProviderForModelId` can only ever miss
+  // on `cursor/auto`, so the round-trip is pure cost — and not a cheap one on a
+  // live turn: `resolveOrgModelConfig` carries a 15 s timeout, and this call
+  // sits between the request and the first token of an external-account harness
+  // turn that needs nothing from the org's model config.
+  const skipOrgConfig = shapeIsExact || isRuntimeChosenModelSentinel(modelId);
+  if (!skipOrgConfig && projectId) {
+    try {
+      const config = await resolveOrgModelConfig({ projectId }, auth);
+      const fromConfig = matchOrgProviderForModelId(config, modelId);
+      if (fromConfig) return fromConfig;
+    } catch (error) {
+      // Org config unavailable — fall through to shape inference, the
+      // same best-effort behavior the synthetic runner has always had.
+      logger.warn(
+        "[org-model-config] Host model org config lookup failed; falling back to catalog/id-shape inference",
+        {
+          modelId,
+          projectId,
+          error: error instanceof Error ? error.message : String(error),
+        },
+      );
+    }
+  }
+
+  const catalogHit = getModelById(modelId);
+  if (catalogHit) return catalogHit;
+
+  return buildSyntheticModelDefinition(modelId);
+}

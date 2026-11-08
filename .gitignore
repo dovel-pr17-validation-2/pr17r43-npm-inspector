@@ -1,0 +1,38 @@
+.DS_Store
+worktrees/
+.worktrees/
+.cursor/
+node_modules/
+node_modules
+.mcpjam/skills/
+**/.mcpjam/skills/
+# Shared hooks are committed, and skills/ links to .agents/skills; local settings, launch configs and worktrees are not.
+.claude/*
+!.claude/settings.json
+!.claude/skills/
+docs/superpowers/
+*.bundled.ts
+# Telemetry catalogs: written by scripts/generate-telemetry-catalogs.mjs from
+# every entry point that reads them. Other generated JSON stays committed.
+sdk/src/internal/telemetry-catalog.generated.json
+mcpjam-inspector/shared/telemetry-catalog.generated.json
+mcpjam-inspector/shared/browser-telemetry-catalog.generated.json
+mcpjam-inspector/shared/browser-telemetry-source-files.generated.json
+mcpjam-inspector/server/utils/browser-harness/*.generated.ts
+cli/dist/
+sdk/dist/
+chat-ui/dist/
+widget-react/dist/
+vitest/dist/
+
+# Local git worktrees checked out under the repo
+worktrees/
+wt-*/
+
+# Playwright MCP scratch output (screenshots, snapshots, console logs)
+.playwright-mcp/
+evaluators/dist/
+
+
+# Generated sandbox bootstrap, embedded in the Inspector build.
+mcpjam-inspector/server/utils/harness/copilot-cli/generated/

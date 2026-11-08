@@ -1,0 +1,528 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { Hono } from "hono";
+const mocks = vi.hoisted(() => ({
+  resolve: vi.fn(),
+  resolveTools: vi.fn(),
+  invoke: vi.fn(),
+  release: vi.fn(),
+  read: vi.fn(),
+  listResources: vi.fn(),
+  listTemplates: vi.fn(),
+  runtime: vi.fn(),
+  catalog: vi.fn(),
+  html: "<p>app</p>",
+  mimeTypeValid: true,
+  csp: undefined as { connectDomains: string[] } | undefined,
+}));
+vi.mock("../../../services/plugin-host/request-runtime.js", async original => ({
+  ...await original<typeof import("../../../services/plugin-host/request-runtime.js")>(),
+  createPluginRequestRuntime: mocks.runtime,
+}));
+vi.mock("../../../services/plugin-host/request-invocation.js", () => ({
+  invokePluginRequest: mocks.invoke,
+}));
+vi.mock("../../../utils/widget-resource-content.js", () => ({
+  widgetResourceContent: () => ({
+    html: mocks.html,
+    mimeTypeValid: mocks.mimeTypeValid,
+    csp: mocks.csp,
+  }),
+}));
+vi.mock("../../../utils/ui-resource-meta.js", () => ({
+  canSkipListingLookup: () => true,
+  findListingMetaForUri: vi.fn(),
+}));
+vi.mock("../../../utils/view-origin-label.js", () => ({
+  viewOriginLabelForConfig: () => undefined,
+}));
+import { pluginModelAppRoutes } from "../plugin-model-apps.js";
+import { modelApps } from "../../../services/plugin-host/model-apps.js";
+import { PLUGIN_MODEL_APP_META } from "../../../../shared/plugin-model-app.js";
+import { webReceiptApp, withReceiptSigning, expectOwnedSourceReceipt } from "./owned-source-receipt-fixture.js";
+const actor = {
+  actorId: "actor",
+  projectId: "project",
+  workspaceId: "workspace",
+  subject: "subject",
+};
+const source = {
+  owner: {
+    ...actor,
+    instanceId: "model-call",
+    generation: 1 as const,
+    serverId: "saved-id",
+    bindingId: "binding",
+    placement: "interactive" as const,
+  },
+  subject: "subject",
+  hostId: "host",
+  hostRevision: "host-revision",
+  serverIdentity: { kind: "standalone" as const, serverId: "saved-id" },
+};
+const meta = { ui: { resourceUri: "ui://app" } };
+function fixture(visitor = actor, web = false) {
+  const result = modelApps.publish(
+    { content: [] },
+    { ...source, owner: { ...source.owner, instanceId: crypto.randomUUID() } } as never,
+    "pickFile",
+    "source-revision",
+    meta,
+  ) as any;
+  const token = result._meta[PLUGIN_MODEL_APP_META].instanceToken;
+  const admission = { revalidate: vi.fn(async () => {}) };
+  const routes = pluginModelAppRoutes({
+      route: async (_c, action) => {
+        try {
+          return await action();
+        } catch {
+          return new Response("denied", { status: 403 });
+        }
+      },
+      admitted: async () => ({
+        actor: visitor,
+        bearer: "private",
+        admission: admission as never,
+      }),
+      cleanup: async () => actor,
+    });
+  const prefix = web ? "/api/web/model-apps" : "";
+  const router = web ? webReceiptApp(routes, "model-apps") : new Hono().route("/", routes);
+  return {
+    token,
+    router,
+    request: () =>
+      router.request(`${prefix}/open`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project",
+          pluginWorkspace: { version: 1, workspaceId: "workspace" },
+          instanceToken: token,
+        }),
+      }),
+  };
+}
+beforeEach(() => {
+  vi.clearAllMocks();
+  mocks.html = "<p>app</p>";
+  mocks.mimeTypeValid = true;
+  mocks.csp = undefined;
+  mocks.read.mockResolvedValue({
+    contents: [{ uri: "ui://app", text: "<p>app</p>" }],
+  });
+  mocks.resolve.mockResolvedValue({
+    revision: "source-revision",
+    appToolsEnabled: true,
+    resourcesEnabled: true,
+    contextEnabled: true,
+    tool: { name: "pickFile", _meta: meta },
+    manager: { readResource: mocks.read, listResources: mocks.listResources, listResourceTemplates: mocks.listTemplates, getServerConfig: () => ({}) },
+  });
+  mocks.runtime.mockReturnValue({
+    resolve: mocks.resolve,
+    resolveTools: mocks.resolveTools,
+    release: mocks.release,
+    catalog: mocks.catalog,
+  });
+});
+
+describe("model App local file opening", () => {
+  const contract = { version: 1, targets: [{ serverId: "saved-id", root: "/allowed", exclusiveWrites: true, resources: [{ uri: "cad://part", relativePath: "part.stl" }] }] };
+  const viewer = { name: "viewer", inputSchema: { type: "object" }, _meta: { ui: { resourceUri: "ui://viewer" }, "openai/ui": { entrypoints: [{ type: "file", extensions: [".stl"] }] } } };
+  const open = (f: ReturnType<typeof fixture>, path = "/allowed/part.stl") => f.router.request("/files/open", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ projectId: "project", pluginWorkspace: { version: 1, workspaceId: "workspace" }, instanceToken: f.token, path }),
+  });
+  beforeEach(() => {
+    mocks.listResources.mockResolvedValue({ resources: [{ uri: "cad://part", name: "part.stl" }] });
+    mocks.catalog.mockResolvedValue({
+      tools: [viewer], localFileTargetContract: contract, fileTargets: { placement: "local" },
+      manager: { listResources: mocks.listResources },
+    });
+  });
+  it("resolves only a listed, admitted target and fences its source again after listing", async () => {
+    const f = fixture();
+    try {
+      const response = await open(f);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toMatchObject({ file: { uri: "cad://part" }, entries: [{ toolName: "viewer" }] });
+      expect(mocks.resolve).toHaveBeenCalledTimes(2);
+      expect((await open(f, "/etc/passwd")).status).toBe(403);
+      mocks.resolve.mockResolvedValueOnce({ revision: "changed", tool: { _meta: meta } });
+      expect((await open(f)).status).toBe(403);
+    } finally { modelApps.close(f.token, actor); }
+  });
+  it("refuses a foreign owner, missing contract, or a source that closes during lookup", async () => {
+    const foreign = fixture({ ...actor, workspaceId: "other" });
+    expect((await open(foreign)).status).toBe(403);
+    expect(mocks.catalog).not.toHaveBeenCalled();
+    modelApps.close(foreign.token, actor);
+    const f = fixture();
+    try {
+      mocks.catalog.mockResolvedValueOnce({ tools: [viewer], fileTargets: { placement: "local" } });
+      expect((await open(f)).status).toBe(403);
+      mocks.listResources.mockImplementationOnce(async () => {
+        modelApps.close(f.token, actor);
+        return { resources: [{ uri: "cad://part", name: "part.stl" }] };
+      });
+      expect((await open(f)).status).toBe(403);
+    } finally { modelApps.close(f.token, actor); }
+  });
+  it("withholds the advertised port and refuses requests when Local files is off", async () => {
+    const f = fixture();
+    try {
+      mocks.resolve.mockResolvedValue({ revision: "source-revision", localFileTargetContract: contract,
+        extensions: { capabilities: { localFiles: false, fileViewers: true } },
+        tool: { name: "pickFile", _meta: meta },
+        manager: { readResource: mocks.read, getServerConfig: () => ({}) },
+      });
+      expect(await (await f.request()).json()).toMatchObject({ localFilesAvailable: false });
+      mocks.catalog.mockResolvedValue({ tools: [viewer], localFileTargetContract: contract,
+        extensions: { capabilities: { localFiles: false, fileViewers: true } },
+      });
+      expect((await open(f)).status).toBe(403);
+      expect(mocks.listResources).not.toHaveBeenCalled();
+    } finally { modelApps.close(f.token, actor); }
+  });
+});
+describe("saved-server model App resource route", () => {
+  it.each([
+    ["above the old 1 MiB limit", "a".repeat(1024 * 1024 + 1), true, 200],
+    ["exactly 5 MiB", "a".repeat(5 * 1024 * 1024), true, 200],
+    ["over 5 MiB in UTF-8 bytes", "é".repeat(2621441), true, 403],
+    ["invalid MIME", "<p>app</p>", false, 403],
+  ])("uses the common UI bound: %s", async (_name, html, valid, status) => {
+    mocks.html = html;
+    mocks.mimeTypeValid = valid;
+    const f = fixture();
+    try {
+      expect((await f.request()).status).toBe(status);
+      expect(mocks.release).toHaveBeenCalledOnce();
+    } finally {
+      modelApps.close(f.token, actor);
+    }
+  });
+
+  it("loads only the original saved server through admitted request runtime", async () => {
+    const fixtureData = fixture();
+    const response = await fixtureData.request();
+    expect(response.status).toBe(200);
+    expect(mocks.runtime.mock.calls[0][3]).toEqual({
+      hostId: "host",
+      serverId: "saved-id",
+    });
+    expect(mocks.read.mock.calls[0][0]).toBe("saved-id");
+    expect(mocks.read.mock.calls[0][1]).toEqual({ uri: "ui://app" });
+    expect(mocks.resolve.mock.calls.map((args) => args[0])).toEqual([
+      "pickFile",
+      "pickFile",
+    ]);
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+  it("refuses a changed source revision before reading any App bytes", async () => {
+    const fixtureData = fixture();
+    mocks.resolve.mockResolvedValueOnce({
+      revision: "changed",
+      tool: { _meta: meta },
+    });
+    expect((await fixtureData.request()).status).toBe(403);
+    expect(mocks.read).not.toHaveBeenCalled();
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+  it("refuses source changes after reading without returning the App", async () => {
+    const fixtureData = fixture();
+    mocks.resolve
+      .mockResolvedValueOnce({
+        revision: "source-revision",
+        tool: { _meta: meta },
+        manager: { readResource: mocks.read },
+      })
+      .mockResolvedValueOnce({ revision: "changed" });
+    expect((await fixtureData.request()).status).toBe(403);
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+});
+
+describe("model App call catalog admission", () => {
+  it.each(["valid", "changed revision", "changed resource"])(
+    "uses one current catalog and forwards the durable read fence: %s",
+    async (change) => {
+      const { token, router } = fixture();
+      const signal = new AbortController().signal;
+      const read = vi.fn(async (action: () => Promise<unknown>) => action());
+      const requested = { tool: { name: "inspect" }, revision: "requested" };
+      mocks.resolveTools.mockResolvedValue(
+        new Map<string, unknown>([
+          [
+            "pickFile",
+            {
+              revision:
+                change === "changed revision" ? "replaced" : "source-revision",
+              tool: {
+                name: "pickFile",
+                _meta:
+                  change === "changed resource"
+                    ? { ui: { resourceUri: "ui://replaced" } }
+                    : meta,
+              },
+            },
+          ],
+          ["inspect", requested],
+        ]),
+      );
+      mocks.invoke.mockImplementation(async (c, options) => {
+        const resolved = await options.resolve("inspect", signal, read);
+        expect(resolved).toBe(requested);
+        return c.json({ ok: true });
+      });
+      const response = await router.request("/call", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project",
+          pluginWorkspace: { version: 1, workspaceId: "workspace" },
+          instanceToken: token,
+          invocationId: "d14497c7-e074-4ffc-a3f5-d8d2dc45469c",
+          params: { name: "inspect", arguments: {} },
+        }),
+      });
+      expect(response.status).toBe(change === "valid" ? 200 : 403);
+      expect(mocks.resolveTools).toHaveBeenCalledExactlyOnceWith(
+        ["pickFile", "inspect"],
+        signal,
+        read,
+      );
+      expect(mocks.resolve).not.toHaveBeenCalled();
+    },
+  );
+});
+
+describe("original model App context", () => {
+  it("returns a real bounded update receipt and current state, then refuses a changed source", async () => {
+    const f = fixture();
+    const body = {
+      projectId: "project",
+      pluginWorkspace: { version: 1, workspaceId: "workspace" },
+      instanceToken: f.token,
+      operationId: crypto.randomUUID(),
+      sequence: 1,
+      params: { content: [{ type: "text", text: "Selected part" }] },
+    };
+    const request = () =>
+      f.router.request("/context", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+    const response = await request();
+    expect(response.status).toBe(200);
+    const result = await response.json();
+    expect(result._meta["openai/modelContext"].updateId).toBe(
+      result.snapshot.state.updateId,
+    );
+    expect(result.snapshot.state.content[0].text).toBe("Selected part");
+    expect(await (await request()).json()).toEqual(result);
+    mocks.resolve.mockResolvedValue({
+      revision: "other",
+      contextEnabled: true,
+      tool: { _meta: meta },
+    });
+    expect((await request()).status).toBe(403);
+    modelApps.close(f.token, actor);
+  });
+  it("admits an update against the client's policy, freshly resolved", async () => {
+    const f = fixture();
+    const update = () =>
+      f.router.request("/context", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          projectId: "project",
+          pluginWorkspace: { version: 1, workspaceId: "workspace" },
+          instanceToken: f.token,
+          operationId: crypto.randomUUID(),
+          sequence: 1,
+          params: {
+            content: Array.from({ length: 100 }, () => ({
+              type: "text",
+              text: "part",
+            })),
+          },
+        }),
+      });
+    // MCPJam's defaults admit 64 blocks.
+    expect((await update()).status).toBe(403);
+    mocks.resolve.mockResolvedValue({
+      revision: "source-revision",
+      contextEnabled: true,
+      tool: { name: "pickFile", _meta: meta },
+      modelContextPolicy: {
+        updateMaxBytes: 2_548_000,
+        maxBlocks: 256,
+        turnMaxBytes: 8 * 1024 * 1024,
+      },
+    });
+    expect((await update()).status).toBe(200);
+    modelApps.close(f.token, actor);
+  });
+  it("removes all of its context through the same ownership checks", async () => {
+    const f = fixture();
+    const owner = {
+      projectId: "project",
+      pluginWorkspace: { version: 1, workspaceId: "workspace" },
+      instanceToken: f.token,
+    };
+    const post = (path: string, body: Record<string, unknown>) =>
+      f.router.request(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...owner, ...body }),
+      });
+    await post("/context", {
+      operationId: crypto.randomUUID(),
+      sequence: 1,
+      params: {
+        content: [{ type: "text", text: "Selected part" }],
+        structuredContent: { view: "front" },
+      },
+    });
+    const removal = { operationId: crypto.randomUUID(), basis: 0 };
+    const response = await post("/context/remove-all", removal);
+    expect(response.status).toBe(200);
+    const removed = await response.json();
+    expect(removed).toMatchObject({
+      outcome: "applied",
+      snapshot: { state: null, held: true, removedAt: 1 },
+    });
+    // A retry of the same operation answers from its receipt.
+    expect(await (await post("/context/remove-all", removal)).json()).toEqual(
+      removed,
+    );
+    // The single-block route is gone.
+    expect(
+      (
+        await post("/context/remove", {
+          ...removal,
+          updateId: removal.operationId,
+          index: 0,
+        })
+      ).status,
+    ).toBe(404);
+    // A changed source is refused before anything is removed.
+    mocks.resolve.mockResolvedValue({
+      revision: "other",
+      contextEnabled: true,
+      tool: { _meta: meta },
+    });
+    expect(
+      (
+        await post("/context/remove-all", {
+          ...removal,
+          operationId: crypto.randomUUID(),
+        })
+      ).status,
+    ).toBe(403);
+    modelApps.close(f.token, actor);
+  });
+  it("does not advertise context when fresh host policy withholds it", async () => {
+    mocks.resolve.mockResolvedValue({
+      revision: "source-revision",
+      contextEnabled: false,
+      tool: { _meta: meta },
+      manager: { readResource: mocks.read, getServerConfig: () => ({}) },
+    });
+    const f = fixture();
+    const response = await f.request();
+    expect((await response.json()).contextEnabled).toBe(false);
+    modelApps.close(f.token, actor);
+  });
+});
+
+
+describe("owned model App resource operations", () => {
+  const resourceRequest = (f: ReturnType<typeof fixture>, operation: object, extra = {}) =>
+    f.router.request("/resources", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: "project", pluginWorkspace: { version: 1, workspaceId: "workspace" }, instanceToken: f.token, operation, ...extra }) });
+  it("reads through the immutable source and releases its runtime", async () => {
+    const f = fixture();
+    const result = await resourceRequest(f, { method: "resources/read", uri: "test://record" });
+    expect(result.status).toBe(200);
+    expect(mocks.read).toHaveBeenCalledWith("saved-id", { uri: "test://record" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+  it("refuses reads when the original host has resources disabled", async () => {
+    const source = await mocks.resolve(); mocks.resolve.mockClear();
+    mocks.resolve.mockResolvedValueOnce({ ...source, resourcesEnabled: false });
+    const result = await resourceRequest(fixture(), { method: "resources/read", uri: "test://record" });
+    expect(result.status).toBe(403);
+    expect(mocks.read).not.toHaveBeenCalled();
+  });
+  it("cancels the actual resource read with the incoming request", async () => {
+    const f = fixture(); const controller = new AbortController();
+    mocks.read.mockImplementationOnce((_server, _params, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      controller.abort(new Error("cancelled"));
+      expect(signal.aborted).toBe(true);
+    }));
+    const result = await f.router.request("/resources", { method: "POST", signal: controller.signal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ projectId: "project", pluginWorkspace: { version: 1, workspaceId: "workspace" }, instanceToken: f.token, operation: { method: "resources/read", uri: "test://record", _meta: { progressToken: "progress" } } }) });
+    expect(result.status).toBe(403);
+    expect(mocks.read).toHaveBeenCalledWith("saved-id", { uri: "test://record", _meta: { progressToken: "progress" } }, expect.any(Object));
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+  it("keeps empty cursors on resource template lists", async () => {
+    mocks.listTemplates.mockResolvedValue({ resourceTemplates: [], nextCursor: "next" });
+    const result = await resourceRequest(fixture(), { method: "resources/templates/list", cursor: "" });
+    expect(result.status).toBe(200);
+    expect(await result.json()).toEqual({ resourceTemplates: [], nextCursor: "next" });
+    expect(mocks.listTemplates).toHaveBeenCalledWith("saved-id", { cursor: "" }, expect.objectContaining({ cacheMode: "bypass" }));
+  });
+  it("refuses a source revision change before resource dispatch", async () => {
+    mocks.resolve.mockResolvedValueOnce({ revision: "changed", resourcesEnabled: true });
+    const result = await resourceRequest(fixture(), { method: "resources/read", uri: "test://record" });
+    expect(result.status).toBe(403);
+    expect(mocks.read).not.toHaveBeenCalled();
+    expect(mocks.release).toHaveBeenCalledOnce();
+  });
+  it("refuses resource output if source authority changes during the read", async () => {
+    const original = await mocks.resolve(); mocks.resolve.mockClear();
+    mocks.resolve.mockResolvedValueOnce(original).mockResolvedValueOnce({ ...original, revision: "changed" });
+    const result = await resourceRequest(fixture(), { method: "resources/read", uri: "test://record" });
+    expect(result.status).toBe(403);
+    expect(await result.text()).not.toContain("contents");
+    expect(mocks.read).toHaveBeenCalledOnce();
+  });
+  it("rejects caller-selected accounts instead of overriding the source", async () => {
+    const result = await resourceRequest(fixture(), { method: "resources/read", uri: "test://record" }, { connectionId: "other-account" });
+    expect(result.status).toBe(403);
+    expect(mocks.read).not.toHaveBeenCalled();
+  });
+});
+
+it("binds model App receipts to the original instance operation and rejects a foreign owner", async () => {
+  await withReceiptSigning(async () => {
+    mocks.html = "<p>Model-owned α</p>";
+    mocks.csp = { connectDomains: ["https://model.example"] };
+    const f = fixture(actor, true);
+    try {
+      const original = modelApps.get(f.token, actor);
+      const response = await f.request();
+      expect(response.status).toBe(200);
+      const result = await response.json();
+      expect(result.operationId).toBe(original.owner.owner.instanceId);
+      expect(result.widgetContent).toMatchObject({ html: mocks.html, csp: mocks.csp });
+      expectOwnedSourceReceipt(result.widgetContent, { serverId: "saved-id", resourceUri: "ui://app", toolCallId: original.owner.owner.instanceId });
+    } finally {
+      modelApps.close(f.token, actor);
+    }
+    mocks.read.mockClear();
+    const foreign = fixture({ ...actor, workspaceId: "other-workspace" }, true);
+    try {
+      const denied = await foreign.request();
+      expect(denied.status).toBe(403);
+      expect(await denied.text()).not.toContain("sourceReceipt");
+      expect(mocks.read).not.toHaveBeenCalled();
+    } finally {
+      modelApps.close(foreign.token, actor);
+    }
+  });
+});

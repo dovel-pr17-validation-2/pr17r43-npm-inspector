@@ -1,0 +1,588 @@
+/**
+ * Mid-stream failures must produce exactly one typed telemetry call — and
+ * aborts must produce none.
+ *
+ * The chat engine answers over a 200 SSE stream, so the HTTP failure events
+ * never see anything that goes wrong after headers. `failureReporter`
+ * (stream-failure-reporter.ts) is the seam that records those failures as
+ * `route.operation.failed`. This suite drives `handleMCPJamFreeChatModel`
+ * with the same mocked-backend harness as the SSE snapshot test and pins:
+ *   - one reporter call + one `{type:"error"}` wire chunk per failure
+ *   - the backend-stream site's hop split (transport failure vs recognized
+ *     user-owned denial)
+ *   - aborts stay silent in both directions
+ *   - the wire error chunk shape is unchanged (client contract)
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { originOf } from "@mcpjam/sdk";
+import {
+  executeToolCallsFromMessages,
+  hasUnresolvedToolCalls,
+} from "@/shared/http-tool-calls";
+import { handleMCPJamFreeChatModel } from "../mcpjam-stream-handler";
+import type {
+  StreamFailureEvent,
+  StreamFailureReporter,
+} from "../stream-failure-reporter";
+
+let lastExecution: Promise<void> | null = null;
+let writtenChunks: any[] = [];
+
+vi.mock("ai", async () => {
+  const actual = await vi.importActual<typeof import("ai")>("ai");
+  return {
+    ...actual,
+    createUIMessageStream: vi.fn(({ execute, onFinish }) => {
+      const writer = {
+        write: vi.fn((chunk) => {
+          writtenChunks.push(chunk);
+        }),
+      };
+      lastExecution = Promise.resolve(execute({ writer })).then(async () => {
+        await onFinish?.();
+      });
+      return { getReader: vi.fn() };
+    }),
+    createUIMessageStreamResponse: vi.fn().mockReturnValue(
+      new Response("{}", {
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    ),
+  };
+});
+
+vi.mock("@/shared/http-tool-calls", () => ({
+  hasUnresolvedToolCalls: vi.fn(),
+  executeToolCallsFromMessages: vi.fn(),
+}));
+
+vi.mock("../mcpjam-tool-helpers", () => ({
+  serializeToolsForConvex: vi.fn(() => []),
+}));
+
+vi.mock("../logger", () => ({
+  logger: {
+    error: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+    event: vi.fn(),
+    systemEvent: vi.fn(),
+  },
+}));
+
+vi.mock("@sentry/node", () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}));
+
+function makeReporter(): {
+  reporter: StreamFailureReporter;
+  calls: StreamFailureEvent[];
+} {
+  const calls: StreamFailureEvent[] = [];
+  const reporter: StreamFailureReporter = (e) => {
+    calls.push(e);
+    return {
+      normalized: e.normalized ?? ({ slug: "internal/unknown" } as any),
+      origin: "ambiguous",
+    };
+  };
+  return { reporter, calls };
+}
+
+function errorChunks() {
+  return writtenChunks.filter((c) => c?.type === "error");
+}
+
+/**
+ * A real 200 SSE body, so the failure travels the way it does in production:
+ * through `parseJsonEventStream` and the chunk switch, not around them.
+ */
+function sseResponse(chunks: unknown[]): Response {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+      }
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+async function runTurn(overrides: Record<string, unknown> = {}) {
+  await handleMCPJamFreeChatModel({
+    messages: [{ role: "user", content: "Hi." }] as any,
+    modelId: "openai/gpt-oss-120b",
+    systemPrompt: "You are helpful",
+    tools: {},
+    mcpClientManager: {
+      getAllToolsMetadata: vi.fn().mockReturnValue({}),
+      listServers: vi.fn().mockReturnValue([]),
+    } as any,
+    heartbeatIntervalMs: 0,
+    ...overrides,
+  } as any);
+  await lastExecution;
+}
+
+describe("engine failure telemetry", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lastExecution = null;
+    writtenChunks = [];
+    process.env.CONVEX_HTTP_URL = "https://test-convex.example.com";
+    vi.mocked(hasUnresolvedToolCalls).mockReturnValue(false);
+    vi.mocked(executeToolCallsFromMessages).mockResolvedValue([]);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    global.fetch = originalFetch;
+    delete process.env.CONVEX_HTTP_URL;
+  });
+
+  it.each([true, false])("reports a busy Swarm step without replaying tools (canWait=%s)", async (canWait) => {
+    vi.useFakeTimers();
+    vi.spyOn(Math, "random").mockReturnValue(0);
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(sseResponse([
+        {
+          type: "tool-input-available",
+          toolCallId: "write-1",
+          toolName: "save_doc",
+          input: { text: "Saved once" },
+        },
+        { type: "finish", finishReason: "tool-calls" },
+      ]))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: "spending_reservation_busy",
+        error: "MCPJam is temporarily busy reserving spending capacity.",
+        retryAfter: 2000,
+        isRetryable: true,
+      }), { status: 503, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(sseResponse([
+        { type: "text-start", id: "reply" },
+        { type: "text-delta", id: "reply", delta: "Saved." },
+        { type: "text-end", id: "reply" },
+        { type: "finish", finishReason: "stop" },
+      ]));
+    global.fetch = fetchMock;
+    vi.mocked(hasUnresolvedToolCalls).mockReturnValueOnce(true);
+    vi.mocked(executeToolCallsFromMessages).mockResolvedValueOnce([{
+      role: "tool",
+      content: [{
+        type: "tool-result",
+        toolCallId: "write-1",
+        toolName: "save_doc",
+        output: { type: "json", value: { saved: true } },
+      }],
+    }]);
+    const { reporter, calls } = makeReporter();
+    const onEngineError = vi.fn();
+    const onConversationComplete = vi.fn();
+    const turn = runTurn({
+      sourceType: "swarm",
+      remainingTurnMs: () => (canWait ? 60_000 : 1000),
+      failureReporter: reporter,
+      onEngineError,
+      onConversationComplete,
+    });
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    await vi.runAllTimersAsync();
+    await turn;
+
+    expect(executeToolCallsFromMessages).toHaveBeenCalledTimes(1);
+    if (canWait) {
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(fetchMock.mock.calls[2][1].body).toBe(fetchMock.mock.calls[1][1].body);
+      expect(calls).toEqual([]);
+      expect(onEngineError).not.toHaveBeenCalled();
+      expect(errorChunks()).toEqual([]);
+      expect(onConversationComplete).toHaveBeenCalledTimes(1);
+    } else {
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(onEngineError).toHaveBeenCalledTimes(1);
+      expect(errorChunks()).toHaveLength(1);
+    }
+  });
+
+  it("reports a backend /stream transport failure once, with the internal hop", async () => {
+    global.fetch = vi
+      .fn()
+      .mockResolvedValue(new Response("Bad Gateway", { status: 502 }));
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      source: "mcp.chat-v2.backend-stream",
+      hop: "mcpjam_internal",
+      transport: "http_stream",
+    });
+    // The site classifies from the response itself and passes it through so
+    // the reporter never re-derives.
+    expect(calls[0].normalized).toBeDefined();
+    expect(calls[0].context).toMatchObject({ httpStatus: 502 });
+
+    // Exactly one error chunk on the wire, exact client contract shape.
+    const chunks = errorChunks();
+    expect(chunks).toHaveLength(1);
+    expect(Object.keys(chunks[0]).sort()).toEqual(["errorText", "type"]);
+  });
+
+  it("keeps a recognized user-owned denial on the user hop", async () => {
+    // HTTP 200 + JSON body = the backend working correctly and refusing for
+    // a user-owned reason. It must still be recorded (the turn failed from
+    // the user's seat) but on the user hop, so it can never promote to a
+    // page.
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "user_rate_limit",
+          error: "Daily limit reached",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      source: "mcp.chat-v2.backend-stream",
+      hop: "user_server_hop",
+      errorCode: "user_rate_limit",
+    });
+  });
+
+  it("owns a 401 whose body names MCPJam's own managed key", async () => {
+    // End-to-end guard for the blind spot: the backend's `categorizeError`
+    // mirrors the UPSTREAM provider's 401 onto its own response when MCPJam's
+    // managed Gateway/OpenRouter key is revoked. Classified by status alone
+    // that is `provider/auth_error` → `user_config`, and `mcpjam_internal`
+    // promotes only `ambiguous` — so a total hosted-chat outage reached the
+    // reporter labelled as the user's expired key and could never page.
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "mcpjam_api_error",
+          error: "MCPJam is experiencing a configuration issue.",
+        }),
+        { status: 401, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].errorCode).toBe("mcpjam_api_error");
+    // Not a recognized user-owned denial, so the internal hop still applies —
+    // but the verdict no longer depends on it.
+    expect(calls[0].hop).toBe("mcpjam_internal");
+    expect(originOf(calls[0].normalized)).toBe("mcpjam");
+  });
+
+  it("does not own a 400 that refuses a retired model", async () => {
+    // The internal hop promotes an `ambiguous` verdict, and a bare 400 is
+    // `internal/unknown` — so without the code, every turn on a retired model
+    // would page.
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "model_retired",
+          error:
+            "This model has been retired and is no longer available on MCPJam. Please switch to a newer model.",
+        }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].errorCode).toBe("model_retired");
+    expect(calls[0].normalized?.slug).toBe("provider/model_retired");
+    expect(originOf(calls[0].normalized)).toBe("user_config");
+  });
+
+  it("does not own a 413 that refuses an oversized guest request", async () => {
+    // INSPECTOR-HONO-M: the code is a listed user-owned denial, but that list
+    // only applies at 200, so the 413 paged as `internal/unknown`.
+    global.fetch = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          ok: false,
+          code: "guest_input_too_large",
+          limit: 32000,
+          estimatedInputTokens: 57002,
+          error:
+            "Guest input is estimated at 57002 tokens, above the 32000 token limit. Disconnect servers, shorten the conversation, or sign in.",
+        }),
+        { status: 413, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].errorCode).toBe("guest_input_too_large");
+    expect(calls[0].normalized?.slug).toBe("account/guest_input_too_large");
+    expect(originOf(calls[0].normalized)).toBe("user_config");
+    // The hop and policy the capture test in error-origin-capture.test.ts
+    // decides on: the slug's origin alone has to keep this off Sentry.
+    expect(calls[0].hop).toBe("mcpjam_internal");
+    expect(calls[0].capture).toBeUndefined();
+  });
+
+  it("fails the turn on a mid-stream error chunk instead of succeeding", async () => {
+    // The second delivery path, and the one HTTP status can never see. The
+    // backend's `toUIMessageStreamResponse({onError})` categorizes the failure
+    // and serializes it into an error PART on a stream whose headers already
+    // said 200. That chunk used to fall into processStream's `default:` and be
+    // forwarded verbatim; the loop then returned normally and the turn was
+    // recorded as COMPLETED. The user saw an error, telemetry saw a success.
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      { type: "start" },
+      {
+        type: "error",
+        errorText: JSON.stringify({
+          code: "mcpjam_api_error",
+          message: "MCPJam is experiencing a configuration issue.",
+          statusCode: 401,
+          isRetryable: false,
+        }),
+      },
+    ]));
+    const { reporter, calls } = makeReporter();
+    const onConversationComplete = vi.fn();
+    const onEngineError = vi.fn();
+
+    await runTurn({
+      failureReporter: reporter,
+      onConversationComplete,
+      onEngineError,
+    });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].source).toBe("mcp.chat-v2.agentic-loop");
+    expect(calls[0].errorCode).toBe("mcpjam_api_error");
+    // Classified at the chunk, where the structured body still existed.
+    // `describeError` on the rethrown Error could only see the sentence.
+    expect(originOf(calls[0].normalized)).toBe("mcpjam");
+
+    // The turn took the failure path: engine error fired, and the successful
+    // conversation was never persisted.
+    expect(onEngineError).toHaveBeenCalledTimes(1);
+    expect(onConversationComplete).not.toHaveBeenCalled();
+
+    // Still exactly one error chunk on the wire — site 3's `emitError` writes
+    // it, and the raw chunk is deliberately not also forwarded.
+    const chunks = errorChunks();
+    expect(chunks).toHaveLength(1);
+    expect(Object.keys(chunks[0]).sort()).toEqual(["errorText", "type"]);
+    // Preserve the structured failure so the client can classify and render it.
+    expect(JSON.parse(chunks[0].errorText)).toEqual({
+      message: "MCPJam is experiencing a configuration issue.",
+      code: "mcpjam_api_error",
+      statusCode: 401,
+      isRetryable: false,
+    });
+  });
+
+  it("keeps the code on a mid-stream provider_not_allowlisted chunk so the client can pick its banner", async () => {
+    // The allowlist banner is chosen from the structured code. Preserve its
+    // details so the client can explain the restriction without API-key advice.
+    const message =
+      'The "openai" provider is not enabled on MCPJam\'s AI Gateway provider allowlist, so MCPJam cannot serve this model right now.';
+    const details =
+      "Your team has restricted access to this provider. Update your Provider Allowlist settings to enable it.";
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      { type: "start" },
+      {
+        type: "error",
+        errorText: JSON.stringify({
+          code: "provider_not_allowlisted",
+          message,
+          statusCode: 403,
+          isRetryable: false,
+          details,
+        }),
+      },
+    ]));
+    const { reporter, calls } = makeReporter();
+    const onEngineError = vi.fn();
+
+    await runTurn({ failureReporter: reporter, onEngineError });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].errorCode).toBe("provider_not_allowlisted");
+    expect(calls[0].normalized?.slug).toBe("provider/not_allowlisted");
+    expect(onEngineError).toHaveBeenCalledTimes(1);
+
+    const chunks = errorChunks();
+    expect(chunks).toHaveLength(1);
+    expect(Object.keys(chunks[0]).sort()).toEqual(["errorText", "type"]);
+    expect(JSON.parse(chunks[0].errorText)).toEqual({
+      code: "provider_not_allowlisted",
+      message,
+      statusCode: 403,
+      isRetryable: false,
+      details,
+    });
+  });
+
+  it("files an empty step the provider generated nothing for on the user hop", async () => {
+    // The provider's own usage says 0 output tokens: there was no content for
+    // our rail to lose, so the empty reply must not promote to an MCPJam page.
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      {
+        type: "finish",
+        finishReason: "other",
+        totalUsage: { inputTokens: 270482, outputTokens: 0, totalTokens: 270482 },
+      },
+    ]));
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      source: "mcp.chat-v2.engine-step",
+      hop: "user_server_hop",
+      context: { outputTokens: 0, ownedByMcpjam: false },
+    });
+    expect(originOf(calls[0].normalized)).toBe("ambiguous");
+  });
+
+  it("keeps an empty step on the internal hop when the provider generated tokens we never received", async () => {
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      {
+        type: "finish",
+        finishReason: "stop",
+        totalUsage: { inputTokens: 7, outputTokens: 50, totalTokens: 57 },
+      },
+    ]));
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toMatchObject({
+      source: "mcp.chat-v2.engine-step",
+      hop: "mcpjam_internal",
+      context: { outputTokens: 50, ownedByMcpjam: true },
+    });
+  });
+
+  it("does not claim a mid-stream provider 5xx as MCPJam's", async () => {
+    // `statusCode` in an error chunk is the UPSTREAM provider's, copied off
+    // its error — not our backend's response status. Reading it with the
+    // non-OK path's `>= 500 → mcpjam` rule would page us every time someone
+    // else's model was overloaded.
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      { type: "start" },
+      {
+        type: "error",
+        errorText: JSON.stringify({
+          code: "provider_error",
+          message: "The AI provider is temporarily unavailable.",
+          statusCode: 503,
+        }),
+      },
+    ]));
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(originOf(calls[0].normalized)).toBe("ambiguous");
+  });
+
+  it("still fails the turn on a non-JSON error chunk", async () => {
+    // Any other producer's error chunk. No code, so no ownership claim — but
+    // the turn must still not be recorded as a success.
+    global.fetch = vi.fn().mockResolvedValue(sseResponse([
+      { type: "start" },
+      { type: "error", errorText: "something broke" },
+    ]));
+    const { reporter, calls } = makeReporter();
+    const onConversationComplete = vi.fn();
+
+    await runTurn({ failureReporter: reporter, onConversationComplete });
+
+    expect(calls).toHaveLength(1);
+    expect(onConversationComplete).not.toHaveBeenCalled();
+    expect(errorChunks()[0].errorText).toBe("something broke");
+  });
+
+  it("stays completely silent on abort — no report, no error chunk", async () => {
+    const controller = new AbortController();
+    global.fetch = vi.fn().mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(
+        Object.assign(new Error("This operation was aborted"), {
+          name: "AbortError",
+        }),
+      );
+    });
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({
+      failureReporter: reporter,
+      abortSignal: controller.signal,
+    });
+
+    expect(calls).toHaveLength(0);
+    expect(errorChunks()).toHaveLength(0);
+  });
+
+  it("stays silent when a NON-abort error lands after the signal fired", async () => {
+    // Exercises the `abortSignal?.aborted` arm, not the error-shape arm: the
+    // rejection is a plain TypeError, so only the engine actually consulting
+    // the signal keeps this silent. Catches a regression where the engine
+    // stops listening to abortSignal entirely.
+    const controller = new AbortController();
+    global.fetch = vi.fn().mockImplementation(() => {
+      controller.abort();
+      return Promise.reject(new TypeError("socket hang up"));
+    });
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({
+      failureReporter: reporter,
+      abortSignal: controller.signal,
+    });
+
+    expect(calls).toHaveLength(0);
+  });
+
+  it("reports an unexpected engine throw via the agentic-loop site", async () => {
+    global.fetch = vi
+      .fn()
+      .mockRejectedValue(new TypeError("fetch failed: ECONNRESET"));
+    const { reporter, calls } = makeReporter();
+
+    await runTurn({ failureReporter: reporter });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].source).toBe("mcp.chat-v2.agentic-loop");
+    expect(calls[0].transport).toBe("http_stream");
+    expect(errorChunks()).toHaveLength(1);
+  });
+});

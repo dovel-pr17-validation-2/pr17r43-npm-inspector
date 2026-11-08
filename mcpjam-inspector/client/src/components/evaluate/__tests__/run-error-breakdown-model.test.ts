@@ -1,0 +1,502 @@
+/**
+ * The errored-run breakdown (PLB-136): each shape a real user hit, and the
+ * one it must never produce — an ordinary failing test reported as an error.
+ */
+import { describe, expect, it } from "vitest";
+import {
+  USER_VALUE_STAGES,
+  type EvalRunDecisionChain,
+  type StageResultRow,
+  type StageState,
+  type UserValueStage,
+} from "@mcpjam/sdk/contract";
+
+import {
+  buildRunErrorBreakdown,
+  classifyIterationError,
+} from "../run-error-breakdown-model";
+import type { EvalIteration } from "../../evals/types";
+
+function chain(
+  states: Partial<Record<UserValueStage, StageState>>,
+  reasons: Partial<Record<UserValueStage, string>>,
+): EvalRunDecisionChain {
+  const stages = USER_VALUE_STAGES.map(
+    (stage) =>
+      ({
+        stage,
+        state: states[stage] ?? "passed",
+        ...(reasons[stage] ? { reason: reasons[stage] } : {}),
+      }) as StageResultRow,
+  );
+  const firstFailed = stages.find((row) => row.state === "failed")?.stage;
+  return {
+    status: "verified",
+    stages,
+    ...(firstFailed ? { firstFailedStage: firstFailed } : {}),
+    analyzerVersion: 8,
+  } as EvalRunDecisionChain;
+}
+
+const toolErrorChain = chain(
+  { call: "failed", response: "notReached", userValue: "notReached" },
+  { call: "toolError" },
+);
+const missingCallChain = chain(
+  {
+    selection: "failed",
+    call: "notReached",
+    response: "notReached",
+    userValue: "notReached",
+  },
+  { selection: "missingToolCall" },
+);
+const providerErrorChain = chain(
+  {
+    selection: "notMeasured",
+    call: "notMeasured",
+    response: "notMeasured",
+    userValue: "notMeasured",
+  },
+  { selection: "providerError" },
+);
+const setupAbortedChain = chain(
+  {
+    connection: "notMeasured",
+    discovery: "notMeasured",
+    selection: "notMeasured",
+    call: "notMeasured",
+    response: "notMeasured",
+    userValue: "notMeasured",
+  },
+  { connection: "setupAborted" },
+);
+
+function iteration(
+  id: string,
+  overrides: Partial<EvalIteration> = {},
+): EvalIteration {
+  return {
+    _id: id,
+    testCaseId: `case_${id}`,
+    status: "completed",
+    result: "failed",
+    iterationNumber: 1,
+    actualToolCalls: [],
+    tokensUsed: 0,
+    createdBy: "u",
+    createdAt: 0,
+    updatedAt: 0,
+    testCaseSnapshot: {
+      title: "Find a transfer",
+      query: "Find my last transfer",
+      provider: "anthropic",
+      model: "sonnet",
+      expectedToolCalls: [],
+    },
+    ...overrides,
+  } as EvalIteration;
+}
+
+const pinnedSnapshot = {
+  title: "Find credit transfers",
+  query: "",
+  provider: "none",
+  model: "none",
+  expectedToolCalls: [],
+  promptTurns: [
+    {
+      id: "turn-1",
+      prompt: "",
+      expectedToolCalls: [],
+      pinnedToolCall: {
+        serverName: "bko",
+        toolName: "find_credit_transfers",
+        arguments: {},
+      },
+    },
+  ],
+} as unknown as EvalIteration["testCaseSnapshot"];
+
+describe("classifyIterationError", () => {
+  it("names the user's server when it returned a tool error", () => {
+    expect(classifyIterationError(iteration("a"), toolErrorChain)).toBe(
+      "serverError",
+    );
+  });
+
+  it("points at the test's saved inputs when a pinned call is rejected", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", { testCaseSnapshot: pinnedSnapshot }),
+        toolErrorChain,
+      ),
+    ).toBe("testInput");
+  });
+
+  it("does not call an ordinary failing test an error", () => {
+    expect(classifyIterationError(iteration("a"), missingCallChain)).toBeNull();
+  });
+
+  it("ignores passing and unfinished results", () => {
+    expect(
+      classifyIterationError(iteration("a", { result: "passed" }), null),
+    ).toBeNull();
+    expect(
+      classifyIterationError(
+        iteration("a", { status: "cancelled", result: "cancelled" }),
+        null,
+      ),
+    ).toBeNull();
+  });
+
+  it("reads a disconnected pinned server from the recorded error", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", {
+          status: "setup_failed",
+          error:
+            'pinned_server_not_connected: "bko" is not connected in this run\'s environment',
+        }),
+        null,
+      ),
+    ).toBe("serverUnreachable");
+  });
+
+  it("puts a model-provider failure on MCPJam's side", () => {
+    expect(classifyIterationError(iteration("a"), providerErrorChain)).toBe(
+      "platform",
+    );
+  });
+
+  it("says unknown rather than guessing when nothing settles it", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", { status: "failed", error: "something odd happened" }),
+        null,
+      ),
+    ).toBe("unknown");
+  });
+});
+
+// A BYOK run whose provider isn't turned on for the organization: the
+// iteration keeps the backend's sentence, and the code only in its diagnostics.
+const notTurnedOn =
+  'The "anthropic" provider isn\'t turned on for your organization. An organization admin can add it under AI providers in organization settings, or you can pick a model from another provider.';
+const orgProviderRefusal = (code = "provider_not_configured") => ({
+  error: notTurnedOn,
+  errorDetails: JSON.stringify({ ok: false, code, error: notTurnedOn }),
+  metadata: { evalErrors: [{ message: notTurnedOn, reason: "providerError" }] },
+});
+
+describe("organization AI provider refusals", () => {
+  it("sends them to the organization's AI provider settings, not to MCPJam", () => {
+    for (const chain of [providerErrorChain, null]) {
+      expect(
+        classifyIterationError(
+          iteration("a", orgProviderRefusal() as Partial<EvalIteration>),
+          chain,
+        ),
+      ).toBe("orgProviders");
+    }
+  });
+
+  it("reads the runner's refused-selection row", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", {
+          status: "setup_failed",
+          error:
+            "Model selection refused — credential_missing: the saved org connection is gone.",
+        }),
+        null,
+      ),
+    ).toBe("orgProviders");
+  });
+
+  it("never reads a refusal out of an error's text without a chain behind it", () => {
+    // Older rows, quarantined rows or a schema mismatch carry no verified
+    // chain; the text may be the MCP server's own.
+    for (const error of [
+      "credential_missing: set GITHUB_TOKEN",
+      "provider_not_configured: GITHUB_TOKEN is not set",
+    ]) {
+      expect(classifyIterationError(iteration("a", { error }), null)).not.toBe(
+        "orgProviders",
+      );
+    }
+  });
+
+  it("keeps a recorded error that isn't the iteration's own off its infra error code", () => {
+    const groups = buildRunErrorBreakdown({
+      iterations: [
+        iteration("a", {
+          status: "failed",
+          error: notTurnedOn,
+          infraError: {
+            class: "configuration",
+            layer: "model",
+            retryable: false,
+            code: "provider_not_configured",
+          },
+          metadata: {
+            evalErrors: [
+              { message: "The judge timed out.", reason: "providerError" },
+            ],
+          },
+        } as Partial<EvalIteration>),
+      ],
+      chains: new Map([["a", providerErrorChain]]),
+    })?.groups;
+    expect(
+      groups?.find((group) => group.cause === "orgProviders")?.errors,
+    ).toEqual([{ message: notTurnedOn, count: 1 }]);
+    expect(groups?.find((group) => group.cause === "platform")?.errors).toEqual(
+      [{ message: "The judge timed out.", count: 1 }],
+    );
+  });
+
+  it("leaves a tool error that looks like a refusal with the MCP server", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", { error: "credential_missing: set GITHUB_TOKEN" }),
+        toolErrorChain,
+      ),
+    ).toBe("serverError");
+  });
+
+  it("keeps a failure the chain pins on the MCP server there, whatever code was recorded", () => {
+    for (const code of ["credential_missing", "provider_not_configured"]) {
+      expect(
+        classifyIterationError(
+          iteration("a", {
+            error: "set GITHUB_TOKEN",
+            errorDetails: JSON.stringify({ ok: false, code }),
+            infraError: {
+              class: "configuration",
+              layer: "model",
+              retryable: false,
+              code,
+            },
+          } as Partial<EvalIteration>),
+          toolErrorChain,
+        ),
+      ).toBe("serverError");
+    }
+  });
+
+  it("reads a stated refusal from the text when the chain stops on the provider or on setup", () => {
+    for (const stop of [providerErrorChain, setupAbortedChain]) {
+      expect(
+        classifyIterationError(
+          iteration("a", {
+            status: "failed",
+            error: "provider_not_configured: anthropic is not enabled",
+          }),
+          stop,
+        ),
+      ).toBe("orgProviders");
+    }
+  });
+
+  it("reads the typed code on a refused turn recorded as a configuration error", () => {
+    expect(
+      classifyIterationError(
+        iteration("a", {
+          status: "failed",
+          error: notTurnedOn,
+          errorDetails: JSON.stringify({ ok: false, error: notTurnedOn }),
+          infraError: {
+            class: "configuration",
+            layer: "model",
+            retryable: false,
+            code: "provider_not_configured",
+          },
+        } as Partial<EvalIteration>),
+        providerErrorChain,
+      ),
+    ).toBe("orgProviders");
+  });
+
+  it("groups the run under one titled cause with the backend's reason", () => {
+    expect(
+      buildRunErrorBreakdown({
+        iterations: [
+          iteration("a", orgProviderRefusal() as Partial<EvalIteration>),
+        ],
+        chains: new Map([["a", providerErrorChain]]),
+      })?.groups,
+    ).toEqual([
+      {
+        cause: "orgProviders",
+        title: "An organization admin needs to add or reconnect an AI provider",
+        count: 1,
+        errors: [{ message: notTurnedOn, count: 1 }],
+      },
+    ]);
+  });
+
+  it.each([
+    "provider_unavailable",
+    "org_runtime_unsupported",
+    "org_keys_required",
+  ])("keeps %s, which provider settings don't fix, where it was", (code) => {
+    expect(
+      classifyIterationError(
+        iteration("a", orgProviderRefusal(code) as Partial<EvalIteration>),
+        providerErrorChain,
+      ),
+    ).toBe("platform");
+  });
+});
+
+describe("buildRunErrorBreakdown", () => {
+  it("explains a run where every result hit a server tool error", () => {
+    const iterations = ["a", "b", "c"].map((id) => iteration(id));
+    const breakdown = buildRunErrorBreakdown({
+      iterations,
+      chains: new Map(iterations.map((row) => [row._id, toolErrorChain])),
+    });
+    expect(breakdown).not.toBeNull();
+    expect(breakdown!.headline).toBe(
+      "All 3 results in this run ended in an error.",
+    );
+    expect(breakdown!.groups).toEqual([
+      expect.objectContaining({
+        cause: "serverError",
+        count: 3,
+      }),
+    ]);
+  });
+
+  it("prefers the diagnostic's chain and groups mixed causes in a fixed order", () => {
+    const iterations = [
+      iteration("provider"),
+      iteration("server"),
+      iteration("pinned", { testCaseSnapshot: pinnedSnapshot }),
+    ];
+    const breakdown = buildRunErrorBreakdown({
+      iterations,
+      diagnostics: [
+        { iterationId: "provider", chain: providerErrorChain },
+        { iterationId: "server", chain: toolErrorChain },
+        { iterationId: "pinned", chain: toolErrorChain },
+      ] as never,
+    });
+    expect(breakdown!.groups.map((group) => group.cause)).toEqual([
+      "serverError",
+      "testInput",
+      "platform",
+    ]);
+  });
+
+  it("shows one error among many passes", () => {
+    const iterations = [
+      iteration("err"),
+      iteration("p1", { result: "passed" }),
+      iteration("p2", { result: "passed" }),
+    ];
+    expect(
+      buildRunErrorBreakdown({
+        iterations,
+        chains: new Map([["err", toolErrorChain]]),
+      }),
+    ).toMatchObject({ errored: 1, finished: 3 });
+  });
+
+  it("stays quiet when the run failed on its merits", () => {
+    const iterations = [iteration("a"), iteration("b")];
+    expect(
+      buildRunErrorBreakdown({
+        iterations,
+        chains: new Map(iterations.map((row) => [row._id, missingCallChain])),
+      }),
+    ).toBeNull();
+  });
+
+  it("counts against finished results only", () => {
+    const breakdown = buildRunErrorBreakdown({
+      iterations: [
+        iteration("a"),
+        iteration("b", { status: "cancelled", result: "cancelled" }),
+      ],
+      chains: new Map([["a", toolErrorChain]]),
+    });
+    expect(breakdown!.finished).toBe(1);
+    expect(breakdown!.headline).toBe(
+      "The only result in this run ended in an error.",
+    );
+  });
+});
+
+describe("recorded error rows", () => {
+  it("keeps eight different errors and counts distinct results", () => {
+    const errors = Array.from({ length: 8 }, (_, i) => ({
+      reason: "toolError",
+      message: `Missing input field${i}`,
+    }));
+    const a = iteration("a", {
+      metadata: { evalErrors: [...errors, errors[0]] },
+    });
+    const b = iteration("b", { metadata: { evalErrors: [errors[0]] } });
+    const result = buildRunErrorBreakdown({ iterations: [a, b, a] })!;
+    expect(result).toMatchObject({ errored: 2, finished: 2 });
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0].count).toBe(2);
+    expect(result.groups[0].errors).toHaveLength(8);
+    expect(result.groups[0].errors[0]).toEqual({
+      message: "Missing input field0",
+      count: 2,
+    });
+  });
+
+  it("counts a result under multiple recorded causes only once in the headline", () => {
+    const result = buildRunErrorBreakdown({
+      iterations: [
+        iteration("a", {
+          metadata: {
+            evalErrors: [
+              { reason: "toolError", message: "Missing input" },
+              { reason: "connectFailed", message: "Connection closed" },
+            ],
+          },
+        }),
+      ],
+    })!;
+    expect(result.errored).toBe(1);
+    expect(result.groups.map((group) => group.cause)).toEqual([
+      "serverUnreachable",
+      "serverError",
+    ]);
+  });
+
+  it("keeps a cause without inventing a message for old results", () => {
+    const result = buildRunErrorBreakdown({
+      iterations: [iteration("a")],
+      chains: new Map([["a", toolErrorChain]]),
+    })!;
+    expect(result.groups[0]).toMatchObject({
+      cause: "serverError",
+      errors: [],
+    });
+  });
+
+  it("uses the diagnostic before chain and raw error metadata", () => {
+    const row = iteration("a", {
+      error: "Something failed",
+      metadata: {
+        evalErrors: [{ reason: "setupAborted", message: "Something failed" }],
+      },
+    });
+    const result = buildRunErrorBreakdown({
+      iterations: [row],
+      chains: new Map([["a", providerErrorChain]]),
+      diagnostics: [{ iterationId: "a", chain: toolErrorChain }] as never,
+    })!;
+    expect(result.groups).toHaveLength(1);
+    expect(result.groups[0]).toMatchObject({
+      cause: "serverError",
+      errors: [{ message: "Something failed", count: 1 }],
+    });
+  });
+});

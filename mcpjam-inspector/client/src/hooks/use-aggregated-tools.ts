@@ -1,0 +1,223 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import type { Tool } from "@modelcontextprotocol/client";
+import {
+  listToolsForServers,
+  type ListToolsForServersResult,
+} from "@/lib/apis/mcp-tools-api";
+import {
+  getApiContextRevision,
+  subscribeApiContext,
+} from "@/lib/apis/web/context";
+
+export interface ServerScopedTool {
+  serverId: string;
+  toolName: string;
+  tool: Tool;
+}
+
+export interface AggregatedToolsState {
+  /** Tools grouped by their serving `serverId`. */
+  toolsByServer: Record<string, Tool[]>;
+  /** Flat list, one entry per (serverId, toolName) pair. */
+  flat: ServerScopedTool[];
+  /** Names that appear on more than one server. */
+  collidingNames: string[];
+  /** Loading state per server (so the UI can show partial progress). */
+  loadingByServer: Record<string, boolean>;
+  /** Per-server fetch error (string message), if any. */
+  errorByServer: Record<string, string>;
+  refetch: () => Promise<void>;
+}
+
+/**
+ * Aggregates tool lists across several MCP servers for the Playground tools
+ * pane.
+ *
+ * Unlike `getToolsMetadata` (which flattens metadata into bare-name maps for
+ * LLM consumption), this hook keeps tools grouped by server so the UI can:
+ *   - render a section-per-server tree with badges (matching the convention
+ *     established in `tool-choice-picker.tsx:204`)
+ *   - resolve clicks to a `(serverId, toolName)` tuple, avoiding the
+ *     last-seen-wins collision behavior baked into `ToolServerMap`.
+ */
+function failureMessage(error: unknown): string {
+  return error instanceof Error ? error.message : "Failed to fetch tools";
+}
+
+export function useAggregatedTools(
+  serverNames: string[],
+  options: { unavailableServerNames?: ReadonlyArray<string> } = {}
+): AggregatedToolsState {
+  const apiContextRevision = useSyncExternalStore(
+    subscribeApiContext,
+    getApiContextRevision,
+    getApiContextRevision
+  );
+  const [toolsByServer, setToolsByServer] = useState<Record<string, Tool[]>>(
+    {}
+  );
+  const [loadingByServer, setLoadingByServer] = useState<
+    Record<string, boolean>
+  >({});
+  const [errorByServer, setErrorByServer] = useState<Record<string, string>>(
+    {}
+  );
+
+  // Stable key so the effect doesn't re-run when the parent passes a fresh
+  // array reference with the same contents. \x00 is a safe delimiter — it
+  // can't appear inside a serverName.
+  const serversKey = useMemo(
+    () => [...serverNames].sort().join("\x00"),
+    [serverNames]
+  );
+  const unavailableServersKey = useMemo(
+    () => [...(options.unavailableServerNames ?? [])].sort().join("\x00"),
+    [options.unavailableServerNames]
+  );
+  const serverNamesRef = useRef<string[]>([]);
+  serverNamesRef.current = serversKey ? serversKey.split("\x00") : [];
+  const unavailableServerNamesRef = useRef<string[]>([]);
+  unavailableServerNamesRef.current = unavailableServersKey
+    ? unavailableServersKey.split("\x00")
+    : [];
+
+  // Monotonic token so a stale in-flight fetch can't clobber a fresher result
+  // when the server set toggles or `refetch` is called mid-request.
+  const fetchTokenRef = useRef(0);
+
+  const fetchAll = useCallback(async (forceRefresh = false) => {
+    const names = serverNamesRef.current;
+    const token = ++fetchTokenRef.current;
+    if (names.length === 0) {
+      setToolsByServer({});
+      setLoadingByServer({});
+      setErrorByServer({});
+      return;
+    }
+
+    const unavailableSet = new Set(unavailableServerNamesRef.current);
+    const fetchableNames = names.filter((name) => !unavailableSet.has(name));
+
+    // Prune state to the new server set synchronously so tools from
+    // just-deselected servers disappear immediately rather than lingering
+    // until the new fetch returns.
+    const activeSet = new Set(names);
+    const pruneToActive = <V>(prev: Record<string, V>): Record<string, V> => {
+      const next: Record<string, V> = {};
+      for (const key of Object.keys(prev)) {
+        if (activeSet.has(key) && !unavailableSet.has(key)) {
+          next[key] = prev[key];
+        }
+      }
+      return next;
+    };
+    setToolsByServer((prev) => pruneToActive(prev));
+    setErrorByServer((prev) => pruneToActive(prev));
+    setLoadingByServer((prev) => {
+      const next = pruneToActive(prev);
+      for (const name of names) {
+        next[name] = true;
+      }
+      return next;
+    });
+
+    if (fetchableNames.length === 0) {
+      return;
+    }
+
+    // One request for the whole set (PLB-158): the hosted passthrough limiter
+    // counts requests, and a per-server fan-out met it on large workspaces.
+    let batch: ListToolsForServersResult;
+    try {
+      batch = await listToolsForServers(fetchableNames, {
+        refresh: forceRefresh,
+      });
+    } catch (err) {
+      batch = {
+        results: {},
+        errors: Object.fromEntries(
+          fetchableNames.map((serverId) => [serverId, err]),
+        ),
+      };
+    }
+
+    if (token !== fetchTokenRef.current) return;
+
+    const results = fetchableNames.map((serverId) => ({
+      serverId,
+      tools: batch.results[serverId]?.tools ?? [],
+      error:
+        serverId in batch.errors
+          ? failureMessage(batch.errors[serverId])
+          : null,
+    }));
+
+    setToolsByServer(() => {
+      const next: Record<string, Tool[]> = {};
+      for (const { serverId, tools } of results) next[serverId] = tools;
+      return next;
+    });
+    setErrorByServer(() => {
+      const next: Record<string, string> = {};
+      for (const { serverId, error } of results) {
+        if (error) next[serverId] = error;
+      }
+      return next;
+    });
+    setLoadingByServer(() => {
+      const next: Record<string, boolean> = {};
+      for (const { serverId } of results) next[serverId] = false;
+      for (const serverId of unavailableSet) {
+        if (activeSet.has(serverId)) next[serverId] = true;
+      }
+      return next;
+    });
+  }, [serversKey, apiContextRevision, unavailableServersKey]);
+
+  useEffect(() => {
+    void fetchAll();
+  }, [fetchAll]);
+
+  // `refetch` is the explicit user-triggered path — force a live re-fetch
+  // (cacheMode: "refresh") rather than silently reusing a still-fresh cached
+  // entry. The mount/server-change effect above stays on the default "use".
+  const refetch = useCallback(() => fetchAll(true), [fetchAll]);
+
+  const flat = useMemo<ServerScopedTool[]>(() => {
+    const entries: ServerScopedTool[] = [];
+    for (const [serverId, tools] of Object.entries(toolsByServer)) {
+      for (const tool of tools) {
+        entries.push({ serverId, toolName: tool.name, tool });
+      }
+    }
+    return entries;
+  }, [toolsByServer]);
+
+  const collidingNames = useMemo(() => {
+    const seen = new Map<string, Set<string>>();
+    for (const { serverId, toolName } of flat) {
+      const servers = seen.get(toolName) ?? new Set<string>();
+      servers.add(serverId);
+      seen.set(toolName, servers);
+    }
+    return Array.from(seen.entries())
+      .filter(([, servers]) => servers.size > 1)
+      .map(([name]) => name);
+  }, [flat]);
+
+  return {
+    toolsByServer,
+    flat,
+    collidingNames,
+    loadingByServer,
+    errorByServer,
+    refetch,
+  };
+}

@@ -1,0 +1,240 @@
+---
+title: "Save Results to MCPJam"
+description: "Save eval results to the MCPJam dashboard with an MCPJam API key (sk_…) for tracking and CI visibility"
+icon: "cloud-upload"
+---
+
+<Warning>
+Reporting authenticates with **MCPJam API keys (`sk_…`)** from Settings → API keys. The legacy project API keys (`mcpjam_…`) are retired and no longer work anywhere — see [API keys](/reference/api-keys).
+</Warning>
+
+After running evals, you can save results to MCPJam to track accuracy over time, compare across branches, and get visibility in the CI Evals dashboard.
+
+<Frame caption="CI Runs page showing eval suite accuracy, pass rate trends, per-model performance, and more">
+  <img src="/images/ci-runs-overview.png" alt="CI Runs overview" />
+</Frame>
+
+## Setup
+
+Create an MCPJam API key (`sk_…`) under **Settings → API keys** and export it:
+
+```bash
+export MCPJAM_API_KEY=sk_...
+# Optional: file results under a specific project (defaults to your org's Default project).
+export MCPJAM_PROJECT_ID=<project id>
+```
+
+That's it. Both `EvalTest` and `EvalSuite` auto-save results when this key is available. Results land in the project named by `MCPJAM_PROJECT_ID` (or the `project` option in the `mcpjam:` config), falling back to your organization's **Default** project.
+
+After each successful upload the SDK prints a link to the run it just created, so you can open it straight from the terminal:
+
+```text
+[mcpjam/sdk] View run: https://app.mcpjam.com/evals/suite/jd7.../runs/kn2...?project=jh4...
+```
+
+One line per run, on by default. See [the printed run URL](/sdk/reference/eval-reporting#the-printed-run-url) for when the `?project=` param is omitted and when nothing prints at all.
+
+**Attach the connected `MCPClientManager` to [`HostRunner`](/sdk/reference/host-runner)** (or pass `agent` / `mcpClientManager` to manual reporting APIs) when you need either of the following:
+
+1. **MCP App / widget replay in Evals traces** — After each MCP App tool call, the agent uses the manager’s [`readResource`](/sdk/reference/mcp-client-manager#readresource) to fetch HTML from the tool’s `ui.resourceUri` and fills [`widgetSnapshots`](/sdk/reference/prompt-result#mcp-app-widget-snapshots) on [`PromptResult`](/sdk/reference/prompt-result). Without the manager, traces still upload (messages + spans) but **widgets will not replay** in the dashboard. The tool’s JSON result alone is not enough for offline iframe replay.
+2. **Replay credentials (authenticated HTTP MCP)** — The SDK can persist server connection details for debugging and reruns. You do not need to build a second secret object yourself; replay config is derived automatically when the agent or manager is attached.
+
+## Auto-Save from EvalTest
+
+When `MCPJAM_API_KEY` is set, `EvalTest.run()` automatically saves results:
+
+```typescript
+await test.run(agent, {
+  iterations: 30,
+  mcpjam: {
+    suiteName: "Addition Eval",
+    passCriteria: { minimumPassRate: 90 },
+  },
+});
+```
+
+**Tool execution:** Auto-saved payloads use the same **pass/fail rules** as the [eval reporting reference](/sdk/reference/eval-reporting#tool-execution-and-passed): failed tool calls default to `passed: false` unless you set `failOnToolError: false` on the `mcpjam` object.
+
+For authenticated HTTP servers:
+
+```typescript
+import { MCPClientManager, HostRunner } from "@mcpjam/sdk";
+
+const manager = new MCPClientManager({
+  asana: {
+    url: process.env.MCP_SERVER_URL!,
+    refreshToken: process.env.MCP_REFRESH_TOKEN!,
+    clientId: process.env.MCP_CLIENT_ID!,
+    clientSecret: process.env.MCP_CLIENT_SECRET,
+  },
+});
+
+await manager.connectToServer("asana");
+
+const agent = new HostRunner({
+  tools: await manager.getTools(),
+  model: "openai/gpt-5.6-sol",
+  apiKey: process.env.OPENAI_API_KEY!,
+  mcpClientManager: manager,
+});
+
+await test.run(agent, {
+  iterations: 30,
+  mcpjam: { suiteName: "Asana Eval" },
+});
+```
+
+To disable auto-save for a specific run:
+
+```typescript
+await test.run(agent, {
+  iterations: 30,
+  mcpjam: { enabled: false },
+});
+```
+
+## Auto-Save from EvalSuite
+
+Suites can be configured at construction or run time:
+
+```typescript
+const suite = new EvalSuite({ name: "Math Operations" });
+```
+
+When a suite runs, individual `EvalTest` auto-saves are suppressed to avoid duplicate uploads. The suite consolidates all test results into a single run.
+
+## Automatic CI metadata
+
+When `ci` is omitted, the SDK reads available CI details from the environment. This works for `EvalSuite`, `EvalTest`, `reportEvalResults`, `reportEvalResultsSafely`, and `createEvalRunReporter`. API-key setup is still required.
+
+| Service | Detected provider | Commit / branch variables |
+| --- | --- | --- |
+| GitHub Actions | `github_actions` | `GITHUB_SHA` / `GITHUB_REF_NAME` (PRs use the source branch from `GITHUB_HEAD_REF` or supplied event metadata) |
+| GitLab CI | `gitlab_ci` | `CI_COMMIT_SHA` / `CI_COMMIT_BRANCH`, then `CI_MERGE_REQUEST_SOURCE_BRANCH_NAME`, then `CI_COMMIT_REF_NAME` |
+| CircleCI | `circleci` | `CIRCLE_SHA1` / `CIRCLE_BRANCH` |
+| Buildkite | `buildkite` | `BUILDKITE_COMMIT` / `BUILDKITE_BRANCH` |
+| Jenkins | `jenkins` | `GIT_COMMIT` / `BRANCH_NAME`, then `GIT_LOCAL_BRANCH`, then `GIT_BRANCH` |
+| Vercel | `vercel` | `VERCEL_GIT_COMMIT_SHA` / `VERCEL_GIT_COMMIT_REF` |
+| Netlify | `netlify` | `COMMIT_REF` / `BRANCH` |
+
+The SDK also attaches available pipeline IDs, job IDs, and CI run URLs. Vercel attaches its deployment ID and Netlify its build ID; neither supplies a job ID or run URL through this detector. A deployed site's URL is not used as a CI run link.
+
+Detection requires the provider's environment flag to be `true` or `1`; Jenkins uses a nonempty `JENKINS_URL` or `JENKINS_HOME`. If several providers match, the table's order wins and their fields are never mixed. Local runs and unknown CI services add no automatic metadata.
+
+Variables must be exposed to the test process. On Vercel, enable access to [system environment variables](https://vercel.com/docs/environment-variables/system-environment-variables). Missing or invalid values are omitted: automatic fields are limited to 512 characters, run URLs must be HTTP(S), and commit values must be full Git hashes. For example, Buildkite's unresolved `HEAD` is omitted. GitHub uses the existing detector: `GITHUB_SHA` remains the evaluated commit (which may be a merge commit), and PRs use the source branch rather than a synthetic merge ref. Detection does not inspect the checkout or make network requests.
+
+An explicit `ci` object replaces detection completely; missing fields are not filled automatically. To supply your own values:
+
+```typescript
+const suite = new EvalSuite({
+  name: "Math Operations",
+  mcpjam: { ci: { commitSha: myCommitSha, branch: myBranch } },
+});
+```
+
+To disable detection:
+
+```typescript
+const suite = new EvalSuite({
+  name: "Math Operations",
+  mcpjam: { ci: {} },
+});
+```
+
+Direct reporting APIs accept `ci` at the top level. Incremental reporters snapshot CI details when created; direct uploads snapshot them when reporting starts. Retries and chunks keep the same metadata.
+
+## Manual Save APIs
+
+For more control — custom test runners, CI post-steps, or framework-agnostic flows — the SDK provides dedicated APIs:
+
+```typescript
+import {
+  reportEvalResults,
+  reportEvalResultsSafely,
+  createEvalRunReporter,
+  uploadEvalArtifact,
+} from "@mcpjam/sdk";
+
+// 1) One-shot save (strict — throws on failure)
+await reportEvalResults({
+  suiteName: "Nightly",
+  mcpClientManager: manager,
+  results: [{ caseTitle: "healthcheck", passed: true }],
+});
+
+// 2) One-shot save (safe — returns null on failure)
+const result = await reportEvalResultsSafely({
+  suiteName: "Nightly",
+  results: [{ caseTitle: "healthcheck", passed: true }],
+});
+
+// 3) Incremental reporter (long-running processes)
+// Assumes `agent` was created with `mcpClientManager: manager`
+const reporter = createEvalRunReporter({
+  suiteName: "Incremental",
+  agent,
+});
+await reporter.record({ caseTitle: "step-1", passed: true });
+await reporter.record({ caseTitle: "step-2", passed: false, error: "timeout" });
+const output = await reporter.finalize();
+
+// 4) Artifact upload (JUnit XML, Jest JSON, Vitest JSON)
+await uploadEvalArtifact({
+  suiteName: "JUnit import",
+  format: "junit-xml",
+  artifact: junitXmlString,
+});
+```
+
+`reportEvalResults()` and `createEvalRunReporter()` resolve replay credentials in this order:
+
+1. `serverReplayConfigs` if you pass it explicitly
+2. `agent.getServerReplayConfigs()`
+3. `mcpClientManager.getServerReplayConfigs()`
+
+Most users should pass `agent` or `mcpClientManager` and let the SDK derive replay credentials automatically. Use `serverReplayConfigs` only as an advanced override.
+
+When replay configs are inferred from `agent` or `mcpClientManager`, the SDK limits them to the `serverNames` you attach to the run when `serverNames` is provided.
+
+**Manual reporters (Vitest/Jest hooks):** Pass `agent` or `mcpClientManager` into [`createEvalRunReporter`](/sdk/reference/eval-reporting#createevalrunreporter) — not only on `HostRunner` — and call **`await reporter.finalize()` before `await manager.disconnectAllServers()`** so replay config is still available at upload time. See [Replay metadata for the MCPJam UI](/sdk/reference/eval-reporting#replay-metadata-for-the-mcpjam-ui).
+
+### Report the whole run, not just pass or fail
+
+`{ caseTitle, passed }` is a valid result, and it produces a run page with nothing to look at. `promptsToEvalResult()` turns the `PromptResult`s you already have into a full result — the conversation trace, the tool calls the model actually made, token counts and end-to-end latency — so the dashboard has something to show:
+
+```typescript
+import { promptsToEvalResult, reportEvalResults } from "@mcpjam/sdk";
+
+const prompt = await agent.run("Find a coffee product and tell me its price.");
+
+await reportEvalResults({
+  suiteName: "Nightly",
+  mcpClientManager: manager,
+  results: [
+    promptsToEvalResult([prompt], {
+      caseTitle: "Finds coffee and reports its price",
+      passed: true,
+      expectedToolCalls: [{ toolName: "search-products", arguments: { query: "coffee" } }],
+    }),
+  ],
+});
+```
+
+Pass every turn of a multi-turn case in one call — `promptsToEvalResult([first, second, third], …)` — and the timeline merges them into one iteration. Anything you set in the overrides wins over what it derives, so `error`, `model` and `provider` stay yours to declare. The trace, `actualToolCalls` and `tokens` are always derived from the prompts and cannot be overridden.
+
+Each iteration records the expected and actual tool calls side by side, along with the model's reasoning trace, so you can pinpoint exactly why a test passed or failed:
+
+<Frame caption="Test case iteration detail showing expected vs actual tool calls and the model's reasoning trace">
+  <img src="/images/test-case-detail.png" alt="Test case detail view" />
+</Frame>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Running Evals" icon="chart-bar" href="/sdk/concepts/running-evals">
+    Learn about EvalTest, EvalSuite, and iteration strategies
+  </Card>
+  <Card title="Saving Results Reference" icon="book" href="/sdk/reference/eval-reporting">
+    Full API reference for all saving and reporting methods
+  </Card>
+</CardGroup>

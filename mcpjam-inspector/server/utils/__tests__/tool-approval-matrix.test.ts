@@ -1,0 +1,1291 @@
+/**
+ * THE approval matrix: family × engine × switch → gate | free.
+ *
+ * Approval is declared ONCE, on the tool, and every engine reads that one
+ * declaration. This file is where the answer lives: every row states the
+ * family, what its builder produces, and what each engine then does with the
+ * switch on and off.
+ *
+ * It exists because there used to be TWO channels — `tool.needsApproval`,
+ * which only the BYOK `streamText` path read, and a per-turn set of tool NAMES
+ * the route threaded, which only the MCPJam loop read. A family that filled one
+ * and not the other was silently wrong on the other engine, in six places, and
+ * nothing said so. The columns below are no longer allowed to disagree, and
+ * that is the property this table is for.
+ *
+ * HOW EACH ENGINE IS DRIVEN — deliberately not a shared abstraction over the
+ * two, because they remain different readers of the same fact:
+ *
+ *   - `mcpjam` runs a whole turn through `handleMCPJamFreeChatModel` with a
+ *     fake model emitting one `tool-call`, and asks whether a
+ *     `tool-approval-request` chunk followed. That is the user-visible pill.
+ *   - `byok` evaluates `tools[name].needsApproval` — the value `streamText`
+ *     reads — invoking it with a representative input when it is a function.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ToolSet } from "ai";
+import { hasUnresolvedToolCalls } from "@/shared/http-tool-calls";
+
+// The stream handler imports one function from the harness runner, and that
+// module loads `@ai-sdk/harness/agent` at import time. Nothing here runs a
+// harness turn, and without this the file that pins the WHOLE approval matrix
+// fails to LOAD wherever that optional package is not installed.
+vi.mock("../harness/run-harness-turn", () => ({
+  runHarnessTurn: vi.fn(),
+}));
+
+import {
+  createApprovalDecisionCache,
+  handleMCPJamFreeChatModel,
+  toolCallNeedsApproval,
+} from "../mcpjam-stream-handler";
+import { mcpToolOptionsFor } from "../mcp-tool-options";
+import {
+  applySkillToolApproval,
+  buildAppTools,
+  buildPageTools,
+  buildUiTools,
+} from "../chat-v2-orchestration";
+import { buildBashTool } from "../built-in-tools/bash";
+import { buildSandboxBashTool } from "../built-in-tools/sandbox-bash";
+import { buildMcpjamTool } from "../built-in-tools/mcpjam";
+import { buildBrowserTools } from "../built-in-tools/browser";
+import { buildExaWebSearchTool } from "../built-in-tools/exa-web-search";
+import { createProgressiveMetaTools } from "../progressive-tool-meta-tools";
+import { createPinnedSkillTools } from "../computers/cloud-skill-tools";
+import { createEffectiveSkillTools } from "../computers/effective-skill-tools";
+import { handleLocalOrgChatModel } from "../org-model-stream-handler";
+import { applyActingServerSkillGate } from "../server-skill-acting-gate";
+import { buildServerSkillBanner } from "../../../shared/server-skill-banner";
+import { convertToMcpjamModelMessages } from "../mcp-tool-result-model-output";
+import type { BrowserSessionHandle } from "../../services/browserd/browser-session";
+
+// ── engine harness ─────────────────────────────────────────────────────────
+//
+// Same shape as `mcpjam-stream-handler.test.ts`: the handler's stream writer is
+// captured so the emitted chunks can be read back, and the Convex hop is a
+// canned SSE body.
+
+let lastExecution: Promise<void> | null = null;
+let writtenChunks: any[] = [];
+
+// Route 3 (local org runtime) builds its own model and calls `streamText`
+// directly; both are stubbed so its rows run without a provider.
+const streamTextMock = vi.hoisted(() => vi.fn());
+vi.mock("@mcpjam/sdk/model-factory", async () => {
+  const actual = await vi.importActual<
+    typeof import("@mcpjam/sdk/model-factory")
+  >("@mcpjam/sdk/model-factory");
+  return {
+    ...actual,
+    assertOrgModelAllowed: vi.fn(),
+    buildOrgModelFromResolvedConfig: vi.fn(() => ({ id: "mock-model" })),
+  };
+});
+
+const createSseResponse = (events: any[]) => {
+  const payload = `${events
+    .map((event) => `data: ${JSON.stringify(event)}\n\n`)
+    .join("")}data: [DONE]\n\n`;
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(encoder.encode(payload));
+      controller.close();
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
+};
+
+vi.mock("ai", async () => {
+  const actual = await vi.importActual<typeof import("ai")>("ai");
+  return {
+    ...actual,
+    streamText: (...args: unknown[]) => streamTextMock(...args),
+    stepCountIs: vi.fn(() => undefined),
+    createUIMessageStream: vi.fn(({ execute, onFinish }) => {
+      const writer = {
+        write: vi.fn((chunk) => {
+          writtenChunks.push(chunk);
+        }),
+      };
+      lastExecution = Promise.resolve(execute({ writer })).then(async () => {
+        await onFinish?.();
+      });
+      return { getReader: vi.fn() };
+    }),
+    createUIMessageStreamResponse: vi.fn().mockReturnValue(
+      new Response("{}", {
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    ),
+  };
+});
+
+vi.mock("@/shared/http-tool-calls", () => ({
+  hasUnresolvedToolCalls: vi.fn().mockReturnValue(false),
+  executeToolCallsFromMessages: vi.fn().mockResolvedValue([]),
+}));
+
+vi.mock("../mcpjam-tool-helpers", () => ({
+  serializeToolsForConvex: vi.fn(() => []),
+}));
+
+// The MCP-apps scrubbers walk the manager's real server list; the stub manager
+// below has no such list, and this matrix is not about scrubbing.
+vi.mock("../chat-helpers", async () => {
+  const actual = await vi.importActual<typeof import("../chat-helpers")>(
+    "../chat-helpers",
+  );
+  return {
+    ...actual,
+    scrubMcpAppsToolResultsForBackend: vi.fn((messages) => messages),
+    scrubChatGPTAppsToolResultsForBackend: vi.fn((messages) => messages),
+  };
+});
+
+vi.mock("../logger", () => ({
+  logger: {
+    error: vi.fn(),
+    warn: vi.fn(),
+    info: vi.fn(),
+    debug: vi.fn(),
+    systemEvent: vi.fn(),
+    event: vi.fn(),
+  },
+  captureOriginErrorToSentry: vi.fn(),
+}));
+
+type Verdict = "gate" | "free";
+
+/**
+ * Drive ONE tool call through the MCPJam emulated loop and report whether the
+ * user would see a pill.
+ */
+async function mcpjamVerdict(args: {
+  name: string;
+  input: Record<string, unknown>;
+  tools: ToolSet;
+  requireToolApproval: boolean;
+  progressivePlan?: unknown;
+}): Promise<Verdict> {
+  writtenChunks = [];
+  global.fetch = vi.fn().mockResolvedValue(
+    createSseResponse([
+      {
+        type: "tool-input-available",
+        toolCallId: "call-1",
+        toolName: args.name,
+        input: args.input,
+      },
+      { type: "finish", finishReason: "stop" },
+    ]),
+  );
+  await handleMCPJamFreeChatModel({
+    messages: [{ role: "user", content: "go" }] as any,
+    modelId: "gpt-4.1-mini",
+    systemPrompt: "You are helpful",
+    tools: args.tools as any,
+    mcpClientManager: {
+      getAllToolsMetadata: vi.fn().mockReturnValue({}),
+    } as any,
+    requireToolApproval: args.requireToolApproval,
+    ...(args.progressivePlan
+      ? { progressivePlan: args.progressivePlan as any }
+      : {}),
+  });
+  await lastExecution;
+  return writtenChunks.some(
+    (chunk: any) => chunk?.type === "tool-approval-request",
+  )
+    ? "gate"
+    : "free";
+}
+
+/**
+ * Read the declaration `streamText` reads. A function form is invoked with the
+ * row's representative input, exactly as the AI SDK invokes it.
+ */
+async function byokVerdict(args: {
+  name: string;
+  input: Record<string, unknown>;
+  tools: ToolSet;
+}): Promise<Verdict> {
+  const declared = (args.tools as Record<string, any>)[args.name]
+    ?.needsApproval;
+  const value =
+    typeof declared === "function"
+      ? await declared(args.input, {
+          toolCallId: "call-1",
+          messages: [],
+        })
+      : declared;
+  return value === true ? "gate" : "free";
+}
+
+// ── family fixtures ────────────────────────────────────────────────────────
+
+const noopRunner = vi.fn() as never;
+
+function fakeBrowserSession() {
+  return vi.fn(
+    async () =>
+      ({
+        engine: "hosted" as const,
+        target: "computer" as const,
+        sessionId: "session-1",
+        computerId: "computer-1",
+        bootId: "boot-1",
+        client: { sendCommand: vi.fn() } as never,
+        streamUrl: "https://stream.example/vnc.html",
+        streamPassword: "pw",
+        contextMode: "persistent",
+        reused: true,
+      } as BrowserSessionHandle),
+  );
+}
+
+const UI_DESTRUCTIVE = {
+  name: "ui_execute_tool",
+  description: "Run a tool",
+  readOnly: false,
+  annotations: { readOnlyHint: false, destructiveHint: true },
+} as const;
+const UI_READ_ONLY = {
+  name: "ui_snapshot_app",
+  description: "Look",
+  readOnly: true,
+  annotations: { readOnlyHint: true, destructiveHint: false },
+} as const;
+const UI_OTHER = {
+  name: "ui_navigate",
+  description: "Go somewhere",
+  readOnly: false,
+  annotations: { readOnlyHint: false, destructiveHint: false },
+} as const;
+
+const PROGRESSIVE_PLAN = {
+  enabled: true as const,
+  reasons: ["matrix"],
+  policy: {
+    thresholdPct: 0.03,
+    maxToolTokens: 10_000,
+    maxToolCount: 30,
+    searchLimit: 8,
+  },
+  catalog: [],
+  totalTokenEstimate: 0,
+};
+
+const SERVER_SKILL_REF = "acme/refunds";
+
+function effectiveSkillTools(opts: { serverOrigin: boolean }) {
+  return createEffectiveSkillTools({
+    skills: [
+      {
+        ref: SERVER_SKILL_REF,
+        skillId: "sk_1",
+        name: "refunds",
+        description: "Refunds",
+        content: "BODY",
+        aggregateHash: "agg_1",
+        files: [],
+        serverId: "srv_1",
+        serverLabel: "Acme",
+        skillUri: "skill://acme/refunds",
+        versionId: "v1",
+        versionNumber: 1,
+        capturedAt: 1,
+      } as never,
+    ],
+    pluginRefs: new Set<string>(),
+    serverRefs: opts.serverOrigin
+      ? new Set([SERVER_SKILL_REF])
+      : new Set<string>(),
+  }) as unknown as ToolSet;
+}
+
+interface MatrixRow {
+  family: string;
+  /** The name the model calls. */
+  name: string;
+  /** Representative input — what a function-form declaration is handed. */
+  input?: Record<string, unknown>;
+  /** This family's advertised toolset, for the turn's switch state. */
+  tools: (requireToolApproval: boolean) => ToolSet;
+  /** Set on the one family that exists only under progressive discovery. */
+  progressivePlan?: unknown;
+  expected: {
+    mcpjam: { on: Verdict; off: Verdict };
+    byok: { on: Verdict; off: Verdict };
+  };
+}
+
+const MATRIX: MatrixRow[] = [
+  {
+    // Floor: setting. `mcpToolOptionsFor({needsApproval})` is the one place a
+    // real MCP tool's declaration is decided; the SDK stamps it onto every
+    // tool it enumerates.
+    family: "real MCP tool",
+    name: "list_issues",
+    tools: (flag) => ({
+      list_issues: {
+        description: "List issues",
+        inputSchema: { type: "object" } as never,
+        execute: async () => ({}),
+        ...(mcpToolOptionsFor({ needsApproval: flag })?.needsApproval
+          ? { needsApproval: true }
+          : {}),
+      } as never,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting.
+    family: "hosted bash",
+    name: "bash",
+    input: { command: "ls" },
+    tools: (flag) => ({
+      bash: buildBashTool(
+        {
+          authHeader: "Bearer u",
+          projectId: "proj_1",
+          engine: "e2b",
+          requireToolApproval: flag,
+        },
+        noopRunner,
+      ),
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting.
+    family: "sandbox bash",
+    name: "bash",
+    input: { command: "ls" },
+    tools: (flag) => ({
+      bash: buildSandboxBashTool(
+        { sandboxId: "sbx_1", requireToolApproval: flag },
+        noopRunner,
+      ),
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. The sharpest tool here, and still the user's call — a
+    // switch some families ignore is a switch people stop believing.
+    family: "local bash",
+    name: "bash",
+    input: { command: "ls" },
+    tools: (flag) => ({
+      bash: buildBashTool(
+        {
+          authHeader: "Bearer u",
+          projectId: "proj_1",
+          engine: "local",
+          requireToolApproval: flag,
+        },
+        noopRunner,
+      ),
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. Opens an ephemeral connection to a user's saved server.
+    family: "workspace tool — connection-opening",
+    name: "diagnose_server",
+    tools: (flag) => ({
+      diagnose_server: buildMcpjamTool("diagnose_server", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: ALWAYS. The agent-op catalog gates it behind a human click, so
+    // the switch cannot take the pill away (MJ-008). This one never asked
+    // before, even with the switch on.
+    family: "workspace tool — catalog-gated spend",
+    name: "run_eval_suite",
+    tools: (flag) => ({
+      run_eval_suite: buildMcpjamTool("run_eval_suite", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "gate" },
+      byok: { on: "gate", off: "gate" },
+    },
+  },
+  {
+    // Floor: ALWAYS. Catalog-gated, and it opens a connection to a server.
+    family: "workspace tool — catalog-gated call",
+    name: "call_server_tool",
+    input: { server: "Linear", toolName: "create_issue" },
+    tools: (flag) => ({
+      call_server_tool: buildMcpjamTool("call_server_tool", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "gate" },
+      byok: { on: "gate", off: "gate" },
+    },
+  },
+  {
+    // Floor: ALWAYS. A write the catalog will not even let the agent propose.
+    family: "workspace tool — agent-excluded write",
+    name: "create_project_server",
+    tools: (flag) => ({
+      create_project_server: buildMcpjamTool("create_project_server", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "gate" },
+      byok: { on: "gate", off: "gate" },
+    },
+  },
+  {
+    // Floor: ALWAYS. A write the agent catalog runs directly still changes
+    // state, so it asks whatever the setting says (MJ-008).
+    family: "workspace tool — direct-tier write",
+    name: "create_persona",
+    tools: (flag) => ({
+      create_persona: buildMcpjamTool("create_persona", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "gate" },
+      byok: { on: "gate", off: "gate" },
+    },
+  },
+  {
+    // Floor: never. `mcpjam.ts` asks only for writes and connection-opening
+    // reads, and `docs/inspector/playground.mdx` promises read-only listing
+    // tools never ask.
+    family: "workspace tool — platform read",
+    name: "list_project_servers",
+    tools: (flag) => ({
+      list_project_servers: buildMcpjamTool("list_project_servers", {
+        client: {} as never,
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      })!,
+    }),
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. `destructiveHint` still decides whether this entry is a
+    // READ or an ACTION; it no longer decides for the user.
+    family: "ui_* destructive",
+    name: UI_DESTRUCTIVE.name,
+    tools: (flag) =>
+      buildUiTools([UI_DESTRUCTIVE] as never, {
+        requireToolApproval: flag,
+      }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: never. Observing buys no safety by pausing and costs a click.
+    family: "ui_* read-only",
+    name: UI_READ_ONLY.name,
+    tools: (flag) =>
+      buildUiTools([UI_READ_ONLY] as never, {
+        requireToolApproval: flag,
+      }),
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: setting.
+    family: "ui_* other",
+    name: UI_OTHER.name,
+    tools: (flag) =>
+      buildUiTools([UI_OTHER] as never, {
+        requireToolApproval: flag,
+      }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. The page's annotations are still never read — they are
+    // claims by the party whose code runs — but the person who turned the
+    // switch off has said what they want from this host.
+    family: "page_*",
+    name: "page_ab12cd34",
+    tools: (flag) =>
+      buildPageTools(
+        [
+          {
+            alias: "page_ab12cd34",
+            sessionId: "sess_1",
+            toolKey: "https://shop.test::checkout",
+            rawName: "checkout",
+            origin: "https://shop.test",
+            description: "Check out",
+          },
+        ] as never,
+        flag,
+      ),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. This is the one the bug report was about: "Tool
+    // Approval: off" and a pill on `browser_navigate` anyway.
+    family: "browser_* attested",
+    name: "browser_act",
+    tools: (flag) =>
+      buildBrowserTools({
+        authHeader: "Bearer u",
+        projectId: "proj_1",
+        approvalDelivery: { kind: "attested" },
+        requireToolApproval: flag,
+        ensureSession: fakeBrowserSession() as never,
+      })!.tools,
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: never, and the row that matters most for it. An unattended run
+    // uses the LOCAL engine, so a floor keyed on the engine rather than on the
+    // DELIVERY would put this back on the switch — and a host config with
+    // approval on would then hang every eval iteration on a pill nobody can
+    // click. `allow_all` so the interactive verbs are actually built: the
+    // read-only row below proves the policy filter, this one proves the floor.
+    family: "browser_* unattended (allow_all) — nobody to ask",
+    name: "browser_act",
+    tools: (flag) =>
+      buildBrowserTools({
+        authHeader: "Bearer u",
+        projectId: "proj_1",
+        engine: "local",
+        runKey: "run-1",
+        requireToolApproval: flag,
+        approvalDelivery: {
+          kind: "unattended",
+          policy: { mode: "allow_all" },
+        },
+        ensureSession: fakeBrowserSession() as never,
+      })!.tools,
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: never. An unattended read-only run builds ONLY the tools that
+    // look — refusing to build the rest is stronger than gating them, since
+    // there is nobody to ask.
+    family: "browser_* unattended read-only observation",
+    name: "browser_observe",
+    // THE FLAG IS THREADED AND STILL LOSES. An unattended run has nobody to
+    // ask, so a switch left on by whoever saved the host config must not turn
+    // every eval iteration into a hang.
+    tools: (flag) =>
+      buildBrowserTools({
+        authHeader: "Bearer u",
+        projectId: "proj_1",
+        engine: "local",
+        runKey: "run-1",
+        requireToolApproval: flag,
+        approvalDelivery: {
+          kind: "unattended",
+          policy: { mode: "read_only" },
+        },
+        ensureSession: fakeBrowserSession() as never,
+      })!.tools,
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. Same rule as local bash, same reason.
+    family: "browser_* local",
+    name: "browser_act",
+    tools: (flag) =>
+      buildBrowserTools({
+        authHeader: "Bearer u",
+        projectId: "proj_1",
+        engine: "local",
+        approvalDelivery: { kind: "attested" },
+        requireToolApproval: flag,
+        ensureSession: fakeBrowserSession() as never,
+      })!.tools,
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: never. Gating discovery itself behind N approvals defeats it.
+    family: "progressive meta-tool",
+    name: "search_mcp_tools",
+    input: { query: "issues" },
+    progressivePlan: PROGRESSIVE_PLAN,
+    tools: () =>
+      createProgressiveMetaTools({
+        getCatalog: () => [],
+        state: {
+          loadedToolIds: new Set(),
+          newlyLoadedToolIds: new Set(),
+        } as never,
+        policy: PROGRESSIVE_PLAN.policy as never,
+      }),
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: never. Pure reads of frozen content under an auto-deny eval run,
+    // where a prompt is a hang rather than a question.
+    family: "pinned skill tool",
+    name: "loadSkill",
+    input: { name: "pdf-processing" },
+    tools: (flag) =>
+      applySkillToolApproval(
+        createPinnedSkillTools([
+          {
+            name: "pdf-processing",
+            description: "PDFs",
+            content: "BODY",
+          } as never,
+        ]) as unknown as Record<string, unknown>,
+        { pinned: true, requireToolApproval: flag },
+      ) as unknown as ToolSet,
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: setting.
+    family: "computer skill tool",
+    name: "loadSkill",
+    input: { name: SERVER_SKILL_REF },
+    tools: (flag) =>
+      applySkillToolApproval(
+        effectiveSkillTools({ serverOrigin: false }) as unknown as Record<
+          string,
+          unknown
+        >,
+        { pinned: false, requireToolApproval: flag },
+      ) as unknown as ToolSet,
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+  {
+    // Floor: always, and a FUNCTION rather than `true` — SEP-2640 binds host
+    // trust to a digest set that has to be resolved before the prompt.
+    family: "server-origin skill ref",
+    name: "loadSkill",
+    input: { name: SERVER_SKILL_REF },
+    tools: (flag) =>
+      applySkillToolApproval(
+        effectiveSkillTools({ serverOrigin: true }) as unknown as Record<
+          string,
+          unknown
+        >,
+        { pinned: false, requireToolApproval: flag },
+      ) as unknown as ToolSet,
+    expected: {
+      mcpjam: { on: "gate", off: "gate" },
+      byok: { on: "gate", off: "gate" },
+    },
+  },
+  {
+    // Floor: never — never set on this family.
+    family: "app_*",
+    name: "app_ab12cd34",
+    tools: () =>
+      buildAppTools([
+        {
+          alias: "app_ab12cd34",
+          appName: "Acme",
+          rawName: "search",
+          description: "Search",
+        },
+      ] as never),
+    expected: {
+      mcpjam: { on: "free", off: "free" },
+      byok: { on: "free", off: "free" },
+    },
+  },
+  {
+    // Floor: setting. The query is the user's text and it leaves for a third
+    // party, and the call spends org credits — so it follows the switch like
+    // the other built-ins that reach outside this process, rather than
+    // counting as a free read.
+    family: "exa web search",
+    name: "web_search",
+    input: { query: "mcp" },
+    tools: (flag) => ({
+      web_search: buildExaWebSearchTool({
+        authHeader: "Bearer u",
+        projectId: "proj_1",
+        requireToolApproval: flag,
+      } as never),
+    }),
+    expected: {
+      mcpjam: { on: "gate", off: "free" },
+      byok: { on: "gate", off: "free" },
+    },
+  },
+];
+
+describe("tool approval matrix — family × engine × switch", () => {
+  const originalFetch = global.fetch;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    lastExecution = null;
+    writtenChunks = [];
+    process.env.CONVEX_HTTP_URL = "https://test-convex.example.com";
+    vi.mocked(hasUnresolvedToolCalls).mockReturnValue(false);
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    delete process.env.CONVEX_HTTP_URL;
+  });
+
+  for (const row of MATRIX) {
+    for (const flag of [true, false]) {
+      const label = flag ? "on" : "off";
+
+      it(`${row.family} · mcpjam · switch ${label} → ${row.expected.mcpjam[label]}`, async () => {
+        const verdict = await mcpjamVerdict({
+          name: row.name,
+          input: row.input ?? {},
+          tools: row.tools(flag),
+          requireToolApproval: flag,
+          progressivePlan: row.progressivePlan,
+        });
+        expect(verdict, row.family).toBe(row.expected.mcpjam[label]);
+      });
+
+      it(`${row.family} · byok · switch ${label} → ${row.expected.byok[label]}`, async () => {
+        const verdict = await byokVerdict({
+          name: row.name,
+          input: row.input ?? {},
+          tools: row.tools(flag),
+        });
+        expect(verdict, row.family).toBe(row.expected.byok[label]);
+      });
+    }
+  }
+});
+
+/**
+ * THE PROPERTY, stated once: the two engines never disagree.
+ *
+ * This replaces the divergence list the table carried while there were two
+ * channels. It named six rows where one engine could not see a family's
+ * declaration; the fix was to delete the second channel, so what used to be a
+ * list of known exceptions is now an invariant with no exceptions.
+ *
+ * Both checks below run the REAL builders and the REAL engines. Comparing the
+ * two `expected` columns against each other instead would have been a check on
+ * this file's own fixture — it would catch a typo in the table and nothing
+ * else, while reading like the guarantee the change exists to make.
+ */
+describe("one mechanism", () => {
+  for (const row of MATRIX) {
+    for (const flag of [true, false]) {
+      const label = flag ? "on" : "off";
+
+      it(`${row.family} · switch ${label} → both engines answer the same`, async () => {
+        // A FRESH toolset per engine, as production gives each turn. Sharing
+        // one would hand the same function-form declaration to two readers
+        // under the same `toolCallId`, and a second evaluation of the SEP-2640
+        // gate re-fetches the manifest and can overwrite the binding it exists
+        // to check — the hazard the memoisation test next door is about.
+        const [mcpjam, byok] = [
+          await mcpjamVerdict({
+            name: row.name,
+            input: row.input ?? {},
+            tools: row.tools(flag),
+            requireToolApproval: flag,
+            progressivePlan: row.progressivePlan,
+          }),
+          await byokVerdict({
+            name: row.name,
+            input: row.input ?? {},
+            tools: row.tools(flag),
+          }),
+        ];
+        expect(mcpjam, `${row.family}: mcpjam vs byok`).toBe(byok);
+      });
+    }
+  }
+
+  it("never lets the switch FREE a family that asks without it", async () => {
+    // The floor semantics, off the built tools rather than off the table: the
+    // switch raises. A family that gates with the switch off and not with it
+    // on would be a setting that turns safety down.
+    for (const row of MATRIX) {
+      const ask = (flag: boolean) =>
+        byokVerdict({
+          name: row.name,
+          input: row.input ?? {},
+          tools: row.tools(flag),
+        });
+      const [on, off] = [await ask(true), await ask(false)];
+      expect(
+        on === "gate" || off === "free",
+        `${row.family} stops asking when the switch is turned on`,
+      ).toBe(true);
+    }
+  });
+});
+
+/**
+ * The MCPJam gate's own contract, asserted directly rather than through a turn.
+ *
+ * The rows above are the behaviour; this is the rule that produces it. Keeping
+ * both means a change to the predicate that happens to leave one row's verdict
+ * intact still shows up here.
+ */
+/**
+ * Route 3, the local org runtime, cannot resume a turn after an approval, so
+ * its answer to "gate" is a refusal of the whole turn before the model runs.
+ * These rows pin that for the two tools the acting-skill gate raises: with
+ * the switch, and with a server-served skill in the conversation. A skill
+ * loaded during the turn is refused by the gated call's own `execute`.
+ */
+describe("tool approval matrix — route 3 (local org runtime)", () => {
+  type Route3Verdict = "refused" | "ran";
+
+  const ACTING = [
+    { role: "user", content: "hi" },
+    {
+      role: "tool",
+      content: [
+        {
+          type: "tool-result",
+          toolCallId: "c1",
+          toolName: "loadSkill",
+          output: {
+            type: "text",
+            value: `${buildServerSkillBanner({
+              ref: "acme/refunds",
+              serverLabel: "Acme",
+              skillUri: "skill://acme/refunds/SKILL.md",
+            })}body`,
+          },
+        },
+      ],
+    },
+  ];
+  const NOT_ACTING = [{ role: "user", content: "hi" }];
+
+  async function route3Verdict(args: {
+    tools: ToolSet;
+    messages: unknown[];
+    requireToolApproval: boolean;
+  }): Promise<Route3Verdict> {
+    writtenChunks = [];
+    lastExecution = null;
+    streamTextMock.mockReset();
+    streamTextMock.mockReturnValue({
+      consumeStream: async () => {},
+      response: Promise.resolve({ modelId: "mock-model", messages: [] }),
+      steps: Promise.resolve([]),
+      totalUsage: Promise.resolve({ inputTokens: 1, outputTokens: 1 }),
+      finishReason: Promise.resolve("stop"),
+      toUIMessageStream: () => ({
+        [Symbol.asyncIterator]() {
+          return { next: async () => ({ value: undefined, done: true }) };
+        },
+      }),
+    });
+    handleLocalOrgChatModel({
+      provider: {
+        providerKey: "openai",
+        provider: "openai",
+        runtime: "local",
+        apiKey: "sk-test",
+      } as never,
+      admission: {
+        target: { projectId: "proj_1" },
+        providerKey: "openai",
+        model: "gpt-4-turbo",
+      },
+      projectId: "proj_1",
+      modelId: "gpt-4-turbo",
+      messages: args.messages as never,
+      systemPrompt: "s",
+      tools: args.tools,
+      requireToolApproval: args.requireToolApproval,
+    });
+    try {
+      await lastExecution;
+    } catch {
+      // What happens after `streamText` is not this matrix's question.
+    }
+    const refused = writtenChunks.some(
+      (chunk) =>
+        chunk?.type === "error" &&
+        JSON.parse(chunk.errorText).code === "tool_approval_unsupported",
+    );
+    if (refused) {
+      expect(streamTextMock).not.toHaveBeenCalled();
+      return "refused";
+    }
+    expect(streamTextMock, "neither refused nor ran").toHaveBeenCalled();
+    return "ran";
+  }
+
+  const ROWS: Array<{
+    family: string;
+    tools: (flag: boolean) => ToolSet;
+    messages: unknown[];
+    expected: { on: Route3Verdict; off: Route3Verdict };
+  }> = [
+    {
+      family: "local bash",
+      tools: (flag) =>
+        applyActingServerSkillGate({
+          bash: buildBashTool(
+            {
+              authHeader: "Bearer u",
+              projectId: "proj_1",
+              engine: "local",
+              requireToolApproval: flag,
+            },
+            noopRunner,
+          ),
+        }) as ToolSet,
+      messages: NOT_ACTING,
+      expected: { on: "refused", off: "ran" },
+    },
+    {
+      family: "local bash while acting on a server skill",
+      tools: (flag) =>
+        applyActingServerSkillGate({
+          bash: buildBashTool(
+            {
+              authHeader: "Bearer u",
+              projectId: "proj_1",
+              engine: "local",
+              requireToolApproval: flag,
+            },
+            noopRunner,
+          ),
+        }) as ToolSet,
+      messages: ACTING,
+      expected: { on: "refused", off: "refused" },
+    },
+    {
+      family: "workspace read_server_resource",
+      tools: (flag) =>
+        applyActingServerSkillGate({
+          read_server_resource: buildMcpjamTool("read_server_resource", {
+            client: {} as never,
+            projectId: "proj_1",
+            requireToolApproval: flag,
+          })!,
+        }) as ToolSet,
+      messages: NOT_ACTING,
+      expected: { on: "refused", off: "ran" },
+    },
+    {
+      family: "workspace read_server_resource while acting on a server skill",
+      tools: (flag) =>
+        applyActingServerSkillGate({
+          read_server_resource: buildMcpjamTool("read_server_resource", {
+            client: {} as never,
+            projectId: "proj_1",
+            requireToolApproval: flag,
+          })!,
+        }) as ToolSet,
+      messages: ACTING,
+      expected: { on: "refused", off: "refused" },
+    },
+    {
+      // A tool the gate does not name runs whatever is in context.
+      family: "exa web search while acting on a server skill",
+      tools: () =>
+        applyActingServerSkillGate({
+          web_search: {
+            description: "search",
+            needsApproval: false,
+            execute: async () => ({}),
+          },
+        }) as unknown as ToolSet,
+      messages: ACTING,
+      expected: { on: "ran", off: "ran" },
+    },
+  ];
+
+  beforeEach(() => {
+    process.env.CONVEX_HTTP_URL = "https://test-convex.example.com";
+  });
+
+  afterEach(() => {
+    delete process.env.CONVEX_HTTP_URL;
+  });
+
+  for (const row of ROWS) {
+    for (const flag of [true, false]) {
+      const label = flag ? "on" : "off";
+      it(`${row.family} · route 3 · switch ${label} → ${row.expected[label]}`, async () => {
+        const verdict = await route3Verdict({
+          tools: row.tools(flag),
+          messages: row.messages,
+          requireToolApproval: flag,
+        });
+        expect(verdict, row.family).toBe(row.expected[label]);
+      });
+    }
+  }
+
+  // The banner arrives within the turn: the model calls `loadSkill`, then the
+  // gated tool. The request had none, so the turn runs; the call then sees
+  // the step's messages, which carry one. It must neither ask (no resume
+  // here) nor run.
+  for (const [family, name] of [
+    ["local bash", "bash"],
+    ["workspace read_server_resource", "read_server_resource"],
+  ] as const) {
+    it(`${family} · route 3 · switch off · skill loaded in the same call → refused in execute`, async () => {
+      const row = ROWS.find((candidate) => candidate.family === family)!;
+      const verdict = await route3Verdict({
+        tools: row.tools(false),
+        messages: NOT_ACTING,
+        requireToolApproval: false,
+      });
+      expect(verdict).toBe("ran");
+      const tool = streamTextMock.mock.calls[0]![0].tools[name];
+      const options = { toolCallId: "c2", messages: ACTING };
+      const asks =
+        typeof tool.needsApproval === "function"
+          ? await tool.needsApproval({}, options)
+          : tool.needsApproval === true;
+      expect(asks, family).toBe(false);
+      const output = await tool.execute({}, options);
+      expect(output.error, family).toMatch(/server-provided skill/);
+    });
+  }
+});
+
+describe("toolCallNeedsApproval — the MCPJam gate", () => {
+  const ask = (
+    name: string,
+    tools: Record<string, unknown>,
+    over: {
+      toolCallId?: string;
+      decisions?: ReturnType<typeof createApprovalDecisionCache>;
+    } = {},
+  ) =>
+    toolCallNeedsApproval({
+      name,
+      input: { name: "acme/refunds" },
+      toolCallId: over.toolCallId ?? "call-1",
+      tools: tools as never,
+      messages: [],
+      decisions: over.decisions ?? createApprovalDecisionCache(),
+    });
+
+  it("reads the tool's declaration, not the turn's switch", async () => {
+    const tools = {
+      gated: { needsApproval: true },
+      free: { needsApproval: false },
+    };
+    expect(await ask("gated", tools)).toBe(true);
+    expect(await ask("free", tools)).toBe(false);
+  });
+
+  it("treats a MISSING declaration as free, the way the AI SDK does", async () => {
+    // `never` spelled as silence. The two readers must agree here or a turn
+    // strands: the client defers on one answer while the server sends the
+    // other.
+    expect(await ask("undeclared", { undeclared: {} })).toBe(false);
+    expect(await ask("absent", {})).toBe(false);
+  });
+
+  it("invokes a FUNCTION declaration the way streamText does", async () => {
+    const seen: unknown[] = [];
+    const tools = {
+      loadSkill: {
+        needsApproval: (input: unknown, options: unknown) => {
+          seen.push({ input, options });
+          return true;
+        },
+      },
+    };
+    expect(await ask("loadSkill", tools)).toBe(true);
+    expect(seen).toEqual([
+      {
+        input: { name: "acme/refunds" },
+        options: { toolCallId: "call-1", messages: [] },
+      },
+    ]);
+  });
+
+  it("evaluates a function ONCE per tool call, however often it is asked", async () => {
+    // Not an optimization. The SEP-2640 declaration RECORDS the manifest
+    // digest `execute` re-checks, and this engine asks about the same call
+    // three times (emit gate, unresolved re-scan, auto-deny re-scan). A second
+    // evaluation would re-fetch the manifest and could overwrite the binding
+    // it exists to check.
+    let calls = 0;
+    const tools = {
+      loadSkill: {
+        needsApproval: async () => {
+          calls += 1;
+          return true;
+        },
+      },
+    };
+    const decisions = createApprovalDecisionCache();
+    await Promise.all([
+      ask("loadSkill", tools, { decisions }),
+      ask("loadSkill", tools, { decisions }),
+    ]);
+    await ask("loadSkill", tools, { decisions });
+    expect(calls).toBe(1);
+    // A DIFFERENT call is a different question.
+    await ask("loadSkill", tools, { decisions, toolCallId: "call-2" });
+    expect(calls).toBe(2);
+  });
+
+  it("fails CLOSED on a declaration that is neither boolean nor function", async () => {
+    // Out of contract — the AI SDK would try to CALL it and throw. A bug to
+    // fix, not a tool to wave through.
+    expect(
+      await ask("weird", { weird: { needsApproval: "yes" as never } }),
+    ).toBe(true);
+  });
+
+  it("fails CLOSED when a function declaration throws", async () => {
+    const tools = {
+      loadSkill: {
+        needsApproval: () => {
+          throw new Error("server unreachable");
+        },
+      },
+    };
+    expect(await ask("loadSkill", tools)).toBe(true);
+  });
+
+  it("does not exempt meta-tools by NAME", async () => {
+    // Progressive mode mints them with a `never` declaration, so they are free
+    // because of what they carry. A REAL server tool that happens to be called
+    // `search_mcp_tools` carries the switch's declaration and still asks —
+    // which is what the old name-plus-plan exemption was protecting, now for
+    // free.
+    expect(
+      await ask("search_mcp_tools", {
+        search_mcp_tools: { needsApproval: false },
+      }),
+    ).toBe(false);
+    expect(
+      await ask("search_mcp_tools", {
+        search_mcp_tools: { needsApproval: true, execute: async () => ({}) },
+      }),
+    ).toBe(true);
+  });
+});
+
+/**
+ * The hosted loop decides approval with `toolCallNeedsApproval` over the raw
+ * converted history. QA-1 (HARN-15): it streams a `loadSkill` result as an
+ * object, so the next request sees it json-wrapped, and a skill loaded one
+ * request earlier must still make `bash` ask.
+ */
+describe("hosted loop — a server skill loaded in an earlier request", () => {
+  it("asks for a gated bash through the json-wrapped result", async () => {
+    const history = await convertToMcpjamModelMessages([
+      { id: "u1", role: "user", parts: [{ type: "text", text: "load it" }] },
+      {
+        id: "a1",
+        role: "assistant",
+        parts: [
+          {
+            type: "dynamic-tool",
+            toolName: "loadSkill",
+            toolCallId: "call_load",
+            state: "output-available",
+            input: { name: "acme/refunds" },
+            output: {
+              type: "text",
+              value: `${buildServerSkillBanner({
+                ref: "acme/refunds",
+                serverLabel: "Acme",
+                skillUri: "skill://acme/refunds/SKILL.md",
+              })}body`,
+              _meta: {},
+            },
+          },
+        ],
+      },
+      { id: "u2", role: "user", parts: [{ type: "text", text: "run ls" }] },
+    ] as never);
+    const tools = applyActingServerSkillGate({
+      bash: {
+        description: "shell",
+        needsApproval: false,
+        execute: async () => ({}),
+      },
+    });
+    expect(
+      await toolCallNeedsApproval({
+        name: "bash",
+        input: { command: "ls" },
+        toolCallId: "call_bash",
+        tools: tools as never,
+        messages: history,
+        decisions: createApprovalDecisionCache(),
+      }),
+    ).toBe(true);
+  });
+});

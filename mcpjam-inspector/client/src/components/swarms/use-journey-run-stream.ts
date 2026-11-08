@@ -1,0 +1,369 @@
+import { notifyMCPJamLimitError } from "@/lib/mcpjam-limit";
+import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  initialEvalStreamState,
+  mergeStreamingTrace,
+  reduceEvalStreamEvent,
+  type EvalStreamState,
+} from "@/components/evals/eval-stream-reducer";
+import type { EvalStreamEvent } from "@/shared/eval-stream-events";
+import {
+  swarmEventToEvalPayload,
+  type SwarmAttemptStreamStatus,
+  type SwarmStreamEvent,
+  type SwarmStreamSessionNoticeKind,
+} from "@/shared/swarm-stream-events";
+import { streamJourneyRun } from "@/lib/swarm-api";
+import type { TraceEnvelope } from "@/components/evals/trace-viewer-adapter";
+import { summaryTargetKey } from "./swarm-targets";
+
+export type SwarmCellLiveStatus = SwarmAttemptStreamStatus | "pending";
+
+export type SwarmLiveSessionState = {
+  envelope: {
+    runId: string;
+    hostId: string;
+    /** Opaque execution-target id (absent on legacy/historical streams). */
+    targetId?: string;
+    chatSessionId: string;
+    sessionIndex: number;
+  };
+  attemptStatus: SwarmCellLiveStatus;
+  errorMessage?: string;
+  /**
+   * The code the attempt row is stored under, when a terminal event carried one.
+   * `errorMessage` is humanized and has dropped it, so a surface that reads
+   * MCPJam's own wait or limit by its code reads it here until the row lands.
+   */
+  errorCode?: string;
+  /**
+   * Run-visible setup notes for this session (today: a built-in tool the
+   * resolver deliberately did not advertise). Not errors — the session is
+   * healthy, it just ran with less than the host config asked for, and that has
+   * to be visible or it looks like a host-config bug.
+   */
+  notices: SwarmSessionNotice[];
+  stream: EvalStreamState;
+};
+
+export type SwarmSessionNotice = {
+  kind: SwarmStreamSessionNoticeKind;
+  message: string;
+  toolId?: string;
+};
+
+export type JourneyRunStreamState = {
+  sessions: Record<string, SwarmLiveSessionState>;
+  /** Coarse matrix key: `${targetKey}:${sessionIndex}` → status, where
+   * targetKey is the canonical `targetId ?? hostId` (D2). */
+  cellStatus: Record<string, SwarmCellLiveStatus>;
+  runComplete: boolean;
+  connected: boolean;
+  error: string | null;
+};
+
+/**
+ * Canonical per-event target key (D2). MUST match the matrix column key
+ * ({@link summaryTargetKey}): a host-shaped `targetId` (`host:<hostId>`, which
+ * fresh legacy runs echo on the SSE envelope) collapses to the bare hostId, so
+ * live cell updates land on the same key the matrix reads instead of leaving a
+ * running cell stuck "pending".
+ */
+export function swarmEventTargetKey(event: {
+  targetId?: string;
+  hostId: string;
+}): string {
+  return summaryTargetKey(event);
+}
+
+export function swarmCellKey(targetKey: string, sessionIndex: number): string {
+  return `${targetKey}:${sessionIndex}`;
+}
+
+function emptyRunStreamState(): JourneyRunStreamState {
+  return {
+    sessions: {},
+    cellStatus: {},
+    runComplete: false,
+    connected: false,
+    error: null,
+  };
+}
+
+function ensureSession(
+  state: JourneyRunStreamState,
+  event: SwarmStreamEvent,
+): SwarmLiveSessionState {
+  const existing = state.sessions[event.chatSessionId];
+  if (existing) return existing;
+  return {
+    envelope: {
+      runId: event.runId,
+      hostId: event.hostId,
+      ...(event.targetId ? { targetId: event.targetId } : {}),
+      chatSessionId: event.chatSessionId,
+      sessionIndex: event.sessionIndex,
+    },
+    attemptStatus: "pending",
+    notices: [],
+    stream: initialEvalStreamState,
+  };
+}
+
+/** Pure reducer for tests + the live hook. */
+export function reduceSwarmStreamEvent(
+  state: JourneyRunStreamState,
+  event: SwarmStreamEvent,
+): JourneyRunStreamState {
+  if (event.type === "run_complete") {
+    return { ...state, runComplete: true };
+  }
+
+  // Lifecycle-only events without a real session key (empty host/session).
+  if (!event.chatSessionId) {
+    return state;
+  }
+
+  const session = ensureSession(state, event);
+  const cellKey = swarmCellKey(swarmEventTargetKey(event), event.sessionIndex);
+  let nextSession = session;
+  let nextCellStatus = state.cellStatus[cellKey] ?? "pending";
+
+  switch (event.type) {
+    case "attempt_status":
+    case "session_complete": {
+      const status =
+        event.type === "session_complete" ? event.status : event.status;
+      nextCellStatus = status;
+      nextSession = {
+        ...session,
+        attemptStatus: status,
+        ...(event.errorMessage ? { errorMessage: event.errorMessage } : {}),
+        ...(event.errorCode ? { errorCode: event.errorCode } : {}),
+      };
+      break;
+    }
+    case "session_start": {
+      nextCellStatus = "running";
+      nextSession = { ...session, attemptStatus: "running" };
+      break;
+    }
+    case "session_notice": {
+      // Deduped by (kind, toolId, message): the SSE ring buffer replays on
+      // late-join, so a reconnecting client must not stack the same note.
+      const incoming: SwarmSessionNotice = {
+        kind: event.kind,
+        message: event.message,
+        ...(event.toolId ? { toolId: event.toolId } : {}),
+      };
+      const already = session.notices.some(
+        (n) =>
+          n.kind === incoming.kind &&
+          n.toolId === incoming.toolId &&
+          n.message === incoming.message,
+      );
+      nextSession = already
+        ? session
+        : { ...session, notices: [...session.notices, incoming] };
+      break;
+    }
+    default: {
+      const payload = swarmEventToEvalPayload(event);
+      if (payload) {
+        nextSession = {
+          ...session,
+          stream: reduceEvalStreamEvent(
+            session.stream,
+            payload as EvalStreamEvent,
+          ),
+        };
+      }
+      break;
+    }
+  }
+
+  return {
+    ...state,
+    sessions: {
+      ...state.sessions,
+      [event.chatSessionId]: nextSession,
+    },
+    cellStatus: {
+      ...state.cellStatus,
+      [cellKey]: nextCellStatus,
+    },
+  };
+}
+
+/**
+ * Delays before each reopen once a server has answered `run_remote`; a reopen
+ * that fails or closes before answering spends one too. With no replica
+ * affinity the next request can land on the server that owns the runner, and
+ * a runner that had not started yet has usually registered by then. Bounded,
+ * so a run whose runner was lost stops asking; the durable Convex view carries
+ * it until the backend settles the run.
+ */
+const REMOTE_RECONNECT_DELAYS_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 15_000];
+
+/**
+ * Auto-connects to the journey-run SSE while `enabled` (typically when the
+ * run detail is open and status is `running`). Aborts on unmount / disable /
+ * `run_complete`, and reconnects a bounded number of times after `run_remote`.
+ * `connected` is true only while a stream delivers the runner's events.
+ */
+export function useJourneyRunStream(
+  runId: string | null,
+  enabled: boolean,
+  /** The run's wave, so a limit refusal opens the dialog once per swarm. */
+  swarmRunGroupId?: string,
+  /**
+   * The organization the swarm belongs to, so its wave is that organization's:
+   * a wave no notice attributed is treated as the buyer's by whichever
+   * organization starts a checkout next.
+   */
+  organizationId?: string,
+): JourneyRunStreamState {
+  const [state, setState] = useState<JourneyRunStreamState>(emptyRunStreamState);
+  const genRef = useRef(0);
+  // Read at notify time: the run doc (and its wave id) can arrive after the
+  // stream opened, and the id must not reconnect the stream. The organization
+  // can load after it too.
+  const swarmRunGroupIdRef = useRef(swarmRunGroupId);
+  swarmRunGroupIdRef.current = swarmRunGroupId;
+  const organizationIdRef = useRef(organizationId);
+  organizationIdRef.current = organizationId;
+
+  useEffect(() => {
+    const gen = ++genRef.current;
+    if (!runId || !enabled) {
+      setState(emptyRunStreamState());
+      return;
+    }
+
+    const controller = new AbortController();
+    let reconnects = 0;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    setState(emptyRunStreamState());
+
+    const open = () => {
+      let remote = false;
+      // Whether this stream answered with anything but run_remote: one of the
+      // runner's events, or run_complete.
+      let answered = false;
+      let failure: string | null = null;
+      void streamJourneyRun(
+        runId,
+        (event) => {
+          if (genRef.current !== gen) return;
+          if (event.type === "run_remote") remote = true;
+          else answered = true;
+          // A server without the runner answers only run_remote or
+          // run_complete, so neither one means the stream is live.
+          const live =
+            event.type !== "run_remote" && event.type !== "run_complete";
+          const wave = swarmRunGroupIdRef.current;
+          const organization = organizationIdRef.current;
+          if (
+            event.type === "attempt_status" ||
+            event.type === "session_complete"
+          ) {
+            notifyMCPJamLimitError({
+              runId,
+              ...(wave ? { swarmRunGroupId: wave } : {}),
+              ...(organization ? { organizationId: organization } : {}),
+              message: event.errorMessage,
+              surface: "swarm",
+            });
+          } else if (event.type === "error") {
+            notifyMCPJamLimitError({
+              runId,
+              ...(wave ? { swarmRunGroupId: wave } : {}),
+              ...(organization ? { organizationId: organization } : {}),
+              message: event.message,
+              details: event.details,
+              surface: "swarm",
+            });
+          }
+          setState((prev) => {
+            const next = reduceSwarmStreamEvent(prev, event);
+            return live && !next.connected
+              ? { ...next, connected: true }
+              : next;
+          });
+        },
+        controller.signal,
+      )
+        .catch((err) => {
+          failure = err instanceof Error ? err.message : String(err);
+        })
+        .finally(() => {
+          if (genRef.current !== gen || controller.signal.aborted) return;
+          // Once a server has answered run_remote, a reopen that ends before it
+          // answers anything, whether it fails (a 502 mid-deploy, a transient
+          // 404) or closes empty, spends a retry instead of ending the chain.
+          // One that delivered runner events is not reopened: the owner
+          // replays its buffer to a new subscriber, and the reducer would
+          // append those events a second time. Only a failure with no retry
+          // left is shown as an error.
+          const delay =
+            remote || (reconnects > 0 && !answered)
+              ? REMOTE_RECONNECT_DELAYS_MS[reconnects]
+              : undefined;
+          setState((prev) => ({
+            ...prev,
+            connected: false,
+            ...(failure !== null && delay === undefined
+              ? { error: failure }
+              : {}),
+          }));
+          if (delay === undefined) return;
+          reconnects += 1;
+          reconnectTimer = setTimeout(() => {
+            if (genRef.current === gen) open();
+          }, delay);
+        });
+    };
+    open();
+
+    return () => {
+      if (genRef.current === gen) genRef.current += 1;
+      clearTimeout(reconnectTimer);
+      controller.abort();
+    };
+  }, [runId, enabled]);
+
+  return state;
+}
+
+export function liveSessionTrace(
+  session: SwarmLiveSessionState | undefined,
+): TraceEnvelope | null {
+  if (!session) return null;
+  return mergeStreamingTrace(
+    session.stream.trace,
+    session.stream.draftMessages,
+    // Live browser frames ride the envelope as `browserInteractionSteps`, so the
+    // Replay tab's filmstrip fills in while the agent is still clicking.
+    session.stream.liveBrowserSteps,
+  );
+}
+
+export function useLiveSessionView(
+  stream: JourneyRunStreamState,
+  chatSessionId: string | null,
+): {
+  session: SwarmLiveSessionState | undefined;
+  fallbackTrace: TraceEnvelope | null;
+  toolCalls: EvalStreamState["actualToolCalls"];
+} {
+  return useMemo(() => {
+    const session = chatSessionId
+      ? stream.sessions[chatSessionId]
+      : undefined;
+    return {
+      session,
+      fallbackTrace: liveSessionTrace(session),
+      toolCalls: session?.stream.actualToolCalls ?? [],
+    };
+  }, [stream.sessions, chatSessionId]);
+}

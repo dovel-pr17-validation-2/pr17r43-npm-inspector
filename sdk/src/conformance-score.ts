@@ -1,0 +1,463 @@
+/**
+ * The conformance score: one number, 0–100, computable for any suite and for
+ * all of them pooled.
+ *
+ * Every applicable check is worth one point, and the score is the share that
+ * passed, to one decimal: 150/150 is 100, 149/150 is 99.3.
+ *
+ *   - The spec (every version's `basic/index.mdx`) defines requirement levels
+ *     via BCP 14 / RFC 2119 and has no conformance clause beyond them —
+ *     conformance IS the checks.
+ *   - SEP-2484 (Final): "Checks for SHOULD-level requirements report as
+ *     warnings rather than failures. MAY requirements do not need rows."
+ *     SHOULD/MAY advice is therefore reported but worth 0 points: it never
+ *     moves the number.
+ *   - The share is rounded DOWN, so a run with any failure can never display
+ *     100 (199/200 is 99.5, 1999/2000 is 99.9).
+ *
+ * The denominator rules come from `conformance-outcome.ts` and are what make
+ * the score honest:
+ *
+ *   - `not-applicable` checks leave the denominator entirely — a server
+ *     without auth, a stdio server's HTTP checks, a legacy pin's modern
+ *     checks: none of them cost points.
+ *   - `could-not-run` checks stay in the denominator unless caller input was
+ *     missing. Missing inputs leave the run incomplete but do not cost points.
+ *   - `pending` checks — ones the run's conformance profile does not score yet
+ *     (see `conformance-profile.ts`) — leave the denominator AND the verdict.
+ *     A newly added MUST check must not silently re-grade every server that
+ *     was green before it existed; promoting it is a profile version bump.
+ *
+ * A score of 100 means every scored check passed. Read the outcome as well:
+ * missing inputs can leave the run incomplete even with a score of 100.
+ *
+ * Pure data reasoning — no MCP client, no transport, no Node built-ins — so
+ * it is exported from the browser entry alongside the catalog.
+ */
+
+import {
+  decideConformanceOutcome,
+  isInapplicableCheck,
+  isUnrunCheck,
+  type ConformanceRunOutcome,
+  type OutcomeCheckLike,
+} from "./conformance-outcome.js";
+import { isMissingInputCheck } from "./conformance-input.js";
+import {
+  partitionByStamp,
+  type ConformanceProfileStamp,
+} from "./conformance-profile.js";
+import type { MCPConformanceResult } from "./mcp-conformance/types.js";
+import type {
+  MCPAppsConformanceResult,
+} from "./apps-conformance/types.js";
+import type {
+  MCPTasksConformanceResult,
+} from "./tasks-conformance/types.js";
+import {
+  CONFORMANCE_CHECK_METADATA,
+  type ConformanceResult as OAuthConformanceResult,
+} from "./oauth-conformance/types.js";
+
+/** Per RFC 2119, RECOMMENDED is the SHOULD tier; MAY is the weakest. */
+export type ConformanceAdvisoryTier = "should" | "may";
+
+/**
+ * One piece of advice: a readiness warning, a check warning. Reported
+ * alongside the score but worth 0 points.
+ */
+export interface ScoredAdvisory {
+  id: string;
+  tier: ConformanceAdvisoryTier;
+}
+
+export interface ConformanceScore {
+  /**
+   * 0–100, or null when nothing was applicable — a server with no applicable
+   * checks has nothing to claim a number ABOUT, and inventing one would let a
+   * vacuous run outrank a real one.
+   */
+  score: number | null;
+  outcome: ConformanceRunOutcome;
+  /** The denominator excludes checks blocked by missing caller input. */
+  applicable: number;
+  passed: number;
+  failed: number;
+  couldNotRun: number;
+  notApplicable: number;
+  /**
+   * Checks that ran and reported a verdict the active conformance profile does
+   * NOT score yet (see `conformance-profile.ts`). Excluded from `applicable`,
+   * from `passed`/`failed`/`couldNotRun`, and from the outcome — a check
+   * arriving in the pool must not re-grade servers that were already green.
+   * Always 0 for a result with no profile stamp.
+   */
+  pending: number;
+  advisories: ScoredAdvisory[];
+  /**
+   * Always 0: advice no longer costs points. Kept so stored reports and the
+   * backend's summary shape still line up.
+   */
+  advicePointsLost: number;
+  /** The revision the score was judged against. Always display it. */
+  protocolVersion?: string;
+}
+
+function scoreFromCounts(
+  counts: Pick<
+    ConformanceScore,
+    "passed" | "failed" | "couldNotRun" | "notApplicable"
+  > &
+    Partial<Pick<ConformanceScore, "pending">>,
+  advisories: ScoredAdvisory[],
+  outcome: ConformanceRunOutcome,
+  protocolVersion?: string,
+  applicable = counts.passed + counts.failed + counts.couldNotRun,
+): ConformanceScore {
+  // One decimal, rounded down: rounding to nearest would print 100 for
+  // 1999/2000. Multiplying before dividing keeps 150/150 an exact 100.
+  const score =
+    applicable > 0
+      ? Math.floor((1000 * counts.passed) / applicable) / 10
+      : null;
+
+  return {
+    score,
+    outcome,
+    applicable,
+    ...counts,
+    // Normalized rather than optional: every consumer can read `.pending`
+    // without a `?? 0`, and a suite with no profile reports an honest zero.
+    pending: counts.pending ?? 0,
+    advisories,
+    advicePointsLost: 0,
+    ...(protocolVersion !== undefined ? { protocolVersion } : {}),
+  };
+}
+
+/**
+ * Score one suite's checks. `advisories` is whatever advice channel the suite
+ * has (readiness warnings, per-check warnings) — pass an empty array for a
+ * suite without one.
+ */
+export function computeConformanceScore(
+  checks: OutcomeCheckLike[],
+  advisories: ScoredAdvisory[] = [],
+  protocolVersion?: string,
+  /**
+   * The run's profile stamp, when it has one. Checks the profile does not score
+   * are partitioned out BEFORE the counts and before the verdict — a pending
+   * check must not move the number and must not fail the run. Absent ⇒ every
+   * check is scored, which is the pre-profile arithmetic exactly.
+   */
+  profileStamp?: Pick<ConformanceProfileStamp, "pendingCheckIds">,
+): ConformanceScore {
+  const { scored, pending } = partitionByStamp(checks, profileStamp);
+  const counts = {
+    passed: scored.filter((check) => check.status === "passed").length,
+    failed: scored.filter((check) => check.status === "failed").length,
+    couldNotRun: scored.filter(isUnrunCheck).length,
+    notApplicable: scored.filter(isInapplicableCheck).length,
+    pending: pending.length,
+  };
+  // The outcome word comes from the shared verdict logic, never from the
+  // arithmetic — the score annotates the verdict, it does not override it. It
+  // reads the SCORED checks only, for the same reason the counts do.
+  const { outcome } = decideConformanceOutcome(scored);
+  return scoreFromCounts(
+    counts,
+    advisories,
+    outcome,
+    protocolVersion,
+    counts.passed + counts.failed + counts.couldNotRun -
+      scored.filter(isMissingInputCheck).length,
+  );
+}
+
+/**
+ * One number across suites. Counts are summed and the score re-derived, so a
+ * suite with many checks cannot drown one with few through averaging — and a
+ * 0-for-9 OAuth run stays visible inside 30 protocol passes.
+ *
+ * Parts with nothing applicable (score null — e.g. OAuth against a public
+ * server) contribute only their `notApplicable` tally: they are excluded from
+ * the denominator by construction, not by filtering.
+ */
+export function pooledConformanceScore(
+  parts: ConformanceScore[],
+): ConformanceScore {
+  const counts = {
+    passed: sum(parts, (part) => part.passed),
+    failed: sum(parts, (part) => part.failed),
+    couldNotRun: sum(parts, (part) => part.couldNotRun),
+    notApplicable: sum(parts, (part) => part.notApplicable),
+    // `?? 0`: a part deserialized from a build that predates the pending
+    // bucket carries no field, and reading it as NaN would poison the pool.
+    pending: sum(parts, (part) => part.pending ?? 0),
+  };
+  // Once per advice id: an OAuth suite runs one flow per strategy against the
+  // same authorization server, and each flow reports the same advice. Ids are
+  // unique across suites, so this holds for a run-wide pool too.
+  const advisories = [
+    ...new Map(
+      parts
+        .flatMap((part) => part.advisories ?? [])
+        .map((advisory) => [advisory.id, advisory] as const),
+    ).values(),
+  ];
+
+  // Worst-of, failure outranking incomplete — the same ordering the CLI exit
+  // codes and suite reports use. Scoreless parts carry "passed" (nothing
+  // unverified) and so never drag the pool.
+  const outcomes = parts.map((part) => part.outcome);
+  const outcome: ConformanceRunOutcome = outcomes.includes("failed")
+    ? "failed"
+    : outcomes.includes("incomplete")
+      ? "incomplete"
+      : "passed";
+
+  // Strict: EVERY part must state the same version for the pool to claim one.
+  // A part without a version is a run that established none, and labeling the
+  // pool from the parts that did would overstate what was judged. Scoreless
+  // parts (nothing applicable) constrain nothing — they judged nothing.
+  const constraining = parts.filter((part) => part.applicable > 0);
+  const versions = new Set(constraining.map((part) => part.protocolVersion));
+  const protocolVersion =
+    constraining.length > 0 && versions.size === 1
+      ? [...versions][0]
+      : undefined;
+
+  return scoreFromCounts(
+    counts,
+    advisories,
+    outcome,
+    protocolVersion,
+    sum(parts, (part) => part.applicable),
+  );
+}
+
+function sum<T>(items: T[], select: (item: T) => number): number {
+  return items.reduce((total, item) => total + select(item), 0);
+}
+
+/** The one-line rendering every surface shares, so the wording cannot drift. */
+export function describeConformanceScore(score: ConformanceScore): string {
+  const missingInputs = Math.max(
+    0,
+    score.passed + score.failed + score.couldNotRun - score.applicable
+  );
+  const otherUnrun = score.couldNotRun - missingInputs;
+  const unrun = [
+    missingInputs > 0
+      ? `${missingInputs} check${missingInputs === 1 ? " needs" : "s need"} input`
+      : null,
+    otherUnrun > 0 ? `${otherUnrun} could not run` : null,
+  ].filter((part): part is string => part !== null);
+  if (score.score === null) {
+    if (unrun.length > 0) return `not scored. ${unrun.join(", ")}`;
+    return `not scored — 0 applicable checks (${score.notApplicable} not applicable)`;
+  }
+  const parts = [
+    `${score.passed}/${score.applicable} applicable checks passed`,
+  ];
+  if (score.failed > 0) {
+    parts.push(`${score.failed} failed`);
+  }
+  parts.push(...unrun);
+  if (score.advisories.length > 0) {
+    parts.push(
+      `${score.advisories.length} advisor${score.advisories.length === 1 ? "y" : "ies"}`
+    );
+  }
+  // Named, never silent: a reader has to be able to tell "this run asked 36
+  // questions and scored all of them" from "it asked 39 and scored 36".
+  if ((score.pending ?? 0) > 0) {
+    parts.push(`${score.pending} pending (unscored by this profile)`);
+  }
+  const version = score.protocolVersion ? ` [${score.protocolVersion}]` : "";
+  return `${score.score}/100 — ${parts.join(", ")}${version}`;
+}
+
+/**
+ * Protocol: checks verbatim; advice is the typed readiness channel, whose
+ * `specStrength` already names the RFC 2119 tier.
+ */
+export function scoreFromProtocolResult(
+  result: MCPConformanceResult,
+): ConformanceScore {
+  // `?? []`: a serialized result from an SDK that predates the readiness
+  // channel scores fine — it just has no advice to list.
+  return computeConformanceScore(
+    result.checks,
+    // `informational` advice stays out of the advisory list: it describes
+    // behavior the spec explicitly permits, or rests on a non-normative
+    // example, and the readiness module calls it "reported and never scored".
+    (result.readiness ?? [])
+      .filter((warning) => warning.informational !== true)
+      .map((warning) => ({
+        id: warning.id,
+        tier: warning.specStrength === "MAY" ? "may" : "should",
+      })),
+    result.protocolVersion,
+    // Read off the RESULT, not the current build's manifest: a stored report
+    // must score the same way it did when it was produced, even after this
+    // build promotes some of its pending checks.
+    result.profile,
+  );
+}
+
+/**
+ * Apps and Tasks share a check shape. Their advice channel is the per-check
+ * free-string `warnings` — untyped, so each entry is listed at the WEAKEST
+ * tier: a string with no declared spec strength is not a SHOULD.
+ */
+function scoreFromWarningChecks(
+  checks: Array<OutcomeCheckLike & { warnings?: string[] }>,
+  protocolVersion?: string,
+  profileStamp?: Pick<ConformanceProfileStamp, "pendingCheckIds">,
+  typedAdvisories: Array<ScoredAdvisory & { checkId: string }> = []
+): ConformanceScore {
+  // Warnings on a PENDING check are not listed: the check is not being
+  // scored, so its advice is not either. Typed advice follows the check it
+  // came from for the same reason.
+  const { scored } = partitionByStamp(checks, profileStamp);
+  const scoredIds = new Set(scored.map((check) => check.id));
+  return computeConformanceScore(
+    checks,
+    [
+      ...scored.flatMap((check) =>
+        (check.warnings ?? []).map((_, index) => ({
+          id: `${check.id}-warning-${index + 1}`,
+          tier: "may" as const,
+        }))
+      ),
+      ...typedAdvisories
+        .filter((advisory) => scoredIds.has(advisory.checkId))
+        .map(({ id, tier }) => ({ id, tier })),
+    ],
+    protocolVersion,
+    profileStamp,
+  );
+}
+
+export function scoreFromAppsResult(
+  result: MCPAppsConformanceResult,
+): ConformanceScore {
+  return scoreFromWarningChecks(
+    result.checks,
+    result.protocolVersion,
+    undefined,
+    // The typed advice channel, read like the Tasks suite's. A "Deprecation
+    // Notice" costs 0 points only because it is `informational`; without
+    // that flag the tier mapping below would charge it as a SHOULD.
+    (result.readiness ?? [])
+      .filter((warning) => warning.informational !== true)
+      .map((warning) => ({
+        id: warning.id,
+        checkId: warning.checkId,
+        tier: warning.specStrength === "MAY" ? "may" : "should",
+      }))
+  );
+}
+
+export function scoreFromTasksResult(
+  result: MCPTasksConformanceResult,
+): ConformanceScore {
+  return scoreFromWarningChecks(
+    result.checks,
+    result.discovery.protocolVersion,
+    // Read off the RESULT, not the current build's manifest, for the same
+    // reason the protocol suite does: a stored report must score the way it did
+    // when it was produced.
+    result.profile,
+    // The typed advice channel, read like the protocol suite's readiness:
+    // `informational` advice stays out of the advisory list.
+    (result.readiness ?? [])
+      .filter((warning) => warning.informational !== true)
+      .map((warning) => ({
+        id: warning.id,
+        checkId: warning.checkId,
+        tier: warning.specStrength === "MAY" ? "may" : "should",
+      }))
+  );
+}
+
+/**
+ * The ids an OAuth score may leave out: only the listed post-flow checks. A
+ * flow step (discovery, registration, token) always counts, so a stored list
+ * naming one cannot pass a flow that broke there.
+ */
+export function scorableOAuthIds(ids: readonly string[] | undefined): string[] {
+  return (ids ?? []).filter((id) =>
+    Object.prototype.hasOwnProperty.call(CONFORMANCE_CHECK_METADATA, id)
+  );
+}
+
+/**
+ * OAuth is the outlier twice over.
+ *
+ * Its `"not-applicable"` outcome (the server serves without auth, which the
+ * spec makes OPTIONAL) means the whole suite has nothing to score: null, zero
+ * applicable, every step tallied as not-applicable. That is the mechanism by
+ * which "a server without auth shouldn't deduct points" holds.
+ *
+ * Otherwise its steps adapt structurally (`step` → `id`) and are counted
+ * directly: the score reads the evidence, not the verdict — even now that the
+ * runner derives its verdict from the same shared vocabulary, the score's
+ * arithmetic stays anchored to the steps themselves. `teachableMoments` are
+ * explanations of failures already counted as failed checks, never advisories.
+ */
+export function scoreFromOAuthResult(
+  result: OAuthConformanceResult,
+  options?: {
+    /**
+     * Checks the caller leaves out of the score (see `scorableOAuthIds`;
+     * flow steps always count). OAuth's steps are one
+     * sequential sign-in flow, so they all still RUN; these are reported as
+     * pending (unscored), exactly like a profile's pending checks: out of the
+     * counts and out of the verdict.
+     */
+    unscoredCheckIds?: readonly string[];
+  }
+): ConformanceScore {
+  const unscored = scorableOAuthIds(options?.unscoredCheckIds);
+  if (result.outcome === "not-applicable") {
+    // Unscored steps stay pending here too, so the score and a report that
+    // marks them pending count them the same way.
+    const unscoredIds = new Set(unscored);
+    const pending = result.steps.filter((step) =>
+      unscoredIds.has(step.step)
+    ).length;
+    return scoreFromCounts(
+      {
+        passed: 0,
+        failed: 0,
+        couldNotRun: 0,
+        notApplicable: result.steps.length - pending,
+        pending,
+      },
+      [],
+      "passed",
+      result.protocolVersion,
+    );
+  }
+
+  const checks: OutcomeCheckLike[] = result.steps.map((step) => ({
+    id: step.step,
+    status: step.status,
+    ...(step.skipReason ? { skipReason: step.skipReason } : {}),
+    ...(step.error?.message ? { error: { message: step.error.message } } : {}),
+  }));
+  return computeConformanceScore(
+    checks,
+    // The typed advice channel, read like the protocol suite's readiness.
+    (result.readiness ?? [])
+      .filter((warning) => warning.informational !== true)
+      .map((warning) => ({
+        id: warning.id,
+        tier: warning.specStrength === "MAY" ? "may" : "should",
+      })),
+    result.protocolVersion,
+    unscored.length > 0 ? { pendingCheckIds: [...unscored] } : undefined
+  );
+}

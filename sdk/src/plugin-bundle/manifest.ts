@@ -1,0 +1,790 @@
+/**
+ * Agent Plugins 1.0 manifest (`plugin.json` at the bundle root) validation
+ * and normalization — https://agent-plugins.org/schemas/1.0.0/plugin.schema.json.
+ *
+ * The manifest is a CLOSED object per the spec: `$schema` and `name` are
+ * required; unknown top-level fields are reported and ignored (never
+ * preserved, never executed); a non-object `extensions` is reported and
+ * ignored. `$schema` selects the validation contract from a compiled-in
+ * list — schemas are never retrieved at load time (spec MUST).
+ *
+ * MCPJam-specific presentation metadata (display name, icon, logo) lives in
+ * the `com.mcpjam` reverse-domain extension namespace, per the spec's
+ * client-extension model — never as top-level fields.
+ */
+
+import { isUnsafeRawUrl, urlCarriesSecret } from "./mcp-entry-values.js";
+import { resolveContainedPath } from "./paths.js";
+import {
+  MAX_VALUE_DEPTH,
+  sanitizeUnknownRecord,
+  type PluginIssueCollector,
+} from "./validation.js";
+
+export const PLUGIN_MANIFEST_PATH = "plugin.json";
+
+/**
+ * Canonical schema identifiers per supported Agent Plugins version. Frozen:
+ * this map IS the compiled-in allowlist, so a caller mutating it at runtime
+ * would defeat the local-schema-selection contract.
+ */
+export const PLUGIN_MANIFEST_SCHEMAS: Readonly<Record<string, string>> =
+  Object.freeze({
+    "1.0.0": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  });
+
+/** Reverse-domain namespace MCPJam reads its own extension data from. */
+export const MCPJAM_EXTENSION_NAMESPACE = "com.mcpjam";
+
+export interface PluginManifestAuthor {
+  name?: string;
+  email?: string;
+  url?: string;
+}
+
+export interface NormalizedPluginManifest {
+  /**
+   * Agent Plugins version the bundle targets, resolved locally from
+   * `$schema` (e.g. `"1.0.0"`). Never fetched.
+   */
+  schemaVersion: string;
+  /** Validated plugin name — the stable logical identity. Dots are legal. */
+  name: string;
+  /** Declared version string, when present. Metadata only, format-free. */
+  version?: string;
+  description?: string;
+  /** From the `com.mcpjam` extension namespace, when present. */
+  displayName?: string;
+  homepage?: string;
+  repository?: string;
+  license?: string;
+  author?: PluginManifestAuthor;
+  keywords?: string[];
+  /** Bundle-relative icon path from the `com.mcpjam` namespace. */
+  icon?: string;
+  /**
+   * Bundle-relative directory icon (light). From OpenAI's `interface.logo`
+   * (top-level, or `extensions["com.openai"].interface`); the `com.mcpjam`
+   * namespace's `logo` overrides it.
+   */
+  logo?: string;
+  /** Bundle-relative directory icon (dark), from OpenAI's `interface.logoDark`. */
+  logoDark?: string;
+  /**
+   * Bundle-relative composer icon, from OpenAI's `interface.composerIcon`.
+   * Optional: composer chips fall back to the directory icon.
+   */
+  composerIcon?: string;
+  /**
+   * The packaged onboarding skill (`extensions["com.openai"].onboardingSkill`),
+   * kept only when it names a skill this bundle loaded.
+   */
+  onboarding?: { skillPath: string; componentKey: string };
+  /**
+   * Client-extension data keyed by reverse-domain namespace, sanitized
+   * (secret-looking keys/values dropped, depth-capped). MCPJam applies only
+   * the `com.mcpjam` namespace and ignores the rest, per spec.
+   */
+  extensions: Record<string, unknown>;
+}
+
+/**
+ * Agent Plugins name rule, byte-for-byte the canonical
+ * plugin.schema.json pattern: lowercase alphanumerics plus `-`/`.`, no
+ * leading/trailing separator, no `--`, no `..`; 1–64 chars. Note the
+ * published pattern DOES accept mixed adjacent separators (`foo.-bar`,
+ * `foo-.bar`) — only same-character doubles are excluded — and rejecting
+ * them here would reject spec-valid names.
+ */
+const AP_NAME = /^(?!.*(?:--|\.\.))[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/;
+const MAX_NAME_LENGTH = 64;
+
+const PLACEHOLDER = /\[TODO:/i;
+
+/** Simple string metadata fields copied through after a type check. */
+const STRING_FIELDS = ["description", "license"] as const;
+
+/** URL metadata fields; MCPJam requires HTTPS when present. */
+const URL_FIELDS = ["homepage", "repository"] as const;
+
+/**
+ * Unknown fields that would change execution semantics if silently ignored.
+ * The spec says unknown fields are reported and ignored; these are rejected
+ * outright because "ignored" is exactly what an attacker shipping an
+ * `install_script` field would want.
+ */
+const EXECUTION_AMBIGUOUS_FIELDS = new Set([
+  "command",
+  "entrypoint",
+  "exec",
+  "install",
+  "install_script",
+  "postinstall",
+  "preinstall",
+  "run",
+  "script",
+  "scripts",
+]);
+
+const HANDLED_FIELDS = new Set<string>([
+  "$schema",
+  "name",
+  "version",
+  "author",
+  "keywords",
+  "extensions",
+  // OpenAI's plugin presentation block. Only its display name and icons are
+  // read.
+  "interface",
+  ...STRING_FIELDS,
+  ...URL_FIELDS,
+]);
+
+function scanForPlaceholders(
+  value: unknown,
+  fieldPath: string,
+  issues: PluginIssueCollector,
+  depth = 0,
+  state = { reportedTooDeep: false }
+): void {
+  if (typeof value === "string") {
+    if (PLACEHOLDER.test(value)) {
+      issues.error(
+        "MANIFEST_PLACEHOLDER",
+        `manifest field "${fieldPath}" contains an unresolved placeholder`
+      );
+    }
+    return;
+  }
+  // Depth cap: hostile deeply-nested JSON must fail with a stable issue
+  // code, not a raw RangeError from unbounded recursion.
+  if (depth > MAX_VALUE_DEPTH) {
+    if (!state.reportedTooDeep) {
+      state.reportedTooDeep = true;
+      issues.error(
+        "VALUE_TOO_DEEP",
+        `manifest field "${fieldPath}" nests deeper than ${MAX_VALUE_DEPTH} levels`
+      );
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((item, index) =>
+      scanForPlaceholders(
+        item,
+        `${fieldPath}[${index}]`,
+        issues,
+        depth + 1,
+        state
+      )
+    );
+    return;
+  }
+  if (value && typeof value === "object") {
+    for (const [key, nested] of Object.entries(
+      value as Record<string, unknown>
+    )) {
+      scanForPlaceholders(
+        nested,
+        fieldPath === "" ? key : `${fieldPath}.${key}`,
+        issues,
+        depth + 1,
+        state
+      );
+    }
+  }
+}
+
+/**
+ * A metadata URL. The spec types these fields but forbids rejecting a plugin
+ * for failing a URL check, so a malformed or non-HTTPS value is reported and
+ * not stored; only a non-string is a schema violation.
+ */
+function readHttpsUrl(
+  key: string,
+  value: unknown,
+  issues: PluginIssueCollector
+): string | undefined {
+  if (typeof value !== "string") {
+    issues.error(
+      "MANIFEST_INVALID_FIELD",
+      `manifest field "${key}" must be a string URL`
+    );
+    return undefined;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    issues.warn(
+      "MANIFEST_INVALID_FIELD",
+      `manifest field "${key}" is not a valid URL; ignored`
+    );
+    return undefined;
+  }
+  // A user name or password in a link is a credential (a token often sits in
+  // the user name), as is a key in its path or query, and the manifest is
+  // stored and shown to every member.
+  if (
+    parsed.username !== "" ||
+    parsed.password !== "" ||
+    urlCarriesSecret(parsed)
+  ) {
+    issues.warn(
+      "MANIFEST_SECRET_FIELD_OMITTED",
+      `manifest field "${key}" carries a credential; ignored`
+    );
+    return undefined;
+  }
+  // `new URL` drops or rewrites these, so the stored string would not be the
+  // one checked: a backslash reads as `/`, whitespace and control characters
+  // are stripped, and the slashes after the scheme are normalized.
+  if (isUnsafeRawUrl(value, { allowFragment: true })) {
+    issues.warn(
+      "MANIFEST_INVALID_FIELD",
+      `manifest field "${key}" is not a URL as written; ignored`
+    );
+    return undefined;
+  }
+  if (parsed.protocol !== "https:") {
+    issues.warn(
+      "MANIFEST_INSECURE_URL",
+      `manifest field "${key}" must use HTTPS; ignored`
+    );
+    return undefined;
+  }
+  return value;
+}
+
+/**
+ * Read MCPJam presentation metadata out of the `com.mcpjam` namespace.
+ *
+ * Reads from the RAW extensions record, not the sanitized copy: the shared
+ * secret-value screen drops long opaque runs, and a legitimate icon path
+ * (`assets/brand-name-banner-icon-desktop-retina-display.png`) can trip it.
+ * These three fields have their own validation — a string type check plus,
+ * for icon/logo, containment and existence in the bundle — so nothing
+ * unvetted is stored.
+ */
+function applyMcpjamExtension(
+  manifest: NormalizedPluginManifest,
+  rawExtensions: Record<string, unknown>,
+  filePaths: ReadonlySet<string>,
+  issues: PluginIssueCollector
+): void {
+  const raw = rawExtensions[MCPJAM_EXTENSION_NAMESPACE];
+  if (raw === undefined) return;
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    issues.warn(
+      "MANIFEST_INVALID_FIELD",
+      `extension namespace "${MCPJAM_EXTENSION_NAMESPACE}" must be an object; ignored`
+    );
+    return;
+  }
+  const record = raw as Record<string, unknown>;
+
+  const displayName = record.displayName ?? record.display_name;
+  if (displayName !== undefined) {
+    if (typeof displayName !== "string") {
+      issues.warn(
+        "MANIFEST_INVALID_FIELD",
+        `"${MCPJAM_EXTENSION_NAMESPACE}.displayName" must be a string; ignored`
+      );
+    } else {
+      manifest.displayName = displayName;
+    }
+  }
+
+  for (const key of ["icon", "logo"] as const) {
+    const value = record[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") {
+      issues.warn(
+        "MANIFEST_INVALID_FIELD",
+        `"${MCPJAM_EXTENSION_NAMESPACE}.${key}" must be a bundle-relative path; ignored`
+      );
+      continue;
+    }
+    const resolved = resolveContainedPath("", value);
+    if (!resolved.ok) {
+      issues.warn(resolved.code, `"${MCPJAM_EXTENSION_NAMESPACE}.${key}": ${resolved.message}`);
+      continue;
+    }
+    if (!filePaths.has(resolved.path)) {
+      issues.warn(
+        "MANIFEST_MISSING_FILE",
+        `"${MCPJAM_EXTENSION_NAMESPACE}.${key}" references a file that is not in the bundle: "${resolved.path}"`,
+        { path: resolved.path }
+      );
+      continue;
+    }
+    manifest[key] = resolved.path;
+  }
+}
+
+/** Reverse-domain namespace OpenAI keeps its plugin data in. */
+export const OPENAI_EXTENSION_NAMESPACE = "com.openai";
+
+const OPENAI_INTERFACE_ICON_FIELDS = [
+  "logo",
+  "logoDark",
+  "composerIcon",
+] as const;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * Read OpenAI's plugin presentation — `interface.displayName`, the directory
+ * icon `interface.logo` / `logoDark` (light and dark) and
+ * `interface.composerIcon` — from the top-level `interface` block and from
+ * `extensions["com.openai"].interface` (which wins when both are present).
+ * Each icon must be a bundle-relative path to a file in the bundle, and a
+ * display name must not be an unresolved `[TODO: ...]` placeholder; anything
+ * else is reported and ignored, never fatal, so a plugin with bad
+ * presentation still imports. The `com.mcpjam` namespace applies afterwards and overrides
+ * `displayName` and `logo`.
+ */
+function applyOpenAiInterface(
+  manifest: NormalizedPluginManifest,
+  sources: Array<{ label: string; value: unknown }>,
+  filePaths: ReadonlySet<string>,
+  issues: PluginIssueCollector
+): void {
+  for (const { label, value } of sources) {
+    if (value === undefined) continue;
+    if (!isPlainRecord(value)) {
+      issues.warn(
+        "MANIFEST_INVALID_FIELD",
+        `"${label}" must be an object; ignored`
+      );
+      continue;
+    }
+    if (
+      value.displayName !== undefined &&
+      typeof value.displayName !== "string"
+    ) {
+      issues.warn(
+        "MANIFEST_INVALID_FIELD",
+        `"${label}.displayName" must be a string; ignored`
+      );
+    } else if (value.displayName?.trim()) {
+      if (PLACEHOLDER.test(value.displayName)) {
+        issues.warn(
+          "MANIFEST_INVALID_FIELD",
+          `"${label}.displayName" is an unresolved placeholder; ignored`
+        );
+      } else {
+        manifest.displayName = value.displayName;
+      }
+    }
+    for (const key of OPENAI_INTERFACE_ICON_FIELDS) {
+      const ref = value[key];
+      if (ref === undefined) continue;
+      if (typeof ref !== "string") {
+        issues.warn(
+          "MANIFEST_INVALID_FIELD",
+          `"${label}.${key}" must be a bundle-relative path; ignored`
+        );
+        continue;
+      }
+      const resolved = resolveContainedPath("", ref);
+      if (!resolved.ok) {
+        issues.warn(resolved.code, `"${label}.${key}": ${resolved.message}`);
+        continue;
+      }
+      if (!filePaths.has(resolved.path)) {
+        issues.warn(
+          "MANIFEST_MISSING_FILE",
+          `"${label}.${key}" references a file that is not in the bundle: "${resolved.path}"`,
+          { path: resolved.path }
+        );
+        continue;
+      }
+      manifest[key] = resolved.path;
+    }
+  }
+}
+
+/**
+ * OpenAI requires a plugin directory icon in light and dark. Only checked
+ * for plugins that carry OpenAI data, so a plain Agent Plugins bundle is not
+ * held to OpenAI's listing rules.
+ */
+function checkOpenAiDirectoryIcon(
+  manifest: NormalizedPluginManifest,
+  issues: PluginIssueCollector
+): void {
+  if (manifest.logo === undefined && manifest.logoDark === undefined) {
+    issues.warn(
+      "MANIFEST_DIRECTORY_ICON_MISSING",
+      `plugin has no directory icon: OpenAI requires "interface.logo" (light) and "interface.logoDark" (dark), PNG`
+    );
+    return;
+  }
+  if (manifest.logo === undefined || manifest.logoDark === undefined) {
+    const missing = manifest.logo === undefined ? "logo" : "logoDark";
+    issues.warn(
+      "MANIFEST_DIRECTORY_ICON_VARIANT_MISSING",
+      `plugin directory icon has no ${
+        missing === "logo" ? "light" : "dark"
+      } variant: add "interface.${missing}"`
+    );
+  }
+}
+
+export interface PluginManifestNormalization {
+  /** `null` when the manifest is unusable (errors were collected). */
+  manifest: NormalizedPluginManifest | null;
+  /** The declared onboarding skill, unvalidated: see `applyOnboardingSkill`. */
+  onboardingSkill?: unknown;
+}
+
+/**
+ * Validate and normalize a parsed `plugin.json` value per Agent Plugins 1.0.
+ *
+ * Fatal (bundle-rejecting) violations: missing/unsupported `$schema`,
+ * invalid `name`, wrong-typed known fields, execution-ambiguous fields.
+ * Non-fatal: unknown top-level fields (reported, ignored) and a non-object
+ * `extensions` (reported, ignored) — per the spec's explicit list.
+ *
+ * `filePaths` is the set of canonical bundle paths, used to verify files
+ * referenced from the `com.mcpjam` namespace (icon/logo) exist in-bundle.
+ */
+export function normalizePluginManifest(
+  raw: unknown,
+  context: {
+    filePaths: ReadonlySet<string>;
+    issues: PluginIssueCollector;
+  }
+): PluginManifestNormalization {
+  const { filePaths, issues } = context;
+
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    issues.error(
+      "MANIFEST_INVALID_JSON",
+      "plugin.json must contain a JSON object"
+    );
+    return { manifest: null };
+  }
+  const record = raw as Record<string, unknown>;
+
+  // $schema — required; selects the locally supported validation contract.
+  const schema = record.$schema;
+  const schemaVersion =
+    typeof schema === "string"
+      ? Object.keys(PLUGIN_MANIFEST_SCHEMAS).find(
+          (version) => PLUGIN_MANIFEST_SCHEMAS[version] === schema
+        )
+      : undefined;
+  if (schemaVersion === undefined) {
+    issues.error(
+      "MANIFEST_UNSUPPORTED_SCHEMA",
+      schema === undefined
+        ? `manifest is missing the required "$schema" field`
+        : `manifest "$schema" is not a supported Agent Plugins schema: ${String(
+            schema
+          )}`
+    );
+    return { manifest: null };
+  }
+
+  // name — required, Agent Plugins charset (dots legal, no "--"/"..").
+  const name = record.name;
+  if (
+    typeof name !== "string" ||
+    name.length === 0 ||
+    name.length > MAX_NAME_LENGTH ||
+    !AP_NAME.test(name)
+  ) {
+    issues.error(
+      "MANIFEST_INVALID_NAME",
+      `manifest "name" must be 1-${MAX_NAME_LENGTH} lowercase [a-z0-9.-] chars with single separators (no "--" or "..")`
+    );
+    return { manifest: null };
+  }
+
+  const manifest: NormalizedPluginManifest = {
+    schemaVersion,
+    name,
+    extensions: {},
+  };
+
+  // version — optional free-form string (the spec imposes no format).
+  if (record.version !== undefined) {
+    if (typeof record.version !== "string" || record.version.length === 0) {
+      issues.error(
+        "MANIFEST_INVALID_VERSION",
+        `manifest "version" must be a non-empty string when present`
+      );
+    } else {
+      manifest.version = record.version;
+    }
+  }
+
+  for (const key of STRING_FIELDS) {
+    const value = record[key];
+    if (value === undefined) continue;
+    if (typeof value !== "string") {
+      issues.error(
+        "MANIFEST_INVALID_FIELD",
+        `manifest field "${key}" must be a string`
+      );
+      continue;
+    }
+    manifest[key] = value;
+  }
+
+  for (const key of URL_FIELDS) {
+    if (record[key] === undefined) continue;
+    const url = readHttpsUrl(key, record[key], issues);
+    if (url !== undefined) manifest[key] = url;
+  }
+
+  // author — object per the spec schema (no additional properties).
+  const author = record.author;
+  if (author !== undefined) {
+    if (author && typeof author === "object" && !Array.isArray(author)) {
+      const authorRecord = author as Record<string, unknown>;
+      const normalizedAuthor: PluginManifestAuthor = {};
+      for (const key of Object.keys(authorRecord)) {
+        if (key === "name" || key === "email" || key === "url") {
+          if (key !== "url" && typeof authorRecord[key] !== "string") {
+            issues.error(
+              "MANIFEST_INVALID_FIELD",
+              `manifest field "author.${key}" must be a string`
+            );
+          }
+          continue;
+        }
+        issues.warn(
+          "MANIFEST_UNKNOWN_FIELD",
+          `manifest field "author.${key}" is not part of Agent Plugins ${schemaVersion}; ignored`
+        );
+      }
+      if (typeof authorRecord.name === "string") {
+        normalizedAuthor.name = authorRecord.name;
+      }
+      if (typeof authorRecord.email === "string") {
+        normalizedAuthor.email = authorRecord.email;
+      }
+      if (authorRecord.url !== undefined) {
+        const url = readHttpsUrl("author.url", authorRecord.url, issues);
+        if (url !== undefined) normalizedAuthor.url = url;
+      }
+      manifest.author = normalizedAuthor;
+    } else {
+      issues.error(
+        "MANIFEST_INVALID_FIELD",
+        `manifest field "author" must be an object`
+      );
+    }
+  }
+
+  const keywords = record.keywords;
+  if (keywords !== undefined) {
+    if (
+      !Array.isArray(keywords) ||
+      keywords.some((keyword) => typeof keyword !== "string")
+    ) {
+      issues.error(
+        "MANIFEST_INVALID_FIELD",
+        `manifest field "keywords" must be an array of strings`
+      );
+    } else {
+      manifest.keywords = keywords as string[];
+    }
+  }
+
+  // OpenAI icons — before `extensions`, so the `com.mcpjam` namespace (applied
+  // there) overrides them.
+  const rawOpenAi = isPlainRecord(record.extensions)
+    ? record.extensions[OPENAI_EXTENSION_NAMESPACE]
+    : undefined;
+  const declaresOpenAi = record.interface !== undefined || rawOpenAi !== undefined;
+  applyOpenAiInterface(
+    manifest,
+    [
+      { label: "interface", value: record.interface },
+      {
+        label: `extensions.${OPENAI_EXTENSION_NAMESPACE}.interface`,
+        value: isPlainRecord(rawOpenAi) ? rawOpenAi.interface : undefined,
+      },
+    ],
+    filePaths,
+    issues
+  );
+
+  // extensions — reverse-domain namespace map. Non-object: report + ignore
+  // (explicitly non-fatal per spec). Object: sanitize before storing, so no
+  // secret-looking key or value at any depth rides into the persisted
+  // manifest.
+  const extensions = record.extensions;
+  if (extensions !== undefined) {
+    if (
+      extensions === null ||
+      typeof extensions !== "object" ||
+      Array.isArray(extensions)
+    ) {
+      issues.warn(
+        "MANIFEST_INVALID_FIELD",
+        `manifest field "extensions" must be an object; ignored`
+      );
+    } else {
+      manifest.extensions = sanitizeUnknownRecord(
+        storedExtensions(extensions as Record<string, unknown>),
+        {
+          issues,
+          secretCode: "MANIFEST_SECRET_FIELD_OMITTED",
+          label: "manifest extensions",
+        }
+      );
+      applyMcpjamExtension(
+        manifest,
+        extensions as Record<string, unknown>,
+        filePaths,
+        issues
+      );
+    }
+  }
+
+  if (declaresOpenAi) checkOpenAiDirectoryIcon(manifest, issues);
+
+  // Unknown top-level fields: reported and IGNORED (closed manifest) —
+  // except execution-ambiguous names, which are rejected outright.
+  for (const key of Object.keys(record)) {
+    if (HANDLED_FIELDS.has(key)) continue;
+    if (EXECUTION_AMBIGUOUS_FIELDS.has(key)) {
+      issues.error(
+        "MANIFEST_AMBIGUOUS_FIELD",
+        `manifest field "${key}" is not supported and is execution-ambiguous; remove it`
+      );
+      continue;
+    }
+    issues.warn(
+      "MANIFEST_UNKNOWN_FIELD",
+      `manifest field "${key}" is not part of Agent Plugins ${schemaVersion}; ignored`
+    );
+  }
+
+  // Placeholder hygiene runs over the NORMALIZED manifest, not the raw
+  // record: an unresolved [TODO: ...] in a field we keep is fatal, but one
+  // inside an unknown field we already reported and ignored must not be —
+  // ignored means ignored.
+  scanForPlaceholders(
+    manifest as unknown as Record<string, unknown>,
+    "",
+    issues
+  );
+
+  return {
+    manifest,
+    onboardingSkill: isPlainRecord(rawOpenAi)
+      ? rawOpenAi.onboardingSkill
+      : undefined,
+  };
+}
+
+/** The `interface` fields `applyOpenAiInterface` reads from the raw manifest. */
+const OPENAI_INTERFACE_FIELDS = new Set<string>([
+  "displayName",
+  ...OPENAI_INTERFACE_ICON_FIELDS,
+]);
+
+/**
+ * `extensions` as stored, without what is read from the raw manifest instead.
+ * The onboarding skill is kept only once `applyOnboardingSkill` validates it,
+ * and the secret screen would report a long skill path as a dropped secret.
+ * An interface field holding a placeholder was already reported and ignored,
+ * and the placeholder scan would otherwise make it fatal.
+ */
+function storedExtensions(
+  extensions: Record<string, unknown>
+): Record<string, unknown> {
+  const openai = extensions[OPENAI_EXTENSION_NAMESPACE];
+  if (!isPlainRecord(openai)) return extensions;
+  const { onboardingSkill: _declared, ...rest } = openai;
+  if (isPlainRecord(rest.interface)) {
+    rest.interface = Object.fromEntries(
+      Object.entries(rest.interface).filter(
+        ([key, value]) =>
+          !OPENAI_INTERFACE_FIELDS.has(key) ||
+          typeof value !== "string" ||
+          !PLACEHOLDER.test(value)
+      )
+    );
+  }
+  return { ...extensions, [OPENAI_EXTENSION_NAMESPACE]: rest };
+}
+
+/**
+ * Keep the declared onboarding skill only when it names, exactly, a skill this
+ * bundle loaded. The reference is read from the raw manifest because the
+ * secret screen can drop a long path; once validated it is restored to
+ * `extensions["com.openai"]` and set as the typed `onboarding` field. An
+ * unvalidated reference is removed, so no consumer can act on it.
+ */
+export function applyOnboardingSkill(
+  manifest: NormalizedPluginManifest,
+  declared: unknown,
+  skills: ReadonlyArray<{ skillFilePath: string; componentKey: string }>,
+  issues: PluginIssueCollector
+): void {
+  const namespace = manifest.extensions[OPENAI_EXTENSION_NAMESPACE];
+  const openai = isPlainRecord(namespace) ? { ...namespace } : undefined;
+  if (openai !== undefined) {
+    delete openai.onboardingSkill;
+    manifest.extensions[OPENAI_EXTENSION_NAMESPACE] = openai;
+  }
+  if (declared === undefined) return;
+  const resolved =
+    typeof declared === "string" ? resolveContainedPath("", declared) : null;
+  const skill = resolved?.ok
+    ? skills.find((candidate) => candidate.skillFilePath === resolved.path)
+    : undefined;
+  if (skill === undefined || openai === undefined) {
+    issues.warn(
+      "MANIFEST_MISSING_FILE",
+      `the onboarding skill this plugin names is not one of its loaded skills; onboarding is unavailable`
+    );
+    return;
+  }
+  manifest.onboarding = {
+    skillPath: skill.skillFilePath,
+    componentKey: skill.componentKey,
+  };
+  openai.onboardingSkill = declared;
+}
+
+/**
+ * Directory icon path for a theme (plugin lists and cards): the matching
+ * variant, else the other one. `undefined` means fall back to the server
+ * icon, then a generic icon.
+ */
+export function pluginDirectoryIconPath(
+  manifest: Pick<NormalizedPluginManifest, "logo" | "logoDark">,
+  theme: "light" | "dark"
+): string | undefined {
+  return theme === "dark"
+    ? manifest.logoDark ?? manifest.logo
+    : manifest.logo ?? manifest.logoDark;
+}
+
+/**
+ * Composer icon path (composer chips naming the plugin): `composerIcon`,
+ * then the `com.mcpjam` icon, then the directory icon.
+ */
+export function pluginComposerIconPath(
+  manifest: Pick<
+    NormalizedPluginManifest,
+    "composerIcon" | "icon" | "logo" | "logoDark"
+  >,
+  theme: "light" | "dark"
+): string | undefined {
+  return (
+    manifest.composerIcon ??
+    manifest.icon ??
+    pluginDirectoryIconPath(manifest, theme)
+  );
+}

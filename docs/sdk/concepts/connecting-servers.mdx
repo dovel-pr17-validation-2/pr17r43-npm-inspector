@@ -1,0 +1,300 @@
+---
+title: "Connecting to MCP Servers"
+description: "Learn how to connect to local and remote MCP servers"
+icon: "plug"
+---
+
+The `MCPClientManager` is your gateway to MCP servers. It handles connections, manages multiple servers, and provides a unified interface for calling tools, reading resources, and accessing prompts.
+
+## When to Use MCPClientManager
+
+Use `MCPClientManager` when you need to:
+- Connect to one or more MCP servers
+- Execute tools programmatically (without an LLM)
+- Build applications that aggregate tools from multiple servers
+- Set up test environments for your MCP server
+
+## Two Types of Servers
+
+MCP servers come in two transport types:
+
+### STDIO Servers (Local)
+
+STDIO servers run as subprocesses on your machine. You provide a command and arguments, and the SDK spawns the process.
+
+```typescript
+import { MCPClientManager } from "@mcpjam/sdk";
+
+const manager = new MCPClientManager({
+  myServer: {
+    command: "node",
+    args: ["./my-server.js"],
+    env: {
+      API_KEY: process.env.MY_API_KEY,
+    },
+  },
+});
+```
+
+**Best for:**
+- Local development
+- Servers you're building
+- CLI-based MCP servers
+- Servers requiring local resources
+
+<Note>
+Unconfigured stdio connections auto-negotiate the MCP era: the SDK probes `server/discover` on a sibling process to detect 2026 support, then falls back to the legacy `initialize` handshake if the server doesn't respond. This means your server binary may be spawned a second time during the probe. The probe is bounded (at most one extra spawn) and only occurs when no explicit protocol version pin is set.
+</Note>
+
+### HTTP Servers (Remote)
+
+HTTP servers connect via SSE (Server-Sent Events) or Streamable HTTP over the network.
+
+```typescript
+const manager = new MCPClientManager({
+  asana: {
+    url: "https://mcp.asana.com/sse",
+    requestInit: {
+      headers: {
+        Authorization: `Bearer ${process.env.ASANA_TOKEN}`,
+      },
+    },
+  },
+});
+```
+
+**Best for:**
+- Production MCP servers
+- Third-party integrations (Asana, Slack, etc.)
+- Shared team servers
+- Serverless deployments
+
+### HTTP Authentication Options
+
+For HTTP servers, `MCPClientManager` supports four auth patterns:
+
+- `accessToken` for a static bearer token
+- `refreshToken` + `clientId` for non-interactive OAuth token exchange with automatic refresh
+- `authProvider` when you need to provide a custom MCP SDK OAuth provider
+- `onUnauthorized` for custom 401 recovery when you manage tokens externally
+
+If you already have a refresh token, you can let the SDK handle access token exchange and refresh for you:
+
+```typescript
+const manager = new MCPClientManager({
+  asana: {
+    url: "https://mcp.asana.com/mcp",
+    refreshToken: process.env.ASANA_REFRESH_TOKEN!,
+    clientId: process.env.ASANA_CLIENT_ID!,
+    clientSecret: process.env.ASANA_CLIENT_SECRET,
+  },
+});
+```
+
+With this configuration, the SDK:
+
+- exchanges the refresh token for an access token during connection
+- automatically retries with a fresh access token when the server returns an auth challenge
+- keeps using the newest refresh token the authorization server returns, **for the life of the connection**
+
+<Warning>
+**A refresh token is usually single-use, so persist the rotation or the next
+run cannot authorize.** Most authorization servers hand back a new refresh
+token on every exchange and immediately invalidate the old one. The SDK keeps
+using the newest one for as long as the connection that received it lives. It
+can do no more than that: the value you passed as `refreshToken` is spent, so a
+long-lived caller configured from a secret — a CI job, a cron, a worker —
+authorizes once and then fails, with nothing in the logs to say a credential
+was replaced. A reconnect after `disconnectServer` starts from the
+`refreshToken` on the config as well, so it needs the persisted value too.
+
+Use `onTokensRotated` to store the replacement wherever the original came from:
+
+```typescript
+const manager = new MCPClientManager({
+  asana: {
+    url: "https://mcp.asana.com/mcp",
+    refreshToken: await secrets.read("ASANA_REFRESH_TOKEN"),
+    clientId: process.env.ASANA_CLIENT_ID!,
+    onTokensRotated: async ({ refreshToken }) => {
+      await secrets.write("ASANA_REFRESH_TOKEN", refreshToken);
+    },
+  },
+});
+```
+
+It fires only when the token actually changed, and it is awaited before the
+connection completes — so a job that exits the moment it finishes still gets
+the write, and a handler that never settles stalls the connection. It never
+fails a connection that has already authorized: an error from your handler is
+swallowed and **nothing is logged**, so log it yourself, and if the write has
+to be reliable do it somewhere it can be retried. The payload carries the
+access token alongside the refresh token, so keep it out of shared logs.
+</Warning>
+
+<Note>
+`refreshToken` is only supported for HTTP servers. When you use it, do not also set `accessToken`, `authProvider`, or an `Authorization` header in `requestInit.headers`.
+</Note>
+
+#### Custom 401 recovery with onUnauthorized
+
+Use `onUnauthorized` when you supply an `accessToken` but manage token rotation yourself — for example, when tokens come from a secrets vault or a backend service rather than a standard OAuth flow:
+
+```typescript
+const manager = new MCPClientManager({
+  myServer: {
+    url: "https://mcp.example.com/mcp",
+    accessToken: currentToken,
+    onUnauthorized: async ({ serverId }) => {
+      // Call your own token endpoint to get a fresh token
+      const { accessToken } = await myTokenService.refresh(serverId);
+      return { accessToken };
+    },
+  },
+});
+```
+
+When the server returns HTTP 401, the SDK:
+
+1. Calls `onUnauthorized` once to obtain a fresh access token.
+2. Strips any stale `Authorization` header from `requestInit`.
+3. Rebuilds the transport with the new token and retries the operation.
+4. If the retry also returns 401, the error is surfaced to the caller.
+
+<Note>
+`onUnauthorized` only fires on strict HTTP 401 responses — not 403. It is also skipped when `refreshToken` or `authProvider` is configured, since those patterns handle token refresh internally. Parallel 401s for the same server share a single refresh call.
+</Note>
+
+## Connecting and Disconnecting
+
+After configuring servers, you must explicitly connect:
+
+```typescript
+// Connect to a specific server
+await manager.connectToServer("myServer");
+
+// Now you can use it
+const tools = await manager.listTools("myServer");
+console.log("Available tools:", tools.tools.map((tool) => tool.name));
+
+// Always disconnect when done
+await manager.disconnectServer("myServer");
+```
+
+<Note>
+Always disconnect servers when you're done, especially in tests. This cleans up subprocess handles and network connections.
+</Note>
+
+## Working with Multiple Servers
+
+`MCPClientManager` can manage multiple servers at once:
+
+```typescript
+const manager = new MCPClientManager({
+  math: {
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-everything"],
+  },
+  asana: {
+    url: "https://mcp.asana.com/sse",
+    requestInit: {
+      headers: { Authorization: `Bearer ${token}` },
+    },
+  },
+  github: {
+    url: "https://mcp.github.com/sse",
+    requestInit: {
+      headers: { Authorization: `Bearer ${ghToken}` },
+    },
+  },
+});
+
+// Connect to all
+await Promise.all([
+  manager.connectToServer("math"),
+  manager.connectToServer("asana"),
+  manager.connectToServer("github"),
+]);
+
+// Aggregate tools from all servers
+const allTools = await manager.getTools();
+// Now allTools contains tools from math, asana, and github
+```
+
+## Executing Tools Directly
+
+You can call tools without involving an LLM, useful for unit tests:
+
+```typescript
+// Direct tool execution
+const result = await manager.executeTool("math", "add", { a: 5, b: 3 });
+console.log(result); // 8
+
+// Test your server's tools deterministically
+expect(result).toBe(8);
+```
+
+## Integration with HostRunner
+
+The most common pattern is connecting servers, then creating a `HostRunner` with their tools:
+
+```typescript
+const manager = new MCPClientManager({
+  myServer: { command: "node", args: ["./server.js"] },
+});
+
+await manager.connectToServer("myServer");
+
+// Get tools for HostRunner
+const tools = await manager.getTools();
+
+// Create agent with those tools
+const agent = new HostRunner({
+  tools,
+  model: "anthropic/claude-sonnet-4-20250514",
+  apiKey: process.env.ANTHROPIC_API_KEY,
+});
+
+// Now prompt the agent
+const result = await agent.run("Add 2 and 3");
+```
+
+## Error Handling
+
+Connection failures throw errors. Wrap in try/catch for production code:
+
+```typescript
+try {
+  await manager.connectToServer("myServer");
+} catch (error) {
+  console.error("Failed to connect:", error.message);
+  // Handle gracefully - maybe fall back to another server
+}
+```
+
+## Health Checks
+
+Verify a server is responsive:
+
+```typescript
+try {
+  await manager.pingServer("myServer");
+} catch {
+  console.warn("Server not responding, reconnecting...");
+  await manager.disconnectServer("myServer");
+  await manager.connectToServer("myServer");
+}
+```
+
+`pingServer` is era-aware: on a modern (2026-07-28) connection it probes with `server/discover`; on a legacy connection it uses `ping`. Callers don't need to handle the difference.
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Testing with LLMs" icon="bot" href="/sdk/concepts/testing-with-llms">
+    Connect LLMs to your MCP tools
+  </Card>
+  <Card title="MCPClientManager Reference" icon="book" href="/sdk/reference/mcp-client-manager">
+    Full API documentation
+  </Card>
+</CardGroup>

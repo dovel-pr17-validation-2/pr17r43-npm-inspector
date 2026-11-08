@@ -1,0 +1,283 @@
+---
+title: "Evals System Architecture"
+description: "How the evals system is wired: the Inspector runner, the SDK reporter, the eval-ingest API, and the predicate gate"
+icon: "flask-conical"
+---
+
+The evals system spans three surfaces that share one backend:
+
+- **Inspector Evaluate UI** — author suites and cases, run them hosted, inspect traces. See [Evaluate](/inspector/evals) for the product view.
+- **`@mcpjam/sdk`** — run evals in your own process (`EvalTest` / `EvalSuite`) and upload results. See [Running Evals](/sdk/concepts/running-evals).
+- **`mcpjam` CLI** — author, start, and inspect hosted runs from a terminal (`mcpjam cloud eval …`). See the [command reference](/cli/reference#cloud-eval-commands).
+
+This page covers the wiring underneath: where results enter the system, how host configuration stays consistent across surfaces, and where the code lives.
+
+## The big picture
+
+```mermaid
+graph TB
+    subgraph Clients
+        SDK["@mcpjam/sdk reporter<br/>(local eval runs)"]
+        CLI["mcpjam CLI<br/>(hosted runs)"]
+        UI[Inspector Evaluate UI]
+    end
+
+    subgraph Gateway["Inspector server (Hono)"]
+        INGEST["/api/v1/projects/:projectId/eval-ingest/*<br/>(routes/v1/eval-ingest.ts)"]
+        RUNNER["Eval runner<br/>(services/evals-runner.ts + services/evals/*)"]
+    end
+
+    subgraph Backend["MCPJam backend (Convex)"]
+        CONVEX["/v1/evals/ingest/*<br/>+ suites / cases / iterations"]
+    end
+
+    SDK -->|"POST results (sk_ key)"| INGEST
+    CLI -->|"platform API"| CONVEX
+    UI --> RUNNER
+    INGEST -->|"delegated org JWT"| CONVEX
+    RUNNER -->|recorder| CONVEX
+    RUNNER -->|MCPClientManager| MCP[MCP servers]
+```
+
+Two distinct write paths matter:
+
+1. **Ingestion** — externally produced results (SDK auto-save, manual reporting APIs, artifact uploads) enter through the `eval-ingest` HTTP surface.
+2. **Hosted runs** — the Inspector's own runner executes iterations server-side and persists through its recorder; the CLI's `eval run` starts these hosted runs via the platform API.
+
+## HostConfig consolidation
+
+The Playground (live chat) and Evals share a single, portable `hostConfig` core that lives in `@mcpjam/sdk/host-config/`. Everything that drives an LLM-plus-MCP loop — host style, model, sandbox/permission policy, OpenAI-Apps compat, tool-visibility, MCP server selection — flows through one canonical shape and one hash.
+
+```
+@mcpjam/sdk/host-config/
+  types.ts          # HostConfigInputV2, HostJson, CspDomainSet, …
+  canonicalize.ts   # canonicalizeHostConfigV2 — byte-stable JSON
+  hash.ts           # computeHostConfigHashV2 — sha256(canonical)
+  defaults.ts       # emptyHostConfigInputV2, resolveEffectiveMcpProtocolVersion, …
+  host-policy.ts    # extractHostExecutionPolicy, buildHostIterationMetadata
+  compat-runtime.ts # resolveOpenAiCompatForHostConfig
+  tool-visibility.ts# filterAppOnlyTools, applyVisibilityPolicyAndCountSignals
+  sdk-evals-normalizer.ts # normalizeSdkEvalHostConfigForWire (Stage 5)
+```
+
+This module is the **one source of truth**. The MCPJam backend imports the canonicalizer + hasher directly from `@mcpjam/sdk/host-config/internal`; see `mcpjam-backend/convex/lib/hostConfigV2.ts` — the file is a thin Convex-bound wrapper (server-scope validation, `Id<'servers'>` boundary cast) over the SDK functions, not a parallel implementation.
+
+**Two boundaries inside the inspector consume this module:**
+
+- **Outbound (backend → target MCP server).** The eval runner builds an `MCPClientManager`, connects to the suite's servers, and drives an `HostRunner` over the resolved host. Imports:
+  - `extractHostExecutionPolicy` / `buildHostIterationMetadata` from `@mcpjam/sdk/host-config/internal` (Stage 3) — was previously `server/services/evals/host-execution-policy.ts`; the local file is now deleted.
+  - `resolveOpenAiCompatForHostConfig` from `@mcpjam/sdk/host-config/internal` (Stage 3) — was previously the local `compat-runtime.ts`; only the Convex-bound `loadSuiteHostConfig` remains in the inspector.
+  - `filterAppOnlyTools` from `@mcpjam/sdk/host-config/internal` (Stage 3) — same predicate the chat-v2 path uses, no fork.
+- **Inbound (frontend → backend).** The eval results API persists per-iteration `hostConfigId` rows that reference the same `hostConfigs` table the scenario/playground writes.
+
+The Playground's chat-v2 path consumes the same module — playground and evals are two surfaces over the same configuration vocabulary; see [playground-architecture.mdx](./playground-architecture#hostconfig-consolidation) for the live-path side of the same picture.
+
+### `HostRunner`, `HostRuntime`, `HostExecutor` (Stage 4 rename)
+
+Inside `@mcpjam/sdk`, the executor surface was renamed in 1.11 to align with MCP spec vocabulary:
+
+- `TestAgent` → `HostRunner` — synchronous executor over a host snapshot with tools pre-resolved.
+- `EvalAgent` → `HostExecutor` — interface implemented by both `HostRunner` and `HostRuntime`.
+- `.prompt()` → `.run()` on the interface and both impls.
+- `Host.addServer()` → `Host.requireServer()`.
+- `HostRuntime` (new) — live binding of a `Host` to an `MCPClientManager` (`host.withManager(manager, { apiKey })`). Snapshots the live host on every `.run()`; stateless across turns.
+- `EvalTest.run` / `EvalSuite.run` parameter renamed `agent` → `executor`.
+
+`EvalTest` and `EvalSuite` accept any `HostExecutor`, so an external user can run the same eval against their own runtime as long as it implements `getHostSnapshot?.()`.
+
+### Per-iteration host metadata + Stage 5 wire-send
+
+`HostRunner` snapshots the host once at construction; `HostRuntime` re-snapshots on every `.run()`, so mid-eval mutation to the bound `Host` is captured per-iteration. Each `IterationResult` carries `hostSnapshot?: HostJson` and a derived metadata stamp (`buildHostSnapshotMetadata`) that is additively merged into `EvalResultInput.metadata` (existing keys are never overwritten — conflicting host keys are namespaced under `host.<key>`).
+
+The SDK eval reporter additionally sends `{ hostConfig, hostConfigHash }` at the run boundary. The v1 ingest surface always accepts the pair — the old per-`baseUrl` capability probe is gone:
+
+- `POST /api/v1/projects/:projectId/eval-ingest/runs/start` (chunked path) — body includes the pair when iteration snapshots are homogeneous.
+- `POST /api/v1/projects/:projectId/eval-ingest/report` (one-shot path) — same.
+- `POST /api/v1/projects/:projectId/eval-ingest/runs/iterations` and `…/runs/finalize` — **never** carry the pair (per-run, not per-batch).
+
+Source order, run-level only: `iteration.hostSnapshot` → `executor.getHostSnapshot?.()` → `MCPJamReportingConfig.host`. Today `EvalResultInput` carries no `hostSnapshot` field, so the shipped reporter resolves executor → explicit host. The iteration slot and its homogeneity gate (send only when all snapshots canonicalize to the same hash) are reserved for when per-iteration capture reaches the wire shape; see the comment in `resolveWireHostConfigForRun` (`sdk/src/report-eval-results.ts`). Errors thrown while resolving or canonicalizing the snapshot log a warning and omit the pair rather than failing the upload. Two cases drop it silently by design: heterogeneous iteration snapshots, and an explicit `host` whose `toJSON()` fails (see `resolveRunLevelHostSnapshot` in `sdk/src/sdk-evals-host-config-source.ts`).
+
+`hostConfigHash` is a transport-integrity check — the backend re-runs `normalizeSdkEvalHostConfigForWire → canonicalizeHostConfigV2 → computeHostConfigHashV2` and rejects on mismatch. It is **not** the persisted storage id; suite-resolved Convex `Id<'servers'>` are layered on top at storage time, so the persisted `hostConfigsV2` row's hash differs from the wire hash by design.
+
+### Two distinct sandbox layers
+
+- The persisted host-config sandbox shape (`mcpProfile.apps.sandbox.csp` + `.permissions`) is **allowlist-only** — there is no `deny` field. This is the shape the backend stores and the canonicalizer hashes.
+- The SDK runtime CSP **resolver** (`sandbox-policy.ts`) carries `deny` plus a hosted clamp for render-time enforcement. It is NOT the same type; the two share only leaf subtypes (`SandboxCspMode`, `SandboxPermissionsMode`, four-directive domain-set).
+
+A canonicalize-time guard in the SDK rejects sandbox shapes that leak a `deny` key. Don't reuse `SandboxCspPolicy` / `SandboxPermissionsPolicy` for persisted host configs.
+
+## Result ingestion API (`eval-ingest`)
+
+External results enter through these `POST` endpoints, implemented as a thin proxy in `mcpjam-inspector/server/routes/v1/eval-ingest.ts` over the Convex `/v1/evals/ingest/*` surface:
+
+| Endpoint | Purpose |
+|----------|---------|
+| `POST /api/v1/projects/:projectId/eval-ingest/report` | One-shot upload of a complete run |
+| `POST /api/v1/projects/:projectId/eval-ingest/runs/start` | Open a run for chunked upload |
+| `POST /api/v1/projects/:projectId/eval-ingest/runs/iterations` | Append a batch of iterations |
+| `POST /api/v1/projects/:projectId/eval-ingest/runs/finalize` | Close the run and compute the verdict |
+| `POST /api/v1/projects/:projectId/eval-ingest/artifacts` | Store one large blob (widget HTML snapshot) sent as raw bytes; returns its `storageId` |
+| `POST /api/v1/projects/:projectId/eval-ingest/artifacts/upload-url` | Retired: the backend answers `410 Gone` (`details.code: "SDK_UPGRADE_REQUIRED"`), passed through verbatim. `@mcpjam/sdk` 8.17.0 and later use `POST .../eval-ingest/artifacts` |
+
+Proxy behavior worth knowing when debugging:
+
+- The caller authenticates like any `/api/v1` route (typically an `sk_` API key); the proxy forwards to Convex with a **delegated org-scoped JWT**, not the caller's credential.
+- A literal `default` in the `:projectId` segment is stripped from the payload so the backend resolves the org's Default project; any other value overwrites `payload.projectId`.
+- The proxy caps JSON request bodies at 6 MiB (the backend enforces its own 5 MiB limit) and artifact bodies at 20 MiB, and times out after 60 s; status and body pass through verbatim. For `artifacts`, the project travels as a `?projectId=` query parameter because the body is the artifact itself.
+
+<Warning>
+The legacy `/sdk/v1/evals/*` endpoints and the project API keys (`mcpjam_…`) that protected them are **retired**. The backend answers those routes with `410 Gone`. Everything ingests through `eval-ingest` with `sk_…` keys — see [API keys](/reference/api-keys).
+</Warning>
+
+## SDK reporter
+
+`sdk/src/report-eval-results.ts` implements the client side of ingestion (types in `sdk/src/eval-reporting-types.ts`; API reference in [Saving Eval Results](/sdk/reference/eval-reporting)):
+
+- **Auth** — `Authorization: Bearer <sk_ key>`, resolved from `input.apiKey ?? MCPJAM_API_KEY`. Base URL from `input.baseUrl ?? MCPJAM_BASE_URL` (default `https://app.mcpjam.com`); project from `input.project ?? MCPJAM_PROJECT_ID` (default `default`).
+- **Flow** — a result whose widget HTML would push it past the 1 MiB request limit first uploads that HTML (via `artifacts`); then, if the run fits in one request (≤ 200 results and ≤ 1 MiB), a single `report` call; otherwise `runs/start` → chunked `runs/iterations` → `runs/finalize`.
+- **Retry** — 429/5xx, network errors, and timeouts retry with base delays of 250/750/1750 ms plus ±20% jitter. Billing-limit errors never retry. If `runs/start` reports the run already completed (idempotent reuse), the reporter short-circuits.
+
+## Predicate gate
+
+The deterministic pass/fail layer lives in `@mcpjam/sdk/predicates` (`sdk/src/predicates/`), browser-safe so the Inspector GUI runner and the `mcpjam cloud eval` CLI share one implementation:
+
+- `types.ts` — the `Predicate` union (12 types) plus Zod schemas. The union grows only when a real corpus task demands it.
+- `evaluate.ts` — `evaluatePredicate` / `evaluatePredicates` / `evaluateTurnChecks`, pure functions over an `IterationTranscript`.
+- `transcript.ts` — builds transcripts from traces (`buildIterationTranscript`, `buildTurnTranscript`).
+- `argMatcher.ts` — reuses the same argument engine as `expectedToolCalls` matching, so both agree on what "args match" means.
+
+Constraints that bite contributors:
+
+- **Convex mirror.** `mcpjam-backend/convex/lib/predicates.ts` hand-mirrors the union (Convex cannot import `@mcpjam/sdk`). Parity is proven by the JSON fixtures in `sdk/tests/fixtures/predicates-parity-fixtures.json` and their backend sibling — adding a predicate type means editing both validators and the fixtures in the same PR.
+- **Turn scoping.** Every predicate kind is turn-scopable except `tokenBudgetUnder` (per-turn token usage is not reliably captured); the list is `TURN_SCOPABLE_PREDICATE_KINDS`, also mirrored in the backend.
+- **Verdict rows.** The runner persists one `{ predicate, passed, reason, scope? }` row per predicate under `testIteration.metadata.predicates`.
+
+Per-case predicate resolution (suite defaults vs `inherit` / `replace` / `extend` overrides) is centralized in `mcpjam-inspector/shared/eval-matching.ts` (`resolveCaseSuccessPredicates`).
+
+## Tool-policy enforcement
+
+Eval tool safety is enforced at execution time, not by hiding tools from the
+model. A denied tool remains visible-but-blocked: hiding it would make the
+model's non-selection look like a `selection`-stage miss caused by the model or
+server, instead of a decision made by our policy gate. A blocked call is
+recorded as a policy block, does not call the MCP server, does not create a
+tool trace span, and is not an eval failure. Applicable stage rows become
+`notMeasured` with reason `blockedByPolicy`.
+
+The shared contract applies this precedence:
+
+1. An explicit `deny` entry blocks the tool.
+2. An explicit `allow` entry allows the tool.
+3. `destructiveHint: true` is blocked by default.
+4. In `readOnly` mode, only an explicitly read-only classification is allowed.
+5. `default` mode allows the remaining tools.
+
+Server annotations are advisory and **UNTRUSTED**. A tool is explicitly
+read-only only when `readOnlyHint === true` and `destructiveHint !== true`.
+Destructive and contradictory or malformed annotations are not treated as
+safe. Explicit name-based denies also apply to MCPJam internal tools; mode
+derived rules apply only to MCP-server tools.
+
+`allow` in `mode: "default"` is an override, not an allowlist: it does not
+restrict the set of tools available to the model. In `readOnly` mode, the
+mode-derived rule does not restrain the sandbox `bash` tool or skills because
+those internal tools do not carry `_serverId`. Runs selecting `readOnly` with a
+sandbox-enabled suite emit a launch warning for this limitation.
+
+Harness evals run their MCP calls out of process, so they never reach the
+in-process execution gate. They are enforced instead at the MCP proxy every
+generated `.mcp.json` entry points at. At launch the runner resolves the policy
+for every known tool of every selected server with the same shared contract, and
+seals that decision table together with the proxy credential into the
+`X-MCPJam-Proxy-Token` value the sandbox receives; the proxy opens it and blocks
+a denied `tools/call` before the upstream call happens. Because the policy
+encloses the credential, removing the policy from `.mcp.json` also removes
+access. A tool that appears only after launch is denied (`unknownAtLaunch`).
+`tools/list` is not filtered, and a block is returned as a successful MCP
+result, so it is accounted exactly like an in-process block: `notMeasured` with
+reason `blockedByPolicy`, never a failure attributed to the server. A policied
+harness run is still refused at launch on a deployment that cannot seal
+(`COMPUTERS_TERMINAL_TOKEN_SECRET` absent or too weak), rather than running
+unenforced.
+
+Hosted platform-authored suites currently lack the backend field required to
+carry this policy. The hosted CLI therefore continues to refuse authored
+`defaults.toolPolicy` rather than running without enforcement.
+
+## Run verdict policy (contract only)
+
+`sdk/src/contract/verdict-policy.ts` pins how a completed run becomes a verdict
+under `verdictPolicyVersion: 2`. It is a **contract with no producer yet** —
+nothing in the SDK, the hosted runner, or the backend emits an
+`EvalVerdictDecision`. Anything that reads one must check the version first: a
+row with no `verdictPolicyVersion` is a legacy percent-threshold row and must
+never be reinterpreted under these semantics.
+
+The rules the contract enforces, all of them checked by zod refinements rather
+than left to the producer:
+
+- **Validity is decided before the task verdict.** A run that cannot be
+  believed is `inconclusive`, never `failed` — the two mean different things to
+  whoever is paged. Validity has three independent checks: coverage,
+  `minCompletionRate` (default **0.8**), and `maxEvaluatorErrorRate` (default
+  **0.1**).
+- **Coverage.** Omitting `minEligibleTrials` does **not** mean "no minimum": it
+  selects the default floor — every configured trial attempted, and at least one
+  gradeable trial. An explicit `minEligibleTrials: N` *replaces* that floor with
+  `eligibleTrials >= N`, deliberately tolerating unattempted trials.
+- **Every rate carries its own arithmetic** — numerator, denominator, and the
+  exclusions that shrank the denominator. A zero denominator is
+  `state: "notMeasured"` with a `null` value, never a silent pass: an
+  unsatisfiable bound fails from both directions.
+- **A measured case passes at `passRate >= effectivePassThreshold`** (equality
+  passes), and a case with zero eligible trials is `inconclusive` even at
+  threshold 0. If validity holds, every measured case must meet its own
+  threshold for the run to pass.
+- **Lifecycle status and task verdict are orthogonal.** A trial that ran to
+  `completed` with a failing task verdict is normal, graded failure; a
+  lifecycle-`failed` trial has no verdict to grade and is excluded as
+  `executionFailed`. There is no status-to-verdict mapper, on purpose.
+
+Same generation and mirror discipline as the suite file: the draft 2020-12
+schema and its `.ts` twin are generated by
+`npm run generate:eval-verdict-policy-schema -w @mcpjam/sdk` (checked by
+`check:eval-verdict-policy-schema` and by a test), and
+`sdk/tests/fixtures/eval-verdict-policy-parity-fixtures.json` is the canonical
+corpus to be copied verbatim into the backend when the Convex mirror lands —
+including an aggregation cohort that pins the expected output a future producer
+must reproduce.
+
+## Where the code lives
+
+| Area | Location |
+|------|----------|
+| SDK eval primitives | `sdk/src/EvalTest.ts`, `sdk/src/EvalSuite.ts`, `sdk/src/eval-result-mapping.ts` |
+| SDK reporting | `sdk/src/report-eval-results.ts`, `sdk/src/eval-reporting-types.ts`, `sdk/src/upload-eval-artifact.ts` |
+| Predicates | `sdk/src/predicates/` |
+| Run verdict contract | `sdk/src/contract/verdict-policy.ts` (+ generated `eval-verdict-policy.schema.json`) |
+| Host config core | `sdk/src/host-config/` |
+| Ingestion proxy | `mcpjam-inspector/server/routes/v1/eval-ingest.ts` |
+| Suite/case/run routes | `mcpjam-inspector/server/routes/shared/evals.ts` |
+| Hosted runner | `mcpjam-inspector/server/services/evals-runner.ts` |
+| Runner internals | `mcpjam-inspector/server/services/evals/` (`recorder.ts`, `step-handlers.ts`, `iteration-verdict.ts`, `finalize-iteration.ts`, …) |
+| Shared matching logic | `mcpjam-inspector/shared/eval-matching.ts` |
+| Evaluate UI | `mcpjam-inspector/client/src/components/evals/` |
+| CLI commands | `cli/src/commands/eval.ts` |
+
+<Note>
+Earlier revisions of this page documented the pre-consolidation architecture — `/api/mcp/evals/run` routes, the `evals-cli/` execution engine, and backend test generation via `meta-llama`. Those subsystems are retired; consult git history if you need them.
+</Note>
+
+## Resources
+
+- **MCP Specification**: [https://spec.modelcontextprotocol.io](https://spec.modelcontextprotocol.io)
+- **Vercel AI SDK**: [https://sdk.vercel.ai](https://sdk.vercel.ai)
+- **Convex Database**: [https://convex.dev](https://convex.dev)
+
+## Questions?
+
+If you have questions or need help contributing:
+
+1. Check the [GitHub Issues](https://github.com/MCPJam/inspector/issues)
+2. Join our [Discord community](https://discord.gg/JEnDtz8X6z)
+3. Read the main [Contributing Guide](./CONTRIBUTING.md)

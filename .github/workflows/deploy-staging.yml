@@ -1,0 +1,143 @@
+name: Deploy Staging
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inspector-staging
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_APP_URL || 'https://staging.mcpjam.com' }}
+    env:
+      RAILWAY_API_TOKEN: ${{ secrets.RAILWAY_API_TOKEN }}
+      RAILWAY_PROJECT_ID: ${{ vars.RAILWAY_PROJECT_ID }}
+      RAILWAY_INSPECTOR_SERVICE: ${{ vars.RAILWAY_INSPECTOR_SERVICE }}
+      RAILWAY_STAGING_ENVIRONMENT: ${{ vars.RAILWAY_STAGING_ENVIRONMENT }}
+      STAGING_APP_URL: ${{ vars.STAGING_APP_URL || 'https://staging.mcpjam.com' }}
+    steps:
+      - name: Enforce main branch
+        run: |
+          if [ "${GITHUB_REF_NAME}" != "main" ]; then
+            echo "deploy-staging.yml must run from main" >&2
+            exit 1
+          fi
+
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      # Pinned to the same version every other workflow uses. A floating "24"
+      # meant this gate workflow — the one a release requires to be green —
+      # could silently run on a different minor than the release itself.
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24.22.1"
+          cache: npm
+
+      - name: Install dependencies and format
+        working-directory: mcpjam-inspector
+        run: |
+          npm ci
+          npm run prettier-fix
+
+      - name: Install Railway CLI
+        run: npm install -g @railway/cli@4.57.1
+
+      # Lock in the cross-origin allowlists that the staging sandbox needs.
+      # `sandbox-staging.mcpjam.com` is served by this same Railway service
+      # via a host subdomain; its frame-ancestors CSP is built from
+      # `WEB_ALLOWED_ORIGINS` (see `buildFrameAncestors()` in
+      # `server/routes/web/apps.ts`). Without the `mcp-inspector-pr-*`
+      # wildcard, PR previews hosted on Railway can't iframe the staging
+      # sandbox proxy and MCP Apps render blank inside the preview.
+      #
+      # `*` literal in `WEB_ALLOWED_ORIGINS` is safe for CORS — Hono's CORS
+      # middleware does a literal `Array.includes(origin)` against the
+      # request Origin header, so a wildcard entry never matches a real
+      # origin and CORS stays unchanged. The wildcard reaches the
+      # browser-parsed frame-ancestors directive, which DOES support `*`.
+      # `ALLOWED_ORIGINS` (origin-validation middleware) supports the
+      # wildcard via `matchesAllowedOrigin`, gated on
+      # `MCPJAM_ALLOW_WILDCARD_ORIGINS=true`, which is set below. That opt-in
+      # is set HERE rather than by hand on the service: it used to be implied
+      # by `MCPJAM_NONPROD_LOCKDOWN`, which was never actually set on the
+      # staging service, so `getAllowedOrigins()` silently stripped the
+      # wildcard on every boot and preview→staging calls were rejected.
+      #
+      # The two vars use different wildcard shapes intentionally:
+      #   - ALLOWED_ORIGINS uses the tight mid-host pattern so only PR
+      #     previews of this service can hit staging APIs. `matchesAllowedOrigin`
+      #     compiles `*` to `[A-Za-z0-9-]+`, which never crosses `.`.
+      #   - WEB_ALLOWED_ORIGINS uses the leading-`*.` shape because CSP3
+      #     `frame-ancestors` host-source syntax only accepts `*` as a
+      #     leading wildcard before a dot; mid-host wildcards are ignored
+      #     by browsers and would silently 404 every preview iframe.
+      # `MCPJAM_INSPECTOR_PUBLIC_URL` is set here too, because it decides how a
+      # harness reaches its MCP servers. `resolveWebAuthorizedHarnessStrategy()`
+      # reads it to build the `.mcp.json` the in-sandbox agent dials
+      # (`https://<this>/api/web/harness-mcp/...`), and falls back to the RELAY
+      # transport when it is absent or not publicly reachable — a transport
+      # staging has no infrastructure for, so every harness turn with a server
+      # selected dies at tunnel creation. It was previously hand-set on the
+      # service, which meant a rebuild could silently take the whole harness
+      # surface down.
+      - name: Refresh staging origin config
+        run: |
+          .github/scripts/railway-retry.sh .github/scripts/railway-set-vars.sh \
+            -e "$RAILWAY_STAGING_ENVIRONMENT" \
+            -s "$RAILWAY_INSPECTOR_SERVICE" \
+            ALLOWED_ORIGINS="$STAGING_APP_URL,https://mcp-inspector-pr-*.up.railway.app" \
+            WEB_ALLOWED_ORIGINS="$STAGING_APP_URL,https://*.up.railway.app" \
+            MCPJAM_ALLOW_WILDCARD_ORIGINS=true \
+            VITE_ENVIRONMENT=staging \
+            MCPJAM_INSPECTOR_PUBLIC_URL="$STAGING_APP_URL"
+
+      # Capture the most recent deployment id before we trigger a new one so
+      # the wait step below can detect when *our* deploy appears (instead of
+      # racing on the previous-good deploy's status).
+      - name: Snapshot latest deployment id
+        id: previous_deploy
+        run: |
+          PREV=$(.github/scripts/railway-wait-deploy.sh --latest \
+            -s "$RAILWAY_INSPECTOR_SERVICE" \
+            -e "$RAILWAY_STAGING_ENVIRONMENT")
+          echo "id=$PREV" >> "$GITHUB_OUTPUT"
+          echo "Previous deployment: ${PREV:-<none>}"
+
+      # `--detach` uploads and returns immediately. See railway-wait-deploy.sh
+      # for why `--ci`'s build-log stream is not a usable success signal.
+      - name: Deploy inspector to Railway staging
+        run: |
+          .github/scripts/railway-retry.sh railway up \
+            --detach \
+            --project "$RAILWAY_PROJECT_ID" \
+            --environment "$RAILWAY_STAGING_ENVIRONMENT" \
+            --service "$RAILWAY_INSPECTOR_SERVICE"
+
+      - name: Wait for Railway staging deploy to finish
+        timeout-minutes: 20
+        env:
+          PREVIOUS_DEPLOY_ID: ${{ steps.previous_deploy.outputs.id }}
+        run: |
+          .github/scripts/railway-wait-deploy.sh \
+            -s "$RAILWAY_INSPECTOR_SERVICE" \
+            -e "$RAILWAY_STAGING_ENVIRONMENT" \
+            -p "$PREVIOUS_DEPLOY_ID"
+
+  smoke:
+    needs: deploy
+    uses: ./.github/workflows/post-deploy-smoke.yml
+    secrets:
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}

@@ -1,0 +1,1186 @@
+import { ConvexHttpClient } from "convex/browser";
+import { ConvexError } from "convex/values";
+import { describe, expect, it, vi } from "vitest";
+import type { ModelMessage } from "ai";
+import { logger } from "../../../utils/logger";
+import {
+  createSuiteRunRecorder,
+  startSuiteRunWithRecorder,
+} from "../recorder.js";
+
+describe("startSuiteRunWithRecorder", () => {
+  it.each(["pending", "running", "grading", "completed"])("does not prepare iterations again for a replay in %s", async (status) => {
+    const client = new ConvexHttpClient("https://replay.test");
+    const mutation = vi.spyOn(client, "mutation").mockResolvedValue({ runId: "existing-run", testCases: [], deduped: true, status });
+    const action = vi.spyOn(client, "action").mockRejectedValue(new Error("A replay must not reserve usage or finalize the run"));
+    const result = await startSuiteRunWithRecorder({ convexClient: client, suiteId: "suite-1", idempotencyKey: "same-key" });
+    expect(result).toMatchObject({ runId: "existing-run", deduped: true, status });
+    expect(mutation).toHaveBeenCalledTimes(1);
+    expect(action).not.toHaveBeenCalled();
+  });
+  it("forwards the GitHub server replacement and omits undefined overrides", async () => {
+    const action = vi.fn().mockResolvedValue(undefined);
+    const mutation = vi
+      .fn()
+      .mockResolvedValue({ runId: "run-1", testCases: [] });
+    const githubCheckServerOverride = [
+      { serverName: "gh-check-trigger-1", projectServerId: "server-1" },
+    ];
+
+    await startSuiteRunWithRecorder({
+      convexClient: { mutation, action } as any,
+      suiteId: "suite-1",
+      source: "github_check",
+      githubCheckServerOverride,
+    });
+    expect(mutation.mock.calls[0][1]).toMatchObject({
+      source: "github_check",
+      githubCheckServerOverride,
+    });
+    expect(mutation.mock.calls[0][1]).not.toHaveProperty("environmentOverride");
+
+    mutation.mockClear();
+    await startSuiteRunWithRecorder({
+      convexClient: { mutation, action } as any,
+      suiteId: "suite-1",
+    });
+    expect(mutation.mock.calls[0][1]).not.toHaveProperty(
+      "githubCheckServerOverride",
+    );
+  });
+
+  it("forwards per-run import approvals, and omits the key when there are none", async () => {
+    // The mutation args are RECONSTRUCTED field by field in this function, so
+    // a field nobody names here never reaches Convex — and an approval that
+    // never arrives surfaces to the caller as the backend refusing a run they
+    // did approve. Asserting the exact args is the only thing that catches it.
+    const action = vi.fn().mockResolvedValue(undefined);
+    const mutation = vi
+      .fn()
+      .mockResolvedValue({ runId: "run-1", testCases: [] });
+    const convexClient = { mutation, action } as any;
+    const importApprovals = [
+      { testCaseId: "tc-1", reason: "Reviewed against the upstream rubric." },
+    ];
+
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+      importApprovals,
+    });
+    expect(mutation.mock.calls[0][1]).toMatchObject({ importApprovals });
+
+    mutation.mockClear();
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+    });
+    // Absent rather than `[]`: an empty array is a claim ("I approved
+    // nothing"), and the backend reads the two differently.
+    expect("importApprovals" in mutation.mock.calls[0][1]).toBe(false);
+  });
+
+  it("forwards the benchmark parent id that licenses the hidden source", async () => {
+    // Same reconstruction hazard as the approvals above, with a sharper edge:
+    // `startTestSuiteRun` refuses `source: 'benchmark'` unless it also receives
+    // the `benchmarkRunId` of a live parent run (mcpjam-backend#1160). A field
+    // nobody names here never reaches Convex, and dropping THIS one fails every
+    // benchmark child at the mutation.
+    const action = vi.fn().mockResolvedValue(undefined);
+    const mutation = vi
+      .fn()
+      .mockResolvedValue({ runId: "run-1", testCases: [] });
+    const convexClient = { mutation, action } as any;
+
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+      source: "benchmark",
+      benchmarkRunId: "brun-1",
+    });
+    expect(mutation.mock.calls[0][1]).toMatchObject({
+      source: "benchmark",
+      benchmarkRunId: "brun-1",
+    });
+
+    mutation.mockClear();
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+      source: "api",
+    });
+    // Meaningless without the hidden source, so it is absent rather than
+    // `undefined` — the mutation takes an id, not a placeholder.
+    expect("benchmarkRunId" in mutation.mock.calls[0][1]).toBe(false);
+  });
+
+  it("forwards tool snapshot metadata when creating a suite run", async () => {
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        runId: "run-1",
+        testCases: [
+          {
+            _id: "tc-1",
+            title: "Bootstrap search",
+            query: "Search for yesterday's tasks",
+            model: "gpt-5",
+            provider: "openai",
+            runs: 1,
+            intent: "Bootstrap task search",
+            steps: [
+              {
+                id: "s1",
+                kind: "prompt",
+                prompt: "Search for yesterday's tasks",
+              },
+            ],
+            expectedToolCalls: [
+              {
+                toolName: "bootstrap",
+                arguments: {},
+              },
+            ],
+          },
+        ],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    const convexClient = {
+      mutation: mutationMock,
+      action: actionMock,
+    } as any;
+
+    const toolSnapshot = {
+      version: 1,
+      capturedAt: 123,
+      servers: [
+        {
+          serverId: "alpha",
+          tools: [
+            {
+              name: "bootstrap",
+              description: "Call this before using search.",
+              inputSchema: {
+                type: "object",
+                $schema: "https://json-schema.org/draft/2020-12/schema",
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const toolSnapshotDebug = {
+      captureResult: {
+        status: "complete",
+        serverCount: 1,
+        toolCount: 1,
+        failedServerCount: 0,
+        failedServerIds: [],
+      },
+      promptSection: "# Available MCP Tools",
+      promptSectionTruncated: false,
+      promptSectionMaxChars: 30000,
+      fallbackReason: null,
+      fullSnapshot: toolSnapshot,
+    };
+    const sanitizedToolSnapshot = {
+      version: 1,
+      capturedAt: 123,
+      servers: [
+        {
+          serverId: "alpha",
+          tools: [
+            {
+              name: "bootstrap",
+              description: "Call this before using search.",
+              inputSchema: {
+                type: "object",
+                __convexReserved__schema:
+                  "https://json-schema.org/draft/2020-12/schema",
+              },
+            },
+          ],
+        },
+      ],
+    };
+    const sanitizedToolSnapshotDebug = {
+      captureResult: {
+        status: "complete",
+        serverCount: 1,
+        toolCount: 1,
+        failedServerCount: 0,
+        failedServerIds: [],
+      },
+      promptSection: "# Available MCP Tools",
+      promptSectionTruncated: false,
+      promptSectionMaxChars: 30000,
+      fallbackReason: null,
+      fullSnapshot: sanitizedToolSnapshot,
+    };
+
+    const result = await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+      toolSnapshot,
+      toolSnapshotDebug,
+    });
+
+    expect(mutationMock).toHaveBeenNthCalledWith(
+      1,
+      "testSuites:startTestSuiteRun",
+      expect.objectContaining({
+        suiteId: "suite-1",
+        toolSnapshot: sanitizedToolSnapshot,
+        toolSnapshotDebug: sanitizedToolSnapshotDebug,
+      }),
+    );
+    expect(actionMock).toHaveBeenCalledWith(
+      "testSuites:startSuiteRunIterations",
+      { runId: "run-1" },
+    );
+    expect(result).toEqual(
+      expect.objectContaining({
+        runId: "run-1",
+        suiteId: "suite-1",
+        config: {
+          tests: [
+            {
+              title: "Bootstrap search",
+              query: "Search for yesterday's tasks",
+              model: "gpt-5",
+              provider: "openai",
+              runs: 1,
+              intent: "Bootstrap task search",
+              expectedToolCalls: [
+                {
+                  toolName: "bootstrap",
+                  arguments: {},
+                },
+              ],
+              isNegativeTest: undefined,
+              expectedOutput: undefined,
+              steps: [
+                {
+                  id: "s1",
+                  kind: "prompt",
+                  prompt: "Search for yesterday's tasks",
+                },
+              ],
+              advancedConfig: undefined,
+              testCaseId: "tc-1",
+            },
+          ],
+          environment: {
+            servers: ["alpha"],
+          },
+        },
+      }),
+    );
+  });
+
+  it.each(["local", "hosted"] as const)("uses the backend's frozen %s venue for fresh and deduped runs", async (venue) => {
+    for (const deduped of [false, true]) {
+      const result = await startSuiteRunWithRecorder({
+        convexClient: { mutation: vi.fn().mockResolvedValue({
+          runId: "run-1", testCases: [], deduped, status: "running",
+          configSnapshot: { environment: { servers: [] }, executionVenue: venue },
+        }), action: vi.fn() } as any,
+        suiteId: "suite-1", serverIds: [], runtimeVenue: venue === "local" ? "hosted" : "local",
+      });
+      expect(result.harnessRuntimeVenue).toBe(venue);
+    }
+  });
+
+  it("runs against the environment Convex snapshotted for the suite run", async () => {
+    const snapshotEnvironment = {
+      servers: ["friendly-server-name"],
+      serverBindings: [
+        {
+          serverName: "friendly-server-name",
+          projectServerId: "project-server-id",
+        },
+      ],
+    };
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        runId: "run-1",
+        configSnapshot: {
+          environment: snapshotEnvironment,
+        },
+        testCases: [
+          {
+            _id: "tc-1",
+            title: "Snapshot server",
+            query: "Use the pinned server",
+            model: "gpt-5",
+            provider: "openai",
+            runs: 1,
+            expectedToolCalls: [],
+          },
+        ],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    const result = await startSuiteRunWithRecorder({
+      convexClient: { mutation: mutationMock, action: actionMock } as any,
+      suiteId: "suite-1",
+      serverIds: ["request-server"],
+    });
+
+    expect(result.config.environment).toEqual(snapshotEnvironment);
+  });
+
+  it("forwards all three environment preconditions to the start mutation", async () => {
+    // The revision alone does not make an environment launch atomic: the env
+    // pins a hostId (not a config) and optionally an attachment, both
+    // dereferenced live, so a host rotation or server-group edit drifts the
+    // resolution at an UNCHANGED revision. All three echoes must reach Convex
+    // or that drift is undetectable.
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockResolvedValueOnce({ runId: "run-1", testCases: [] })
+      .mockResolvedValueOnce(undefined);
+
+    await startSuiteRunWithRecorder({
+      convexClient: { mutation: mutationMock, action: actionMock } as any,
+      suiteId: "suite-1",
+      serverIds: ["ps_1", "ps_plugin"],
+      environmentId: "env-1",
+      expectedEnvironmentRevision: 4,
+      expectedEnvironmentHostConfigId: "hc_1",
+      expectedEnvironmentServerIds: ["ps_1", "ps_plugin"],
+    });
+
+    expect(mutationMock).toHaveBeenNthCalledWith(
+      1,
+      "testSuites:startTestSuiteRun",
+      expect.objectContaining({
+        environmentId: "env-1",
+        expectedEnvironmentRevision: 4,
+        expectedEnvironmentHostConfigId: "hc_1",
+        expectedEnvironmentServerIds: ["ps_1", "ps_plugin"],
+      }),
+    );
+  });
+
+  it("omits the environment preconditions entirely for a non-environment run", async () => {
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockResolvedValueOnce({ runId: "run-1", testCases: [] })
+      .mockResolvedValueOnce(undefined);
+
+    await startSuiteRunWithRecorder({
+      convexClient: { mutation: mutationMock, action: actionMock } as any,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+    });
+
+    const args = mutationMock.mock.calls[0][1];
+    expect(args).not.toHaveProperty("environmentId");
+    expect(args).not.toHaveProperty("expectedEnvironmentRevision");
+    expect(args).not.toHaveProperty("expectedEnvironmentHostConfigId");
+    expect(args).not.toHaveProperty("expectedEnvironmentServerIds");
+  });
+
+  it("translates a host-drift rejection into the 409 that names the cause", async () => {
+    const { ConvexError } = await import("convex/values");
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockRejectedValueOnce(new ConvexError({ code: "ENV_HOST_DRIFT" }));
+
+    await expect(
+      startSuiteRunWithRecorder({
+        convexClient: { mutation: mutationMock, action: actionMock } as any,
+        suiteId: "suite-1",
+        serverIds: ["ps_1"],
+        environmentId: "env-1",
+        expectedEnvironmentRevision: 4,
+        expectedEnvironmentHostConfigId: "hc_1",
+        expectedEnvironmentServerIds: ["ps_1"],
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringMatching(/host or server group changed/i),
+    });
+  });
+
+  it("translates a revision conflict even when only the drift echoes were sent", async () => {
+    // The gate is "any echo present", not "revision present" — a launch that
+    // echoed only host config / servers still needs its conflict translated
+    // rather than surfacing as a raw 500.
+    const { ConvexError } = await import("convex/values");
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ConvexError({ code: "ENV_REVISION_CONFLICT" }),
+      );
+
+    await expect(
+      startSuiteRunWithRecorder({
+        convexClient: { mutation: mutationMock, action: actionMock } as any,
+        suiteId: "suite-1",
+        serverIds: ["ps_1"],
+        environmentId: "env-1",
+        expectedEnvironmentHostConfigId: "hc_1",
+      }),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("translates ENV_MODEL_REQUIRED into a branchable 409, with no echoes sent", async () => {
+    // The backend refuses a headless launch whose environment resolves to no
+    // model. Untranslated it reaches the caller as a bare Convex rejection —
+    // reading as an internal fault rather than the one-field misconfiguration
+    // it is. NOT gated on the drift echoes: this refusal is a property of the
+    // environment itself, not of a precondition we sent.
+    const { ConvexError } = await import("convex/values");
+    const actionMock = vi.fn().mockResolvedValue(undefined);
+    const mutationMock = vi.fn().mockRejectedValueOnce(
+      new ConvexError({
+        code: "ENV_MODEL_REQUIRED",
+        message: 'Environment "Prod" has no model to run.',
+        details: { environmentId: "env-1", hostId: "h1" },
+      }),
+    );
+
+    await expect(
+      startSuiteRunWithRecorder({
+        convexClient: { mutation: mutationMock, action: actionMock } as any,
+        suiteId: "suite-1",
+        serverIds: ["ps_1"],
+        environmentId: "env-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: 'Environment "Prod" has no model to run.',
+      details: {
+        code: "ENV_MODEL_REQUIRED",
+        environmentId: "env-1",
+        // The same slug the v1 environments resolve route emits, so a caller
+        // branching on `details.reason` gets one answer from either surface.
+        reason: "environment_model_required",
+      },
+    });
+  });
+
+  it("forwards a rerun's lineage only when one is asked for", async () => {
+    const action = vi.fn().mockResolvedValue(undefined);
+    const mutation = vi
+      .fn()
+      .mockResolvedValue({ runId: "run-1", testCases: [] });
+    const convexClient = { mutation, action } as any;
+
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      replayedFromRunId: "source-run",
+      rerunOfRunId: "source-run",
+      rerunScope: "failed_cases",
+    });
+    expect(mutation.mock.calls[0][1]).toMatchObject({
+      replayedFromRunId: "source-run",
+      rerunOfRunId: "source-run",
+      rerunScope: "failed_cases",
+    });
+
+    mutation.mockClear();
+    await startSuiteRunWithRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      replayedFromRunId: "source-run",
+    });
+    // An ordinary replay sends exactly the args it always sent.
+    expect(mutation.mock.calls[0][1]).not.toHaveProperty("rerunOfRunId");
+    expect(mutation.mock.calls[0][1]).not.toHaveProperty("rerunScope");
+  });
+
+  it.each([
+    ["RERUN_NOTHING_TO_RERUN", 409],
+    ["RERUN_SOURCE_NOT_TERMINAL", 409],
+    ["RERUN_SOURCE_SUITE_MISMATCH", 400],
+  ])(
+    "translates a %s rerun refusal into a %i naming the reason",
+    async (code, status) => {
+      const { ConvexError } = await import("convex/values");
+      const mutation = vi
+        .fn()
+        .mockRejectedValueOnce(
+          new ConvexError({ code, message: "The backend says why." }),
+        );
+      await expect(
+        startSuiteRunWithRecorder({
+          convexClient: { mutation, action: vi.fn() } as any,
+          suiteId: "suite-1",
+          replayedFromRunId: "source-run",
+          rerunOfRunId: "source-run",
+          rerunScope: "failed_cases",
+        }),
+      ).rejects.toMatchObject({
+        status,
+        message: "The backend says why.",
+        details: { reason: code },
+      });
+    },
+  );
+
+  it("marks the suite run failed when iteration precreate fails", async () => {
+    // The precreate is an ACTION now, so the failure under test belongs to it.
+    const actionMock = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("validation exploded"));
+    const mutationMock = vi
+      .fn()
+      .mockResolvedValueOnce({
+        runId: "run-1",
+        testCases: [
+          {
+            _id: "tc-1",
+            title: "Broken setup",
+            query: "Try setup",
+            model: "gpt-5",
+            provider: "openai",
+            runs: 1,
+            expectedToolCalls: [],
+          },
+        ],
+      })
+      .mockResolvedValueOnce(undefined);
+
+    const failure = await startSuiteRunWithRecorder({
+      convexClient: { mutation: mutationMock, action: actionMock } as any,
+      suiteId: "suite-1",
+      serverIds: ["alpha"],
+    }).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Error);
+    expect((failure as Error).message).toBe(
+      "Could not start eval because MCPJam failed to prepare the test attempts. Try again.",
+    );
+    // The failure text is recorded on the run and logged; the response
+    // carries only the run id (MJ-020, MJ-021).
+    expect((failure as { details?: unknown }).details).toEqual({
+      runId: "run-1",
+    });
+
+    expect(actionMock).toHaveBeenCalledWith(
+      "testSuites:startSuiteRunIterations",
+      { runId: "run-1" },
+    );
+    expect(mutationMock).toHaveBeenNthCalledWith(
+      2,
+      "testSuites:markSetupPendingIterationsFailed",
+      { runId: "run-1", error: "validation exploded" },
+    );
+    // One lower than before: the precreate left the mutation sequence.
+    expect(mutationMock).toHaveBeenNthCalledWith(
+      3,
+      "testSuites:updateTestSuiteRun",
+      {
+        runId: "run-1",
+        status: "failed",
+        summary: undefined,
+        notes: "Failed to prepare eval test attempts.",
+      },
+    );
+  });
+
+  it.each([
+    // A budget refusal has no retry time, so it is not a 429: the v1 spec
+    // promises `Retry-After` on every 429.
+    ["PLATFORM_FEE_REQUIRED", 403, "FORBIDDEN", "reason"],
+    ["ORGANIZATION_SPEND_BUDGET_REACHED", 403, "FORBIDDEN", "reason"],
+    ["billing_limit_reached", 402, "BILLING_LIMIT_REACHED", "code"],
+    ["org_keys_required", 403, "FORBIDDEN", "code"],
+  ])(
+    "answers the %s precreate refusal with a %i, without paging",
+    async (backendCode, status, code, detailsKey) => {
+      const { ConvexError } = await import("convex/values");
+      const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+      const warnSpy = vi.spyOn(logger, "warn").mockImplementation(() => {});
+      const action = vi.fn().mockRejectedValueOnce(
+        new ConvexError({
+          code: backendCode,
+          message: "The backend says why.",
+        }),
+      );
+      const mutation = vi
+        .fn()
+        .mockResolvedValueOnce({ runId: "run-1", testCases: [] })
+        .mockResolvedValue(undefined);
+
+      try {
+        await expect(
+          startSuiteRunWithRecorder({
+            convexClient: { mutation, action } as any,
+            suiteId: "suite-1",
+          }),
+        ).rejects.toMatchObject({
+          status,
+          code,
+          message: "The backend says why.",
+          details: { [detailsKey]: backendCode },
+        });
+
+        expect(errorSpy).not.toHaveBeenCalled();
+        expect(warnSpy).toHaveBeenCalledWith(
+          "[evals] Suite run iterations refused",
+          expect.objectContaining({
+            runId: "run-1",
+            status,
+            reason: backendCode,
+          }),
+        );
+        // A refused run still ends failed rather than pending.
+        expect(mutation).toHaveBeenCalledWith(
+          "testSuites:updateTestSuiteRun",
+          expect.objectContaining({ runId: "run-1", status: "failed" }),
+        );
+      } finally {
+        errorSpy.mockRestore();
+        warnSpy.mockRestore();
+      }
+    },
+  );
+
+  it("answers a run start refused over the spend budget with a 403", async () => {
+    const { ConvexError } = await import("convex/values");
+    const action = vi.fn();
+    const mutation = vi.fn().mockRejectedValueOnce(
+      new ConvexError({
+        code: "ORGANIZATION_SPEND_BUDGET_REACHED",
+        message: "The backend says why.",
+      }),
+    );
+
+    await expect(
+      startSuiteRunWithRecorder({
+        convexClient: { mutation, action } as any,
+        suiteId: "suite-1",
+      }),
+    ).rejects.toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      message: "The backend says why.",
+      details: { reason: "ORGANIZATION_SPEND_BUDGET_REACHED" },
+    });
+    // Refused before the run row exists, so nothing is pre-created.
+    expect(action).not.toHaveBeenCalled();
+  });
+
+  it("keeps PLATFORM_FEE_UNAVAILABLE on the retryable 500 path", async () => {
+    const { ConvexError } = await import("convex/values");
+    const errorSpy = vi.spyOn(logger, "error").mockImplementation(() => {});
+    const action = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new ConvexError({ code: "PLATFORM_FEE_UNAVAILABLE" }),
+      );
+    const mutation = vi
+      .fn()
+      .mockResolvedValueOnce({ runId: "run-1", testCases: [] })
+      .mockResolvedValue(undefined);
+
+    try {
+      await expect(
+        startSuiteRunWithRecorder({
+          convexClient: { mutation, action } as any,
+          suiteId: "suite-1",
+        }),
+      ).rejects.toMatchObject({ status: 500, details: { runId: "run-1" } });
+      expect(errorSpy).toHaveBeenCalled();
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+});
+
+describe("createSuiteRunRecorder", () => {
+  it("does not delay result persistence when runtime timing writes hang", async () => {
+    vi.useFakeTimers();
+    try {
+      const query = vi.fn(async (ref: string) => {
+        if (ref === "testSuites:getTestSuiteRun") return { status: "running" };
+        if (ref === "testSuites:getTestSuiteRunDetails") {
+          return {
+            iterations: [
+              { _id: "iter1", testCaseId: "tc1", iterationNumber: 1 },
+            ],
+          };
+        }
+        if (ref === "testSuites:getTestIteration") {
+          return { status: "running" };
+        }
+        throw new Error(`unexpected query ${ref}`);
+      });
+      const mutation = vi.fn((ref: string) => {
+        if (
+          ref === "testSuites:recordEvalIterationRuntimeStart" ||
+          ref === "testSuites:recordEvalIterationRuntimeEnd"
+        ) {
+          return new Promise(() => {});
+        }
+        return Promise.resolve(undefined);
+      });
+      const action = vi.fn(async (ref: string) => {
+        if (ref === "testSuites:appendEvalTurnTrace") {
+          return { skipped: false };
+        }
+        if (ref === "testSuites:updateTestIteration") return {};
+        if (ref === "testSuites:lockEvalSession") {
+          return { skipped: false, locked: true, alreadyLocked: false };
+        }
+        throw new Error(`unexpected action ${ref}`);
+      });
+      const recorder = createSuiteRunRecorder({
+        convexClient: { query, mutation, action } as any,
+        suiteId: "suite-1",
+        runId: "run-1",
+      });
+
+      await recorder.beginExecutionAttempt?.({
+        caseCount: 1,
+        repetitionCount: 1,
+        renderConcurrencyLimit: 2,
+        modelIdentifiers: [],
+      });
+      const iterationId = await recorder.startIteration({
+        testCaseId: "tc1",
+        iterationNumber: 1,
+        startedAt: Date.now(),
+      });
+      await recorder.finishIteration({
+        iterationId,
+        passed: true,
+        status: "completed",
+        toolsCalled: [],
+        usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+        messages: [{ role: "user", content: "hi" } as ModelMessage],
+      });
+
+      expect(action).toHaveBeenCalledWith(
+        "testSuites:updateTestIteration",
+        expect.any(Object),
+      );
+      await vi.advanceTimersByTimeAsync(2_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps execution available when runtime telemetry cannot start", async () => {
+    const query = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:getTestSuiteRun") return { status: "running" };
+      if (ref === "testSuites:getTestSuiteRunDetails") {
+        return {
+          iterations: [{ _id: "iter1", testCaseId: "tc1", iterationNumber: 1 }],
+        };
+      }
+      throw new Error(`unexpected query ${ref}`);
+    });
+    const mutation = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:beginEvalRuntimeAttempt") {
+        throw new Error("telemetry unavailable");
+      }
+      return undefined;
+    });
+    const recorder = createSuiteRunRecorder({
+      convexClient: { query, mutation } as any,
+      suiteId: "suite-1",
+      runId: "run-1",
+    });
+
+    await expect(
+      recorder.beginExecutionAttempt?.({
+        caseCount: 1,
+        repetitionCount: 1,
+        renderConcurrencyLimit: 2,
+        modelIdentifiers: [],
+      }),
+    ).resolves.toBeUndefined();
+    await expect(
+      recorder.startIteration({
+        testCaseId: "tc1",
+        iterationNumber: 1,
+        startedAt: Date.now(),
+      }),
+    ).resolves.toBe("iter1");
+    expect(
+      mutation.mock.calls.some(
+        ([ref]) => ref === "testSuites:recordEvalIterationRuntimeStart",
+      ),
+    ).toBe(false);
+  });
+
+  it("records one attempt and closes timing before uploading iteration results", async () => {
+    const query = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:getTestSuiteRun") return { status: "running" };
+      if (ref === "testSuites:getTestSuiteRunDetails") {
+        return {
+          iterations: [{ _id: "iter1", testCaseId: "tc1", iterationNumber: 1 }],
+        };
+      }
+      if (ref === "testSuites:getTestIteration") return { status: "running" };
+      throw new Error(`unexpected query ${ref}`);
+    });
+    const mutation = vi.fn(async () => undefined);
+    const action = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:appendEvalTurnTrace") return { skipped: false };
+      if (ref === "testSuites:updateTestIteration") return {};
+      if (ref === "testSuites:lockEvalSession") {
+        return { skipped: false, locked: true, alreadyLocked: false };
+      }
+      throw new Error(`unexpected action ${ref}`);
+    });
+    const recorder = createSuiteRunRecorder({
+      convexClient: { query, mutation, action } as any,
+      suiteId: "suite-1",
+      runId: "run-1",
+    });
+
+    await recorder.beginExecutionAttempt?.({
+      caseCount: 1,
+      repetitionCount: 1,
+      renderConcurrencyLimit: 2,
+      modelIdentifiers: [{ provider: "openai", model: "gpt-5" }],
+    });
+    const iterationId = await recorder.startIteration({
+      testCaseId: "tc1",
+      iterationNumber: 1,
+      startedAt: Date.now(),
+      executionType: "model",
+    });
+    await recorder.finishIteration({
+      iterationId,
+      passed: true,
+      status: "completed",
+      toolsCalled: [],
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      messages: [{ role: "user", content: "hi" } as ModelMessage],
+    });
+    await recorder.finalize({ status: "completed" });
+
+    const refs = mutation.mock.calls.map(([ref]) => ref);
+    expect(refs).toContain("testSuites:beginEvalRuntimeAttempt");
+    expect(refs).toContain("testSuites:recordEvalIterationRuntimeStart");
+    expect(refs).toContain("testSuites:recordEvalIterationRuntimeEnd");
+    expect(refs).toContain("testSuites:finalizeEvalRuntimeAttempt");
+    expect(refs.indexOf("testSuites:finalizeEvalRuntimeAttempt")).toBeLessThan(
+      refs.indexOf("testSuites:updateTestSuiteRun"),
+    );
+    const endCall = mutation.mock.calls.find(
+      ([ref]) => ref === "testSuites:recordEvalIterationRuntimeEnd",
+    );
+    expect(endCall?.[1]).toMatchObject({
+      iterationId: "iter1",
+      executionType: "model",
+      executionOutcome: "completed",
+    });
+    expect((endCall?.[1] as any).endOffsetMs).toBeGreaterThanOrEqual(
+      (endCall?.[1] as any).startOffsetMs,
+    );
+  });
+
+  describe("pairing the pre-created row", () => {
+    const backendSnapshot = (model: string) => ({
+      title: "Case",
+      // The backend stores the case's first prompt, wherever it sits.
+      query: "Say OK.",
+      model,
+      provider: "anthropic",
+    });
+    const startWith = async (
+      iterations: unknown[],
+      args: Parameters<
+        ReturnType<typeof createSuiteRunRecorder>["startIteration"]
+      >[0],
+    ) => {
+      const query = vi.fn(async (ref: string) => {
+        if (ref === "testSuites:getTestSuiteRunDetails") return { iterations };
+        throw new Error(`unexpected query ${ref}`);
+      });
+      const mutation = vi.fn(async () => undefined);
+      const recorder = createSuiteRunRecorder({
+        convexClient: { query, mutation } as any,
+        suiteId: "suite-1",
+        runId: "run-1",
+      });
+      return { iterationId: await recorder.startIteration(args), mutation };
+    };
+
+    it("pairs a case that starts with a tool call, whose query the runner synthesizes", async () => {
+      const { iterationId, mutation } = await startWith(
+        [
+          {
+            _id: "iter-sonnet",
+            testCaseId: "tc1",
+            iterationNumber: 1,
+            testCaseSnapshot: backendSnapshot("claude-sonnet-4.5"),
+          },
+          {
+            _id: "iter-haiku",
+            testCaseId: "tc1",
+            iterationNumber: 1,
+            testCaseSnapshot: backendSnapshot("claude-haiku-4.5"),
+          },
+        ],
+        {
+          testCaseId: "tc1",
+          testCaseSnapshot: {
+            ...backendSnapshot("claude-haiku-4.5"),
+            query: 'Pinned tool call: read_me on "excalidraw"',
+            expectedToolCalls: [],
+          },
+          iterationNumber: 1,
+          startedAt: Date.now(),
+        },
+      );
+
+      expect(iterationId).toBe("iter-haiku");
+      expect(mutation).toHaveBeenCalledWith("testSuites:startTestIteration", {
+        iterationId: "iter-haiku",
+      });
+    });
+
+    it("pairs each of two cases with the same title and prompt with its own row", async () => {
+      const { iterationId } = await startWith(
+        [
+          {
+            _id: "iter-a",
+            testCaseId: "tc-a",
+            iterationNumber: 1,
+            testCaseSnapshot: backendSnapshot("claude-haiku-4.5"),
+          },
+          {
+            _id: "iter-b",
+            testCaseId: "tc-b",
+            iterationNumber: 1,
+            testCaseSnapshot: backendSnapshot("claude-haiku-4.5"),
+          },
+        ],
+        {
+          testCaseId: "tc-b",
+          testCaseSnapshot: {
+            ...backendSnapshot("claude-haiku-4.5"),
+            expectedToolCalls: [],
+          },
+          iterationNumber: 1,
+          startedAt: Date.now(),
+        },
+      );
+
+      expect(iterationId).toBe("iter-b");
+    });
+
+    it("keeps pairing rows without a case id by snapshot, as replays of SDK runs create them", async () => {
+      const { iterationId } = await startWith(
+        [
+          {
+            _id: "iter-first",
+            iterationNumber: 1,
+            testCaseSnapshot: {
+              ...backendSnapshot("claude-haiku-4.5"),
+              title: "First",
+            },
+          },
+          {
+            _id: "iter-second",
+            iterationNumber: 1,
+            testCaseSnapshot: {
+              ...backendSnapshot("claude-haiku-4.5"),
+              title: "Second",
+            },
+          },
+        ],
+        {
+          testCaseSnapshot: {
+            ...backendSnapshot("claude-haiku-4.5"),
+            title: "Second",
+            expectedToolCalls: [],
+          },
+          iterationNumber: 1,
+          startedAt: Date.now(),
+        },
+      );
+
+      expect(iterationId).toBe("iter-second");
+    });
+
+    it("pairs the requested iteration of the case", async () => {
+      const row = (id: string, iterationNumber: number) => ({
+        _id: id,
+        testCaseId: "tc1",
+        iterationNumber,
+        testCaseSnapshot: backendSnapshot("claude-haiku-4.5"),
+      });
+      const { iterationId } = await startWith(
+        [row("iter-1", 1), row("iter-2", 2)],
+        {
+          testCaseId: "tc1",
+          testCaseSnapshot: {
+            ...backendSnapshot("claude-haiku-4.5"),
+            expectedToolCalls: [],
+          },
+          iterationNumber: 2,
+          startedAt: Date.now(),
+        },
+      );
+
+      expect(iterationId).toBe("iter-2");
+    });
+
+    it("tells apart one model configured under two providers", async () => {
+      const row = (id: string, provider: string) => ({
+        _id: id,
+        testCaseId: "tc1",
+        iterationNumber: 1,
+        testCaseSnapshot: { ...backendSnapshot("gpt-4o"), provider },
+      });
+      const { iterationId } = await startWith(
+        [row("iter-openai", "openai"), row("iter-azure", "azure")],
+        {
+          testCaseId: "tc1",
+          testCaseSnapshot: {
+            ...backendSnapshot("gpt-4o"),
+            provider: "azure",
+            expectedToolCalls: [],
+          },
+          iterationNumber: 1,
+          startedAt: Date.now(),
+        },
+      );
+
+      expect(iterationId).toBe("iter-azure");
+    });
+
+    it("pairs nothing when neither the test nor the row has a case id", async () => {
+      const { iterationId } = await startWith(
+        [
+          {
+            _id: "other-case",
+            iterationNumber: 1,
+            testCaseSnapshot: backendSnapshot("claude-haiku-4.5"),
+          },
+        ],
+        { iterationNumber: 1, startedAt: Date.now() },
+      );
+
+      expect(iterationId).toBeUndefined();
+    });
+  });
+
+  it("treats a run whose details answer null as deleted, without logging a pairing miss", async () => {
+    // A deleted run answers null (PLB-52) rather than throwing "not found".
+    const query = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:getTestSuiteRunDetails") return null;
+      throw new Error(`unexpected query ${ref}`);
+    });
+    const recorder = createSuiteRunRecorder({
+      convexClient: { query, mutation: vi.fn() } as any,
+      suiteId: "suite-1",
+      runId: "run-1",
+    });
+    const errorSpy = vi.spyOn(logger, "error");
+    const start = () =>
+      recorder.startIteration({
+        testCaseId: "tc1",
+        iterationNumber: 1,
+        startedAt: Date.now(),
+      });
+
+    expect(await start()).toBeUndefined();
+    expect(await start()).toBeUndefined();
+    const pairingMisses = errorSpy.mock.calls.filter(
+      ([message]) =>
+        message === "[evals] Could not find pre-created iteration for",
+    );
+    errorSpy.mockRestore();
+
+    expect(pairingMisses).toHaveLength(0);
+    expect(recorder.isRunDeleted?.()).toBe(true);
+    expect(query).toHaveBeenCalledTimes(1);
+  });
+
+  it("flips runDeleted when finishIteration's shared finalize sees 'not found', short-circuiting subsequent startIteration", async () => {
+    // Pre-check getTestIteration returns running; updateTestIteration throws
+    // "not found" → shared finalizeEvalIteration fires `onRunDeleted` →
+    // recorder's `runDeleted` flag flips → next `startIteration` no-ops
+    // without ever querying Convex.
+    const query = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:getTestIteration") {
+        return { status: "running" };
+      }
+      throw new Error(`unexpected query ${ref}`);
+    });
+    const action = vi.fn(async (ref: string) => {
+      if (ref === "testSuites:appendEvalTurnTrace") {
+        return { skipped: false };
+      }
+      if (ref === "testSuites:updateTestIteration") {
+        throw new Error("iteration not found");
+      }
+      if (ref === "testSuites:lockEvalSession") {
+        return { skipped: false, locked: true, alreadyLocked: false };
+      }
+      throw new Error(`unexpected action ${ref}`);
+    });
+    const mutation = vi.fn();
+    const convexClient = { query, action, mutation } as any;
+
+    const recorder = createSuiteRunRecorder({
+      convexClient,
+      suiteId: "suite-1",
+      runId: "run-1",
+    });
+
+    await recorder.finishIteration({
+      iterationId: "iter1",
+      passed: true,
+      status: "completed",
+      toolsCalled: [],
+      usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+      messages: [{ role: "user", content: "hi" } as ModelMessage],
+    });
+
+    // The action threw "not found"; the runDeleted callback should have
+    // fired. Confirm by calling startIteration and asserting it
+    // short-circuits (no Convex calls).
+    const queryCallsBefore = query.mock.calls.length;
+    const mutationCallsBefore = mutation.mock.calls.length;
+    const result = await recorder.startIteration({
+      testCaseId: "tc1",
+      iterationNumber: 1,
+      startedAt: Date.now(),
+    });
+    expect(result).toBeUndefined();
+    expect(query.mock.calls.length).toBe(queryCallsBefore);
+    expect(mutation.mock.calls.length).toBe(mutationCallsBefore);
+  });
+});
+
+
+it("answers a capacity refusal without retrying admission or starting work", async () => {
+  const client = new ConvexHttpClient("https://capacity.test");
+  const mutation = vi.spyOn(client, "mutation").mockRejectedValue(new ConvexError({
+    kind: "at_capacity", resource: "eval_runs", message: "Eval capacity reached. Try again after another eval finishes.",
+  }));
+  const action = vi.spyOn(client, "action");
+  await expect(startSuiteRunWithRecorder({ convexClient: client, suiteId: "suite-1" })).rejects.toMatchObject({
+    status: 429, code: "RATE_LIMITED",
+    headers: { "Retry-After": "1" },
+    details: { code: "at_capacity", resource: "eval_runs", retryAfterMs: 1000 },
+  });
+  expect(mutation).toHaveBeenCalledTimes(1);
+  expect(action).not.toHaveBeenCalled();
+});

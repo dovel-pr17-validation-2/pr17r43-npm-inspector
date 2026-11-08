@@ -1,0 +1,2517 @@
+import { admitWarmChatManager, isWarmChatManager, warmApprovalBindings } from "../../../utils/harness/warm-approval-binding";
+import { assertPendingPolicy, nativePolicyDigest, stampNativeForwardingPolicy } from "../../../utils/harness/forwarding/native-policy";
+import { getManagerResourceSnapshot, setManagerResourceHostConfig } from "../../../utils/mcp-connections";
+import { taskOwnerScope } from "../../../../shared/task-owner.js";
+import { taskConnectionKey } from "../../../utils/task-connection-key.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const {
+  mcpClientManagerMock,
+  disconnectAllServersMock,
+  localRefreshMock,
+  admissionMock,
+  mintXaaMock,
+} = vi.hoisted(() => ({
+  mcpClientManagerMock: vi.fn(),
+  disconnectAllServersMock: vi.fn(),
+  localRefreshMock: vi.fn(),
+  admissionMock: vi.fn(({ fetch }) => fetch),
+  mintXaaMock: vi.fn(),
+}));
+
+vi.mock("../../../utils/mcp-backpressure.js", () => ({ hostedMcpBackpressureFetch: admissionMock }));
+
+// The authorization-server round trip belongs to local-oauth-refresh's own
+// tests; here it is mocked so these are about the connect path.
+vi.mock("../../../utils/local-oauth-refresh.js", () => ({
+  refreshTokensAgainstPrivateAuthorizationServer: localRefreshMock,
+}));
+
+// Same for the XAA token exchange: what matters here is how the connect path
+// handles a mint that fails.
+vi.mock("../../../services/xaa-mint.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../services/xaa-mint.js")>()),
+  mintXaaAccessToken: mintXaaMock,
+}));
+
+vi.mock("@mcpjam/sdk", async () => {
+  const actual = await vi.importActual<typeof import("@mcpjam/sdk")>(
+    "@mcpjam/sdk"
+  );
+  return {
+    ...actual,
+    MCPClientManager: mcpClientManagerMock.mockImplementation(function () {
+      return {
+        disconnectAllServers: disconnectAllServersMock,
+      };
+    }),
+  };
+});
+
+import type { Context } from "hono";
+import {
+  createAuthorizedManager,
+  createManualHostedConnection,
+  projectServerSchema,
+  taskCapabilitiesSchema,
+  callerContextFromHono,
+} from "../auth.js";
+import { ErrorCode, WebRouteError } from "../errors.js";
+import { parseChallengeHeader } from "@mcpjam/sdk";
+import { __resetPrivateAuthorizationServerMaterialCacheForTests } from "../../../utils/hosted-oauth-refresh.js";
+import { buildHostConnectionPins } from "../../../services/host-connection-pins.js";
+
+// This device has approved every stdio command: the per-device approval gate
+// has its own suite, local-server-resolver.stdio-approval.test.ts.
+vi.mock("../../../utils/stdio-command-approvals.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../../utils/stdio-command-approvals.js")>()),
+  checkStdioLaunchApproval: async () => ({ approval: "approved" as const }),
+}));
+
+// Faithful Hono Context stub: `get`, `var`, and `set` all read/write the same
+// store (in real Hono `c.get(k)` === `c.var[k]`). The delegated-auth header
+// builder reads `c.get("authMethod")`, so the mock must implement `get`.
+const mockVars: Record<string, unknown> = { requestLogContext: undefined };
+const mockContext = {
+  var: mockVars,
+  get: (key: string) => mockVars[key],
+  set: vi.fn((key: string, value: unknown) => {
+    mockVars[key] = value;
+  }),
+} as unknown as Context;
+
+function fetchUrl(input: Parameters<typeof fetch>[0]): string {
+  return input instanceof Request ? input.url : input.toString();
+}
+
+describe("web auth manager batching", () => {
+  it.each([false, true])("marks headers as reproducible only when the effective OAuth token is stored (stored=%s)", async stored => {
+    global.fetch = vi.fn(async () => Response.json({results: {"server-1": {
+      ok: true, role: "member", accessLevel: "project_member", permissions: {chatOnly: false},
+      ...(stored ? {oauthAccessToken: "stored-token", oauthCredentialId: "saved-account"} : {}),
+      serverConfig: {updatedAt: 123, transportType: "http", url: "https://fixture.example/mcp", useOAuth: true},
+    }}}));
+    const result = await createAuthorizedManager({}, "bearer", "project", ["server-1"], 10_000, {"server-1": "caller-token"}, undefined, {lazyConnect: true});
+    const config = result.authorizedServerConfigs?.["server-1"];
+    if (!config || !("url" in config)) throw Error("Missing HTTP config");
+    expect(new Headers(config.requestInit?.headers).get("authorization")).toBe(`Bearer ${stored ? "stored" : "caller"}-token`);
+    setManagerResourceHostConfig(result.manager, "host-config", "host");
+    expect(getManagerResourceSnapshot(result.manager, "server-1")?.headersReconstructible).toBe(stored);
+  });
+
+  it("binds a paused approval to its actual authorized account even when the server name stays the same", async () => {
+    vi.stubEnv("MCPJAM_HOSTED_WARM_AGENT", "1");
+    vi.stubEnv("MCPJAM_HOSTED_WARM_AGENT_ORG_IDS", "pilot-org");
+    const digest = async (credentialId: string | undefined, token: string, authorizedAt = 7) => {
+      global.fetch = vi.fn(async () => Response.json({organizationId: "pilot-org", results: {"same-server": {
+        ok: true, role: "member", accessLevel: "project_member", permissions: {chatOnly: false},
+        ...(credentialId ? {oauthCredentialId: credentialId, oauthAccessToken: token, oauthCredentialAuthorizedAt: authorizedAt} : {}),
+        serverConfig: {updatedAt: 100, name: "Same label", transportType: "http", useOAuth: true, url: "https://fixture.example/mcp"},
+      }}}));
+      const {manager} = await createAuthorizedManager({}, "bearer", "project", ["same-server"], 1000,
+        {"same-server": token}, undefined, {lazyConnect: true});
+      const bindings = warmApprovalBindings(manager);
+      expect(bindings).toHaveLength(1);
+      expect(JSON.stringify(bindings)).not.toContain(token);
+      return nativePolicyDigest({}, bindings);
+    };
+    try {
+      const original = stampNativeForwardingPolicy({data: {}}, await digest("account-a", "first-access-token"));
+      expect(() => assertPendingPolicy(original, "different-policy")).toThrow();
+      const refreshed = await digest("account-a", "rotated-access-token");
+      expect(() => assertPendingPolicy(original, refreshed)).not.toThrow();
+      for (const next of [await digest("account-b", "other-account-token"), await digest("account-a", "new-auth-token", 8)])
+        expect(() => assertPendingPolicy(original, next)).toThrow("policy has changed");
+      expect(await digest(undefined, "caller-token-a")).not.toBe(await digest(undefined, "caller-token-b"));
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it("admits text-only Playground chats from the signed project and refuses missing or mismatched organizations", async () => {
+    vi.stubEnv("MCPJAM_HOSTED_WARM_AGENT", "1");
+    vi.stubEnv("MCPJAM_HOSTED_WARM_AGENT_ORG_IDS", "pilot-org");
+    try {
+      const {manager} = await createAuthorizedManager({}, "bearer", "project", [], 1000);
+      for (const projectOrg of [undefined, "unrelated"]) {
+        admitWarmChatManager(manager, projectOrg, false);
+        expect(isWarmChatManager(manager)).toBe(false);
+      }
+      admitWarmChatManager(manager, "pilot-org", true);
+      expect(isWarmChatManager(manager)).toBe(false);
+      admitWarmChatManager(manager, "pilot-org", false);
+      expect(isWarmChatManager(manager)).toBe(true);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  const originalFetch = global.fetch;
+  const originalConvexHttpUrl = process.env.CONVEX_HTTP_URL;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.CONVEX_HTTP_URL = "https://example.convex.site";
+    __resetPrivateAuthorizationServerMaterialCacheForTests();
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    if (originalConvexHttpUrl === undefined) {
+      delete process.env.CONVEX_HTTP_URL;
+    } else {
+      process.env.CONVEX_HTTP_URL = originalConvexHttpUrl;
+    }
+  });
+
+  it.each([true, false])(
+    "keeps a persisted modern OAuth server on its wire era with a saved client (browser map=%s)",
+    async (browserMap) => {
+      global.fetch = vi.fn(async () =>
+        Response.json({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              oauthAccessToken: "stored-test-token",
+              serverConfig: {
+                transportType: "http",
+                url: "https://fixture.example/mcp",
+                useOAuth: true,
+                oauthProtocolMode: "2026-07-28",
+                oauthProtocolVersion: "2026-07-28",
+                oauthRegistrationStrategy: "dcr",
+              },
+            },
+          },
+        }),
+      );
+      const hostPins = buildHostConnectionPins(
+        {
+          mcpProfile: {
+            mcpProtocolVersion: "auto",
+            initialize: {
+              clientInfo: { name: "saved-client", version: "1.0" },
+              supportedProtocolVersions: ["2025-11-25"],
+            },
+          },
+        },
+        10_000,
+      );
+      const result = await createAuthorizedManager(
+        {},
+        "bearer",
+        "project",
+        ["server-1"],
+        hostPins.timeoutMs,
+        undefined,
+        undefined,
+        {
+          lazyConnect: true,
+          initializePins: hostPins.initializePins,
+          ...(browserMap
+            ? {
+                mcpProtocolVersionsByServerId: {
+                  "server-1": "2026-07-28" as const,
+                },
+              }
+            : {}),
+        },
+      );
+      expect(result.authorizedServerConfigs?.["server-1"]).toMatchObject({
+        mcpProtocolVersion: "2026-07-28",
+      });
+    },
+  );
+
+  it.each([
+    { label: "Auto does not reuse its last OAuth profile", mode: "auto", useOAuth: true, override: undefined, expected: "2025-11-25" },
+    { label: "legacy rows retain their concrete OAuth profile", mode: undefined, useOAuth: true, override: undefined, expected: "2026-07-28" },
+    { label: "an explicit legacy mode does not reuse a modern profile", mode: "2025-11-25", useOAuth: true, override: undefined, expected: "2025-11-25" },
+    { label: "non-OAuth servers do not reuse OAuth metadata", mode: "2026-07-28", useOAuth: false, override: undefined, expected: "2025-11-25" },
+    { label: "the saved per-server override wins over OAuth and host defaults", mode: "2026-07-28", useOAuth: true, override: "2025-06-18", expected: "2025-06-18" },
+  ] as const)("$label", async ({ mode, useOAuth, override, expected }) => {
+    global.fetch = vi.fn(async () => Response.json({
+      results: {
+        "server-1": {
+          ok: true,
+          role: "member",
+          accessLevel: "project_member",
+          permissions: { chatOnly: false },
+          ...(useOAuth ? { oauthAccessToken: "stored-test-token" } : {}),
+          serverConfig: {
+            transportType: "http",
+            url: "https://fixture.example/mcp",
+            useOAuth,
+            ...(mode !== undefined ? { oauthProtocolMode: mode } : {}),
+            oauthProtocolVersion: "2026-07-28",
+          },
+        },
+      },
+    }));
+    const pins = buildHostConnectionPins({
+      mcpProfile: {
+        mcpProtocolVersion: "2025-11-25",
+        initialize: {
+          supportedProtocolVersions: ["2025-11-25", "2025-06-18"],
+        },
+      },
+      ...(override ? {
+        serverConnectionOverrides: {
+          "server-1": { mcpProtocolVersionOverride: override },
+        },
+      } : {}),
+    }, 10_000);
+    const result = await createAuthorizedManager(
+      {}, "bearer", "project", ["server-1"], pins.timeoutMs,
+      undefined, undefined,
+      {
+        lazyConnect: true,
+        initializePins: pins.initializePins,
+        mcpProtocolVersionsByServerId: pins.mcpProtocolVersionsByServerId,
+      },
+    );
+    expect(result.authorizedServerConfigs?.["server-1"]).toMatchObject({
+      mcpProtocolVersion: expected,
+    });
+  });
+
+  it.each(["saved-account", "other-account", undefined])("accepts a single selected credential only when its returned identity matches (%s)", async returnedId => {
+    global.fetch = vi.fn(async () => Response.json({results: {"server-1": {
+      ok: true, role: "member", accessLevel: "project_member", permissions: {chatOnly: false},
+      oauthAccessToken: "selected-token", oauthCredentialId: returnedId, oauthCredentialAuthorizedAt: 42,
+      serverConfig: {updatedAt: 123, transportType: "http", url: "https://fixture.example/mcp", useOAuth: true},
+    }}})) as typeof fetch;
+    const run = createAuthorizedManager({}, "bearer", "project", ["server-1"], 10_000, undefined, undefined, {lazyConnect: true, onlySelectedConnections: true, connectionIds: {"server-1": "saved-account"}});
+    if (returnedId !== "saved-account") {
+      await expect(run).rejects.toThrow("The account saved with this task is unavailable");
+      expect(mcpClientManagerMock).not.toHaveBeenCalled();
+      return;
+    }
+    const result = await run;
+    const key = result.connectionsByServerId?.["server-1"][0]?.key;
+    expect(key).toBe("server-1#saved-account");
+    if (!key) throw Error("Missing selected connection");
+    const config = result.authorizedServerConfigs?.[key];
+    if (!config || !("url" in config)) throw Error("Missing selected HTTP config");
+    expect(new Headers(config.requestInit?.headers).get("authorization")).toBe("Bearer selected-token");
+    setManagerResourceHostConfig(result.manager, "config", "host");
+    expect(getManagerResourceSnapshot(result.manager, key)?.credentialAuthorizedAt).toBe(42);
+    const wireBody = vi.mocked(global.fetch).mock.calls[0][1]?.body;
+    if (typeof wireBody !== "string") throw Error("Missing authorization request body");
+    expect(JSON.parse(wireBody)).toMatchObject({includeConnections: true, connectionIds: {"server-1": "saved-account"}});
+  });
+
+  it.each([
+    { lazyConnect: false, connectionId: undefined },
+    { lazyConnect: true, connectionId: undefined },
+    { lazyConnect: true, connectionId: "saved-account" },
+  ])(
+    "keeps full authorization with optional lazy connection ownership: %j",
+    async ({ lazyConnect, connectionId }) => {
+      global.fetch = vi.fn(async () =>
+        Response.json({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              oauthAccessToken: "wire-token-not-identity",
+              oauthCredentialId: "saved-credential",
+              oauthCredentialAuthorizedAt: 42,
+              internalLogContext: { userId: "resolved-owner" },
+              oauthConnections: [
+                {
+                  connectionId: "other-account",
+                  accessToken: "other-token",
+                  isDefault: true,
+                },
+                {
+                  connectionId: "saved-account",
+                  accessToken: "saved-token",
+                  isDefault: false,
+                },
+              ],
+              serverConfig: {
+                transportType: "http",
+                url: "https://fixture.example/mcp",
+                useOAuth: true,
+                credentialConfigurationId: "a".repeat(64),
+              },
+            },
+          },
+        }),
+      ) as typeof fetch;
+      const c = {
+        ...mockContext,
+        req: {
+          url: "http://localhost:6274/api/web/plugin-instances/execute",
+          header: (name: string) =>
+            name.toLowerCase() === "authorization"
+              ? "Bearer fixture-bearer"
+              : undefined,
+        },
+      } as unknown as Context;
+      const result = await createManualHostedConnection(
+        c,
+        { projectId: "project-1", serverId: "server-1", connectionId },
+        connectionId ? taskCapabilitiesSchema : projectServerSchema,
+        lazyConnect ? { lazyConnect: true } : undefined,
+      );
+      expect(global.fetch).toHaveBeenCalledOnce();
+      expect(String(vi.mocked(global.fetch).mock.calls[0][0])).toContain(
+        "/web/authorize-batch",
+      );
+      const authorization = JSON.parse(
+        String(vi.mocked(global.fetch).mock.calls[0][1]?.body),
+      );
+      expect(authorization.connectionIds).toEqual(
+        connectionId ? { "server-1": connectionId } : undefined,
+      );
+      const [configs, options] = mcpClientManagerMock.mock.calls[0];
+      expect(options.lazyConnect).toBe(lazyConnect ? true : undefined);
+      if (lazyConnect) {
+        expect(result.authorizedServerConfigs).toBe(configs);
+        expect(result.authorizedServerIdentities?.["server-1"]).toMatchObject({
+          serverId: "server-1",
+          credentialId: "saved-credential",
+          credentialAuthorizedAt: 42,
+        });
+        expect(JSON.stringify(result.authorizedServerIdentities)).not.toContain(
+          "wire-token-not-identity",
+        );
+      } else {
+        expect(result.authorizedServerConfigs).toBeUndefined();
+        expect(result.authorizedServerIdentities).toBeUndefined();
+      }
+      const key = connectionId
+        ? taskConnectionKey(result.manager, {
+            serverId: "server-1",
+            connectionId,
+          })
+        : "server-1";
+      expect(Object.keys(configs)).toEqual([key]);
+      expect(
+        taskConnectionKey(result.manager, {
+          serverId: "server-1",
+          connectionId,
+          ownerScope: taskOwnerScope("project-1", "resolved-owner"),
+        }),
+      ).toBe(key);
+      expect(() =>
+        taskConnectionKey(result.manager, {
+          serverId: "server-1",
+          connectionId,
+          ownerScope: "different-owner",
+        }),
+      ).toThrow(
+        expect.objectContaining({ code: ErrorCode.FORBIDDEN, status: 403 }),
+      );
+      expect(configs[key].baseFetch).toBeTypeOf("function");
+      if (connectionId) {
+        expect(configs[key].requestInit.headers.get("Authorization")).toBe(
+          "Bearer saved-token",
+        );
+      }
+      await result.manager.disconnectAllServers();
+    },
+  );
+
+
+  it.each([false, true])(
+    "refuses a missing or revoked pin before constructing any transport: %s",
+    async (revoked) => {
+      global.fetch = vi.fn(async () =>
+        Response.json({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://fixture.example/mcp",
+                useOAuth: true,
+              },
+              oauthConnections: [
+                {
+                  connectionId: "default",
+                  accessToken: "default-token",
+                  isDefault: true,
+                },
+                ...(revoked
+                  ? [
+                      {
+                        connectionId: "saved-account",
+                        accessToken: "stale-token",
+                        needsReauth: true,
+                      },
+                    ]
+                  : []),
+              ],
+            },
+          },
+        }),
+      ) as typeof fetch;
+      const c = {
+        ...mockContext,
+        req: {
+          url: "http://localhost:6274/api/web/tasks/get",
+          header: () => "Bearer fixture-bearer",
+        },
+      } as unknown as Context;
+      await expect(
+        createManualHostedConnection(
+          c,
+          {
+            projectId: "project-1",
+            serverId: "server-1",
+            connectionId: "saved-account",
+          },
+          taskCapabilitiesSchema,
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+      expect(mcpClientManagerMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("wraps project HTTP connections before construction using backend-authenticated identity", async () => {
+    const result = (accessLevel: string) => ({
+      ok: true,
+      role: "member",
+      accessLevel,
+      permissions: { chatOnly: false },
+      serverConfig: {
+        transportType: "http",
+        url: "https://fixture.example/mcp",
+      },
+      internalLogContext: {
+        userId: "authenticated-user",
+        projectId: "project-1",
+        authMethod: "jwt",
+      },
+    });
+    global.fetch = vi.fn(async () =>
+      Response.json({
+        results: {
+          enrolled: result("project_member"),
+          shared: result("shared_chat"),
+        },
+      }),
+    ) as typeof fetch;
+    const authorized = await createAuthorizedManager(
+      { authMethod: "jwt" } as Parameters<typeof createAuthorizedManager>[0],
+      "bearer",
+      "project-1",
+      ["enrolled", "shared"],
+      10_000,
+    );
+    expect(authorized.authenticatedUserId).toBe("authenticated-user");
+    expect(admissionMock).toHaveBeenCalledTimes(1);
+    expect(admissionMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: "project-1",
+        serverId: "enrolled",
+        userId: "authenticated-user",
+        fetch: expect.any(Function),
+      }),
+    );
+    expect(mcpClientManagerMock.mock.calls[0][0].enrolled.baseFetch).toBeTypeOf(
+      "function",
+    );
+  });
+
+  it("surfaces the first batch failure in input order", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-a": {
+              ok: false,
+              status: 403,
+              code: "FORBIDDEN",
+              message: "server-a failed",
+            },
+            "server-b": {
+              ok: false,
+              status: 404,
+              code: "NOT_FOUND",
+              message: "server-b failed",
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await expect(
+      createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-b", "server-a"],
+        10_000
+      )
+    ).rejects.toMatchObject<WebRouteError>({
+      status: 404,
+      code: "NOT_FOUND",
+      message: '"server-b" couldn\'t connect: server-b failed. Check the server\'s settings on the Servers page.',
+    });
+
+    expect(global.fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])("keeps refusals named with caller names present: %s", async (callerNames) => {
+    global.fetch = vi.fn(async () =>
+      Response.json({
+        results: {
+          "server-a": {
+            ok: false,
+            status: 403,
+            code: "FORBIDDEN",
+            message: "server-a failed",
+            serverName: "A",
+          },
+          "server-b": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-b.example.com/mcp",
+              name: "B",
+            },
+          },
+          // An explicit-OAuth server with no token is refused in pass 1 too.
+          "server-c": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-c.example.com/mcp",
+              name: "C",
+              useOAuth: true,
+            },
+          },
+        },
+      }),
+    ) as typeof fetch;
+
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-a", "server-b", "server-c"],
+      10_000,
+      undefined,
+      undefined,
+      { ...(callerNames ? { serverNames: ["A", "B", "C"] } : {}), tolerateServerRefusals: true },
+    );
+    expect(result.serverNamesById).toEqual({ "server-a": "A", "server-b": "B", "server-c": "C" });
+
+    // Each refusal is the error the server's own request would have thrown.
+    expect(result.refusedServers?.["server-a"]).toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      message: '\"A\" couldn\'t connect: server-a failed. Check the server\'s settings on the Servers page.',
+      details: { serverId: "server-a", serverName: "A" },
+    });
+    expect(result.refusedServers?.["server-c"]).toMatchObject({
+      status: 401,
+      code: "UNAUTHORIZED",
+      details: { oauthRequired: true, serverId: "server-c" },
+    });
+    expect(Object.keys(result.refusedServers ?? {})).toEqual([
+      "server-a",
+      "server-c",
+    ]);
+    // The manager holds the servers that were admitted, and only those.
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-b",
+    ]);
+  });
+
+  it("keeps only the listed servers' refusals when given a list", async () => {
+    // A chat turn lists its plugins' servers: the member's own server must
+    // still fail the turn, a plugin server waiting on sign-in must not.
+    const batch = (chosenRefused: boolean) =>
+      vi.fn(async () =>
+        Response.json({
+          results: {
+            "srv-chosen": chosenRefused
+              ? {
+                  ok: false,
+                  status: 403,
+                  code: "FORBIDDEN",
+                  message: "srv-chosen failed",
+                }
+              : {
+                  ok: true,
+                  role: "member",
+                  accessLevel: "project_member",
+                  permissions: { chatOnly: false },
+                  serverConfig: {
+                    transportType: "http",
+                    url: "https://chosen.example.com/mcp",
+                  },
+                },
+            "srv-plugin": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://plugin.example.com/mcp",
+                useOAuth: true,
+              },
+            },
+          },
+        }),
+      ) as typeof fetch;
+    const run = () =>
+      createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["srv-chosen", "srv-plugin"],
+        10_000,
+        undefined,
+        undefined,
+        { tolerateServerRefusals: ["srv-plugin"] },
+      );
+
+    global.fetch = batch(false);
+    const result = await run();
+    expect(Object.keys(result.refusedServers ?? {})).toEqual(["srv-plugin"]);
+    expect(result.refusedServers?.["srv-plugin"]).toMatchObject({
+      status: 401,
+      details: { oauthRequired: true, serverId: "srv-plugin" },
+    });
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "srv-chosen",
+    ]);
+
+    global.fetch = batch(true);
+    await expect(run()).rejects.toMatchObject({
+      status: 403,
+      message: '"srv-chosen" couldn\'t connect: srv-chosen failed. Check the server\'s settings on the Servers page.',
+    });
+  });
+
+  function xaaBatchFetch(): typeof fetch {
+    return vi.fn(async () =>
+      Response.json({
+        results: {
+          "server-xaa": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-xaa.example.com/mcp",
+              authMethod: "xaa",
+            },
+          },
+          "server-plain": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-plain.example.com/mcp",
+            },
+          },
+        },
+      }),
+    ) as typeof fetch;
+  }
+
+  it("records a pass-2 refusal per server when tolerating refusals", async () => {
+    global.fetch = xaaBatchFetch();
+    mintXaaMock.mockRejectedValueOnce(
+      new WebRouteError(404, ErrorCode.NOT_FOUND, "Unknown issuer"),
+    );
+
+    // The XAA server's mint fails in pass 2. Without the option that throw is
+    // the batch's; with it, the sibling still connects.
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-xaa", "server-plain"],
+      10_000,
+      undefined,
+      undefined,
+      { tolerateServerRefusals: true, xaaIssuer: "https://idp.example.com" },
+    );
+
+    expect(result.refusedServers?.["server-xaa"]).toMatchObject({
+      status: 404,
+      code: "NOT_FOUND",
+      details: { serverId: "server-xaa" },
+    });
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-plain",
+    ]);
+  });
+
+  it("keeps an unclassified XAA handshake failure per server", async () => {
+    global.fetch = xaaBatchFetch();
+    mintXaaMock.mockRejectedValueOnce(new Error("IdP answered 500"));
+
+    // Framed as a 500 INTERNAL_ERROR, but it is that server's IdP failing,
+    // and the mint site has already logged it.
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-xaa", "server-plain"],
+      10_000,
+      undefined,
+      undefined,
+      { tolerateServerRefusals: true, xaaIssuer: "https://idp.example.com" },
+    );
+
+    expect(result.refusedServers?.["server-xaa"]).toMatchObject({
+      status: 500,
+      code: "INTERNAL_ERROR",
+      details: { reason: "xaa_handshake_failed", serverId: "server-xaa" },
+    });
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-plain",
+    ]);
+  });
+
+  it("fails the batch on an internal fault even when tolerating refusals", async () => {
+    global.fetch = xaaBatchFetch();
+
+    // No `xaaIssuer` is the caller's bug, not the server's refusal: kept per
+    // server it would answer inside a 200 and reach neither Sentry nor
+    // `http.request.failed`.
+    await expect(
+      createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-xaa", "server-plain"],
+        10_000,
+        undefined,
+        undefined,
+        { tolerateServerRefusals: true },
+      ),
+    ).rejects.toMatchObject({ status: 500, code: "INTERNAL_ERROR" });
+    expect(mcpClientManagerMock).not.toHaveBeenCalled();
+  });
+
+  it("fails the batch on a missing authorize result even when tolerating refusals", async () => {
+    global.fetch = vi.fn(async () =>
+      Response.json({ results: {} }),
+    ) as typeof fetch;
+
+    await expect(
+      createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-a"],
+        10_000,
+        undefined,
+        undefined,
+        { tolerateServerRefusals: true },
+      ),
+    ).rejects.toMatchObject({ status: 500, code: "INTERNAL_ERROR" });
+  });
+
+  // Pass 2 reveals the stored headers of a server the authorize response
+  // redacted. The reveal talks to Convex, not to the server.
+  function revealBatchFetch(
+    reveal: () => Response | Promise<Response>,
+  ): typeof fetch {
+    return vi.fn(async (input) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return Response.json({
+          results: {
+            "server-secret": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-secret.example.com/mcp",
+                hasHeaders: true,
+              },
+            },
+            "server-plain": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-plain.example.com/mcp",
+              },
+            },
+          },
+        });
+      }
+      if (url.endsWith("/web/server/reveal-secrets")) return reveal();
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof fetch;
+  }
+
+  it.each([
+    {
+      reveal: "cannot be reached",
+      respond: () => {
+        throw new Error("connect ECONNREFUSED");
+      },
+    },
+    {
+      reveal: "answers 502",
+      respond: () =>
+        Response.json({ success: false, error: "upstream" }, { status: 502 }),
+    },
+  ])(
+    "fails the batch when the secret reveal $reveal even when tolerating refusals",
+    async ({ respond }) => {
+      global.fetch = revealBatchFetch(respond);
+
+      // MCPJam's own reveal service is down, not the server refusing: kept per
+      // server it would answer inside a 200 and reach neither Sentry nor
+      // `http.request.failed`.
+      await expect(
+        createAuthorizedManager(
+          callerContextFromHono(mockContext),
+          "bearer-token",
+          "project-1",
+          ["server-secret", "server-plain"],
+          10_000,
+          undefined,
+          undefined,
+          { tolerateServerRefusals: true },
+        ),
+      ).rejects.toMatchObject({ status: 502, code: "SERVER_UNREACHABLE" });
+      expect(mcpClientManagerMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps a secret reveal the backend refused per server", async () => {
+    global.fetch = revealBatchFetch(() =>
+      Response.json(
+        { code: "FORBIDDEN", message: "Export denied", exportDenied: true },
+        { status: 403 },
+      ),
+    );
+
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-secret", "server-plain"],
+      10_000,
+      undefined,
+      undefined,
+      { tolerateServerRefusals: true },
+    );
+
+    expect(result.refusedServers?.["server-secret"]).toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      details: { exportDenied: true },
+    });
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-plain",
+    ]);
+  });
+
+  it("keeps an unreachable authorization server per server", async () => {
+    global.fetch = vi.fn(async () =>
+      Response.json({
+        results: {
+          "server-oauth": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            oauthUnavailableReason: "authorization_server_unreachable",
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-oauth.example.com/mcp",
+              useOAuth: true,
+            },
+          },
+          "server-plain": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-plain.example.com/mcp",
+            },
+          },
+        },
+      }),
+    ) as typeof fetch;
+
+    // A 503 too, but it belongs to that server's authorization server.
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-oauth", "server-plain"],
+      10_000,
+      undefined,
+      undefined,
+      { tolerateServerRefusals: true },
+    );
+
+    expect(result.refusedServers?.["server-oauth"]).toMatchObject({
+      status: 503,
+      code: "SERVER_UNREACHABLE",
+      details: { serverId: "server-oauth" },
+    });
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-plain",
+    ]);
+  });
+
+  it("records a failed required recovery per server when tolerating refusals", async () => {
+    // Pass 1b: the batch could not refresh a private-authorization-server
+    // credential, the local refresh fails too, and the server is explicit
+    // OAuth, so the recovery was required. Its sibling still connects.
+    global.fetch = vi.fn(async (input) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return Response.json({
+          results: {
+            "server-private": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              oauthUnavailableReason: "private_authorization_server",
+              serverConfig: {
+                transportType: "http",
+                url: "http://localhost:8000/mcp",
+                headers: {},
+                useOAuth: true,
+              },
+            },
+            "server-b": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-b.example.com/mcp",
+              },
+            },
+          },
+        });
+      }
+      if (url.endsWith("/web/oauth/force-refresh")) {
+        return Response.json(
+          {
+            success: false,
+            code: "private_authorization_server",
+            message: "Authorization server is on a private address.",
+            refresh: {
+              authorizationServerUrl: "http://localhost:9000",
+              serverUrl: "http://localhost:8000/mcp",
+              oauthResourceUrl: "http://localhost:8000",
+              clientId: "client-1",
+              refreshToken: "stored-refresh-token",
+            },
+          },
+          { status: 409 },
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof fetch;
+    localRefreshMock.mockRejectedValue(new Error("connect ECONNREFUSED"));
+
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-private", "server-b"],
+      10_000,
+      undefined,
+      undefined,
+      { tolerateServerRefusals: true },
+    );
+
+    expect(result.refusedServers?.["server-private"]).toBeInstanceOf(Error);
+    expect(Object.keys(mcpClientManagerMock.mock.calls[0][0])).toEqual([
+      "server-b",
+    ]);
+  });
+
+  it("does not report refusals unless asked to tolerate them", async () => {
+    global.fetch = vi.fn(async () =>
+      Response.json({
+        results: {
+          "server-b": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              transportType: "http",
+              url: "https://server-b.example.com/mcp",
+            },
+          },
+        },
+      }),
+    ) as typeof fetch;
+
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-b"],
+      10_000,
+    );
+
+    expect(result.refusedServers).toBeUndefined();
+  });
+
+  it("passes an explicitly selected single connection to admission", async () => {
+    global.fetch = vi.fn(async () => Response.json({ results: { "server-1": {
+      ok: true, role: "member", accessLevel: "project_member", permissions: { chatOnly: false },
+      serverConfig: { transportType: "http", url: "https://fixture.example/mcp", useOAuth: true },
+      oauthAccessToken: "selected-token",
+    } } })) as typeof fetch;
+    await createAuthorizedManager(callerContextFromHono(mockContext), "bearer", "project-1", ["server-1"], 10_000, undefined, undefined,
+      { connectionIds: { "server-1": "selected-connection" } });
+    expect(admissionMock).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ serverId: "server-1", connectionId: "selected-connection" }));
+    expect(mcpClientManagerMock.mock.calls[0][0]["server-1"].requestInit.headers.Authorization).toBe("Bearer selected-token");
+  });
+
+  it("isolates each account's headers and 401 refresh target", async () => {
+    const a = "a".repeat(32),
+      b = "b".repeat(32);
+    const requests: Array<{ url: string; body: any }> = [];
+    global.fetch = vi.fn(async (input, init) => {
+      const url = fetchUrl(input);
+      requests.push({ url, body: JSON.parse(String(init?.body)) });
+      if (url.endsWith("/force-refresh"))
+        return Response.json({ success: true, accessToken: "fresh-b" });
+      return Response.json({
+        results: {
+          "server-1": {
+            ok: true,
+            role: "member",
+            accessLevel: "project_member",
+            permissions: { chatOnly: false },
+            serverConfig: {
+              updatedAt: 123,
+              transportType: "http",
+              url: "https://example.com/mcp",
+              headers: {},
+              useOAuth: true,
+            },
+            oauthAccessToken: "token-a",
+            oauthCredentialAuthorizedAt: 11,
+            oauthConnections: [
+              {
+                connectionId: a,
+                isDefault: true,
+                label: "A",
+                accessToken: "token-a",
+              },
+              {
+                credentialAuthorizedAt: 22,
+                connectionId: b,
+                isDefault: false,
+                label: "B",
+                accessToken: "token-b",
+              },
+            ],
+          },
+        },
+      });
+    }) as typeof fetch;
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      undefined,
+      undefined,
+      { multiConnection: true },
+    );
+    setManagerResourceHostConfig(result.manager, "host-config", "host");
+    const alternate = result.connectionsByServerId?.["server-1"].find(c => c.connectionId === b);
+    expect(alternate).toBeDefined();
+    expect(getManagerResourceSnapshot(result.manager, alternate!.key)?.credentialAuthorizedAt).toBe(22);
+    expect(admissionMock).toHaveBeenCalledTimes(2);
+    expect(admissionMock).toHaveBeenCalledWith(expect.objectContaining({ serverId: "server-1", connectionId: a }));
+    expect(admissionMock).toHaveBeenCalledWith(expect.objectContaining({ serverId: "server-1", connectionId: b }));
+    const configs = mcpClientManagerMock.mock.calls[0][0];
+    expect(Object.keys(configs)).toEqual(["server-1", `server-1#${b}`]);
+    expect(
+      new Headers(configs["server-1"].requestInit.headers).get("authorization"),
+    ).toBe("Bearer token-a");
+    expect(
+      new Headers(configs[`server-1#${b}`].requestInit.headers).get(
+        "authorization",
+      ),
+    ).toBe("Bearer token-b");
+    await configs[`server-1#${b}`].onUnauthorized({});
+    expect(
+      requests.find((r) => r.url.endsWith("/force-refresh"))?.body.connectionId,
+    ).toBe(b);
+    expect(requests[0].body.includeConnections).toBe(true);
+    expect(
+      result.connectionsByServerId?.["server-1"].map((c) => c.connectionId),
+    ).toEqual([a, b]);
+  });
+
+  describe("a member's only login", () => {
+    const credential = "c".repeat(32);
+    const single = (overrides: Record<string, unknown> = {}) => ({
+      ok: true,
+      role: "member",
+      accessLevel: "project_member",
+      permissions: { chatOnly: false },
+      serverConfig: {
+        updatedAt: 123,
+        name: "Lazy bench",
+        transportType: "http",
+        url: "https://example.com/mcp",
+        headers: {},
+        authMethod: "auto",
+      },
+      oauthAccessToken: "token-only",
+      oauthCredentialId: credential,
+      oauthCredentialAuthorizedAt: 11,
+      ...overrides,
+    });
+    const run = async (
+      result: Record<string, unknown>,
+      options: Record<string, unknown> = { multiConnection: true },
+    ) => {
+      const requests: Array<{ url: string; body: any }> = [];
+      global.fetch = vi.fn(async (input, init) => {
+        const url = fetchUrl(input);
+        requests.push({ url, body: JSON.parse(String(init?.body)) });
+        if (url.endsWith("/force-refresh"))
+          return Response.json({ success: true, accessToken: "fresh" });
+        return Response.json({ results: { "server-1": result } });
+      }) as typeof fetch;
+      const created = await createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-1"],
+        10_000,
+        undefined,
+        undefined,
+        options,
+      );
+      return { created, requests };
+    };
+
+    it("is grouped as the implicit default under the bare server key", async () => {
+      const { created, requests } = await run(single());
+      expect(created.connectionsByServerId?.["server-1"]).toEqual([
+        {
+          serverId: "server-1",
+          connectionId: credential,
+          key: "server-1",
+          label: "Lazy bench",
+          profile: undefined,
+          isDefault: true,
+          implicit: true,
+        },
+      ]);
+      const configs = mcpClientManagerMock.mock.calls[0][0];
+      expect(Object.keys(configs)).toEqual(["server-1"]);
+      expect(
+        new Headers(configs["server-1"].requestInit.headers).get(
+          "authorization",
+        ),
+      ).toBe("Bearer token-only");
+      setManagerResourceHostConfig(created.manager, "host-config", "host");
+      expect(
+        getManagerResourceSnapshot(created.manager, "server-1")
+          ?.credentialAuthorizedAt,
+      ).toBe(11);
+      // A 401 refreshes the same credential the call was attributed to.
+      await configs["server-1"].onUnauthorized({});
+      expect(
+        requests.find((r) => r.url.endsWith("/force-refresh"))?.body
+          .connectionId,
+      ).toBe(credential);
+    });
+
+    it.each([
+      ["no account list was requested", single(), {}],
+      ["the caller is a shared-chat visitor", single({ accessLevel: "shared_chat" }), undefined],
+      ["the backend sent no credential id", single({ oauthCredentialId: undefined }), undefined],
+      ["there is no live token", single({ oauthAccessToken: null }), undefined],
+      [
+        "the server authenticates with a bearer header",
+        single({
+          serverConfig: {
+            name: "Lazy bench",
+            transportType: "http",
+            url: "https://example.com/mcp",
+            headers: {},
+            authMethod: "bearer",
+          },
+        }),
+        undefined,
+      ],
+    ])("is not grouped when %s", async (_case, result, options) => {
+      const { created } = await run(result, options);
+      expect(created.connectionsByServerId).toBeUndefined();
+    });
+  });
+
+  it("uses the request oauth token when the batch response does not include one", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: { "X-Test": "yes" },
+                useOAuth: true,
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    const result = await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      {
+        "server-1": "request-token",
+      }
+    );
+
+    expect(result.oauthServerUrls).toEqual({
+      "server-1": "https://server-1.example.com/mcp",
+    });
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config.onUnauthorized).toBeUndefined();
+    expect(mcpClientManagerMock).toHaveBeenCalledWith(
+      {
+        "server-1": expect.objectContaining({
+          url: "https://server-1.example.com/mcp",
+          requestInit: {
+            headers: {
+              "X-Test": "yes",
+              Authorization: "Bearer request-token",
+            },
+          },
+        }),
+      },
+      expect.any(Object)
+    );
+  });
+
+  it("diverts stdio servers to the local resolver in local mode (mixed batch)", async () => {
+    // This suite runs with HOSTED_MODE unset (local). The hosted authorize
+    // batch answers for BOTH servers but strips the stdio row's
+    // command/args/env by contract; the divert re-reads that one server
+    // through /web/authorize-batch-local with the same bearer and builds a
+    // spawnable stdio config, while the http sibling stays on the hosted
+    // mint path untouched.
+    //
+    // Captured, not asserted inside the mock: `authorizeBatchLocal` wraps any
+    // throw from fetch (including a failed expect) into a 502 WebRouteError,
+    // which would surface as a misleading transport error.
+    let localInit: RequestInit | undefined;
+    global.fetch = vi.fn(async (input, init) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return new Response(
+          JSON.stringify({
+            results: {
+              "srv-http": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                serverConfig: {
+                  transportType: "http",
+                  url: "https://srv-http.example.com/mcp",
+                  headers: { "X-Test": "yes" },
+                },
+              },
+              "srv-stdio": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                serverConfig: {
+                  transportType: "stdio",
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/web/authorize-batch-local")) {
+        localInit = init;
+        return new Response(
+          JSON.stringify({
+            results: {
+              "srv-stdio": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                serverConfig: {
+                  transportType: "stdio",
+                  command: "node",
+                  args: ["plugin-server.js"],
+                  env: { FOO: "bar" },
+                  cwd: "/srv/plugin-root",
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["srv-http", "srv-stdio"],
+      10_000
+    );
+
+    expect((localInit?.headers as Record<string, string>).Authorization).toBe(
+      "Bearer bearer-token"
+    );
+    expect(JSON.parse(localInit?.body as string)).toEqual({
+      projectId: "project-1",
+      serverIds: ["srv-stdio"],
+    });
+    expect(mcpClientManagerMock).toHaveBeenCalledWith(
+      {
+        "srv-http": expect.objectContaining({
+          url: "https://srv-http.example.com/mcp",
+        }),
+        "srv-stdio": expect.objectContaining({
+          command: "node",
+          args: ["plugin-server.js"],
+          env: { FOO: "bar" },
+          cwd: "/srv/plugin-root",
+          timeout: 10_000,
+        }),
+      },
+      expect.any(Object)
+    );
+  });
+
+  // Codex P2 regression: the harness proxy authenticates via WorkOS API key
+  // and deliberately passes an EMPTY bearer — the caller context carries the
+  // service-token + acting-as exchange instead. The stdio divert's local
+  // reread must forward that delegated identity, not send `Bearer ` verbatim
+  // (which failed every local harness turn against a stdio server).
+  it("diverts stdio with the delegated exchange when the caller used a WorkOS API key", async () => {
+    const originalServiceToken = process.env.INSPECTOR_SERVICE_TOKEN;
+    process.env.INSPECTOR_SERVICE_TOKEN = "service-token";
+    mockVars.authMethod = "workos_api_key";
+    mockVars.workosUserId = "user_workos_1";
+    mockVars.mcpjamOrganizationId = "org_1";
+
+    let hostedInit: RequestInit | undefined;
+    let localInit: RequestInit | undefined;
+    global.fetch = vi.fn(async (input, init) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        hostedInit = init;
+        return new Response(
+          JSON.stringify({
+            results: {
+              "srv-stdio": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                serverConfig: { transportType: "stdio" },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/web/authorize-batch-local")) {
+        localInit = init;
+        return new Response(
+          JSON.stringify({
+            results: {
+              "srv-stdio": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                serverConfig: {
+                  transportType: "stdio",
+                  command: "node",
+                  args: ["server.js"],
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof fetch;
+
+    try {
+      await createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "", // bearer ignored on the workos_api_key path (harness proxy)
+        "project-1",
+        ["srv-stdio"],
+        10_000
+      );
+
+      // Both the hosted batch and the local reread ride the same exchange.
+      for (const init of [hostedInit, localInit]) {
+        const headers = init?.headers as Record<string, string>;
+        expect(headers.Authorization).toBe("Bearer service-token");
+        expect(headers["x-mcpjam-acting-as"]).toBe("user_workos_1");
+        expect(headers["x-mcpjam-acting-in-org"]).toBe("org_1");
+      }
+    } finally {
+      delete mockVars.authMethod;
+      delete mockVars.workosUserId;
+      delete mockVars.mcpjamOrganizationId;
+      if (originalServiceToken === undefined) {
+        delete process.env.INSPECTOR_SERVICE_TOKEN;
+      } else {
+        process.env.INSPECTOR_SERVICE_TOKEN = originalServiceToken;
+      }
+    }
+  });
+
+  it("attaches hosted OAuth onUnauthorized and force-refreshes through Convex", async () => {
+    global.fetch = vi.fn(async (input, init) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return new Response(
+          JSON.stringify({
+            results: {
+              "server-1": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                oauthAccessToken: "old-hosted-token",
+                serverConfig: {
+                  transportType: "http",
+                  url: "https://server-1.example.com/mcp",
+                  headers: {},
+                  useOAuth: true,
+                },
+              },
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      expect(url).toBe("https://example.convex.site/web/oauth/force-refresh");
+      expect(init?.headers).toEqual({
+        "Content-Type": "application/json",
+        Authorization: "Bearer bearer-token",
+      });
+      expect(JSON.parse(init?.body as string)).toEqual({
+        projectId: "project-1",
+        serverId: "server-1",
+        // This builder is shared with the hosted /web routes, but in LOCAL
+        // mode this process is the one that can reach a private authorization
+        // server — so it declares that, exactly as the /api/mcp resolver does.
+        // Without it, every surface routed through createAuthorizedManager
+        // (chat-v2, evals, environments, swarm runs, harness-mcp) still died
+        // at the first token expiry against a localhost OAuth server.
+        localRuntime: true,
+      });
+      return new Response(
+        JSON.stringify({
+          success: true,
+          accessToken: "new-hosted-token",
+          expiresAt: null,
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config).toEqual(
+      expect.objectContaining({
+        requestInit: {
+          headers: {
+            Authorization: "Bearer old-hosted-token",
+          },
+        },
+        onUnauthorized: expect.any(Function),
+      })
+    );
+
+    await expect(
+      config.onUnauthorized({
+        serverId: "server-1",
+        error: Object.assign(new Error("HTTP 401"), { statusCode: 401 }),
+      })
+    ).resolves.toEqual({ accessToken: "new-hosted-token" });
+    expect(global.fetch).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["", undefined],
+    // A request token must not stand in for the recovery.
+    [", ignoring a request token", { "server-1": "request-token" }],
+  ])("recovers a private-authorization-server credential BEFORE connecting%s", async (_case, oauthTokens) => {
+    // The batch cannot return a token — the backend structurally cannot refresh
+    // an authorization server on the user's machine — so it reports why. Without
+    // this pre-connect pass the fallback only ever covered a mid-session 401,
+    // and the FIRST connect after expiry failed with "requires OAuth
+    // authentication. Please complete the OAuth flow first", to a user who had.
+    global.fetch = vi.fn(async (input, init) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return new Response(
+          JSON.stringify({
+            results: {
+              "server-1": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                // No token, and the reason it is missing.
+                oauthUnavailableReason: "private_authorization_server",
+                serverConfig: {
+                  transportType: "http",
+                  url: "http://localhost:8000/mcp",
+                  headers: {},
+                  useOAuth: true,
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/web/oauth/force-refresh")) {
+        expect(JSON.parse(init?.body as string).localRuntime).toBe(true);
+        return new Response(
+          JSON.stringify({
+            success: false,
+            code: "private_authorization_server",
+            message: "Authorization server is on a private address.",
+            refresh: {
+              authorizationServerUrl: "http://localhost:9000",
+              serverUrl: "http://localhost:8000/mcp",
+              oauthResourceUrl: "http://localhost:8000",
+              clientId: "client-1",
+              refreshToken: "stored-refresh-token",
+            },
+          }),
+          { status: 409, headers: { "Content-Type": "application/json" } }
+        );
+      }
+      if (url.endsWith("/web/oauth/import-tokens")) {
+        return new Response("{}", { status: 200 });
+      }
+      throw new Error(`Unexpected fetch ${url}`);
+    }) as typeof fetch;
+
+    localRefreshMock.mockResolvedValue({
+      access_token: "locally-refreshed",
+      token_type: "Bearer",
+    });
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      oauthTokens
+    );
+
+    // The connect carries the locally-minted token, and the live-401 handler is
+    // attached even though the batch returned none.
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config).toEqual(
+      expect.objectContaining({
+        requestInit: {
+          headers: { Authorization: "Bearer locally-refreshed" },
+        },
+        onUnauthorized: expect.any(Function),
+      })
+    );
+  });
+
+  it("maps invalid hosted refresh tokens to reconnect details", async () => {
+    global.fetch = vi.fn(async (input) => {
+      const url = fetchUrl(input);
+      if (url.endsWith("/web/authorize-batch")) {
+        return new Response(
+          JSON.stringify({
+            results: {
+              "server-1": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                oauthAccessToken: "old-hosted-token",
+                serverConfig: {
+                  transportType: "http",
+                  url: "https://server-1.example.com/mcp",
+                  headers: {},
+                  useOAuth: true,
+                },
+              },
+            },
+          }),
+          {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      }
+
+      return new Response(
+        JSON.stringify({
+          success: false,
+          code: "refresh_token_invalid",
+          message: "Please reconnect.",
+        }),
+        {
+          status: 401,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      undefined,
+      undefined,
+      { serverNames: ["Asana"] }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    await expect(
+      config.onUnauthorized({
+        serverId: "server-1",
+        error: Object.assign(new Error("HTTP 401"), { statusCode: 401 }),
+      })
+    ).rejects.toMatchObject<WebRouteError>({
+      status: 401,
+      code: "UNAUTHORIZED",
+      message: "Please reconnect.",
+      details: {
+        oauthRequired: true,
+        refreshTokenInvalid: true,
+        serverId: "server-1",
+        serverName: "Asana",
+      },
+    });
+  });
+
+  it("preserves oauthRequired error details when no token is available", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: {},
+                useOAuth: true,
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await expect(
+      createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-1"],
+        10_000,
+        undefined,
+        undefined,
+        {
+          serverNames: ["Asana"],
+        }
+      )
+    ).rejects.toMatchObject<WebRouteError>({
+      status: 401,
+      code: "UNAUTHORIZED",
+      message:
+        '"Asana" needs you to sign in. Sign in from the Servers page, then try again.',
+      details: {
+        oauthRequired: true,
+        serverId: "server-1",
+        serverName: "Asana",
+        serverUrl: "https://server-1.example.com/mcp",
+      },
+    });
+  });
+
+  // Every reason the backend names for a withheld token needs its own branch.
+  // Without one it falls through to the refusal above and tells the user to
+  // complete an OAuth flow — wrong for an authorization server that never
+  // answered, wrong for a refresh already in flight, and silent about the
+  // repointed URL that is what actually invalidated the credential.
+  function batchWithOAuthUnavailableReason(
+    reason: string,
+    extra: Record<string, unknown> = {}
+  ): typeof fetch {
+    return vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({
+            results: {
+              "server-1": {
+                ok: true,
+                role: "member",
+                accessLevel: "project_member",
+                permissions: { chatOnly: false },
+                oauthUnavailableReason: reason,
+                ...extra,
+                serverConfig: {
+                  transportType: "http",
+                  url: "https://server-1.example.com/mcp",
+                  headers: {},
+                  useOAuth: true,
+                },
+              },
+            },
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        )
+    ) as typeof fetch;
+  }
+
+  async function captureConnectError(
+    oauthTokens?: Record<string, string>
+  ): Promise<WebRouteError> {
+    try {
+      await createAuthorizedManager(
+        callerContextFromHono(mockContext),
+        "bearer-token",
+        "project-1",
+        ["server-1"],
+        10_000,
+        oauthTokens,
+        undefined,
+        { serverNames: ["Asana"] }
+      );
+    } catch (error) {
+      return error as WebRouteError;
+    }
+    throw new Error("expected createAuthorizedManager to reject");
+  }
+
+  it("tells the user the destination changed when the credential origin no longer matches", async () => {
+    global.fetch = batchWithOAuthUnavailableReason(
+      "credential_origin_mismatch"
+    );
+
+    const error = await captureConnectError();
+
+    expect(error).toMatchObject({
+      status: 401,
+      code: "UNAUTHORIZED",
+      message:
+        'Server "Asana" now points at a different destination, so its saved credentials no longer apply. Authorize it again for the new destination.',
+      details: {
+        oauthRequired: true,
+        serverId: "server-1",
+        serverName: "Asana",
+        serverUrl: "https://server-1.example.com/mcp",
+      },
+    });
+    expect(error.message).not.toContain("complete the OAuth flow first");
+  });
+
+  it("names the organization's export policy instead of asking for a reauthorize", async () => {
+    global.fetch = batchWithOAuthUnavailableReason("credential_export_denied");
+
+    const error = await captureConnectError();
+
+    expect(error).toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      details: {
+        exportDenied: true,
+        policy: "credentialExportPolicy",
+        serverId: "server-1",
+        serverName: "Asana",
+      },
+    });
+    expect(error.message).toContain("credential export policy");
+    // Authorizing again would mint a token the same policy withholds.
+    expect(error.details?.oauthRequired).toBeUndefined();
+  });
+
+  it("names the export policy for an auto-discovery server too", async () => {
+    const base = batchWithOAuthUnavailableReason("credential_export_denied");
+    global.fetch = vi.fn(async (...args: Parameters<typeof fetch>) => {
+      const response = await base(...args);
+      const body = await response.json();
+      body.results["server-1"].serverConfig = {
+        transportType: "http",
+        url: "https://server-1.example.com/mcp",
+        headers: {},
+        authMethod: "auto",
+      };
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+
+    const error = await captureConnectError();
+
+    expect(error).toMatchObject({
+      status: 403,
+      code: "FORBIDDEN",
+      details: { exportDenied: true, policy: "credentialExportPolicy" },
+    });
+  });
+
+  it("reports an unreachable authorization server as retryable, not as a missing authorization", async () => {
+    global.fetch = batchWithOAuthUnavailableReason(
+      "authorization_server_unreachable"
+    );
+
+    const error = await captureConnectError();
+
+    expect(error).toMatchObject({
+      status: 503,
+      code: "SERVER_UNREACHABLE",
+      message:
+        'The authorization server for "Asana" did not respond, so its access token could not be refreshed. Authorizing again will not change that. Try again shortly.',
+      details: {
+        serverId: "server-1",
+        serverName: "Asana",
+        serverUrl: "https://server-1.example.com/mcp",
+      },
+    });
+    expect(error.message).not.toContain("complete the OAuth flow first");
+    expect(error.details?.oauthRequired).toBeUndefined();
+  });
+
+  it("turns an in-flight refresh into a retry carrying the backend's oauthRetryAfterMs", async () => {
+    global.fetch = batchWithOAuthUnavailableReason("refresh_in_progress", {
+      oauthRetryAfterMs: 4200,
+    });
+
+    const error = await captureConnectError();
+
+    expect(error).toMatchObject({
+      status: 429,
+      code: "RATE_LIMITED",
+      message:
+        'Credentials for "Asana" are being refreshed by another request. Try again in 5 seconds.',
+    });
+    expect(error.headers).toEqual({ "Retry-After": "5" });
+    expect(error.message).not.toContain("complete the OAuth flow first");
+  });
+
+  it("omits the retry delay when the backend sends no oauthRetryAfterMs", async () => {
+    global.fetch = batchWithOAuthUnavailableReason("refresh_in_progress");
+
+    const error = await captureConnectError();
+
+    expect(error.status).toBe(429);
+    expect(error.message).toBe(
+      'Credentials for "Asana" are being refreshed by another request. Try again shortly.'
+    );
+    expect(error.headers).toBeUndefined();
+  });
+
+  // A token in the request body is the caller's, not the saved credential the
+  // backend withheld. Were it allowed to skip the refusal, every reason above
+  // would be only as strong as a request that leaves the token out.
+  it.each([
+    ["credential_origin_mismatch", 401],
+    ["credential_export_denied", 403],
+    ["authorization_server_unreachable", 503],
+    ["refresh_in_progress", 429],
+  ])(
+    "keeps the %s refusal when the request carries its own token",
+    async (reason, status) => {
+      global.fetch = batchWithOAuthUnavailableReason(reason);
+
+      const error = await captureConnectError({ "server-1": "request-token" });
+
+      expect(error.status).toBe(status);
+      expect(mcpClientManagerMock).not.toHaveBeenCalled();
+    }
+  );
+
+  function withServerConfig(
+    batch: typeof fetch,
+    serverConfig: Record<string, unknown>
+  ): typeof fetch {
+    return vi.fn(async (...args: Parameters<typeof fetch>) => {
+      const body = await (await batch(...args)).json();
+      body.results["server-1"].serverConfig = serverConfig;
+      return Response.json(body);
+    }) as typeof fetch;
+  }
+
+  it("connects a discover server without the request's token once the backend refused its own", async () => {
+    global.fetch = withServerConfig(
+      batchWithOAuthUnavailableReason("credential_origin_mismatch"),
+      {
+        transportType: "http",
+        url: "https://server-1.example.com/mcp",
+        headers: {},
+        authMethod: "auto",
+      }
+    );
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      { "server-1": "request-token" }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config.requestInit?.headers?.Authorization).toBeUndefined();
+  });
+
+  it("still sends a bearer server's request token: the reason is about OAuth", async () => {
+    global.fetch = withServerConfig(
+      batchWithOAuthUnavailableReason("credential_origin_mismatch"),
+      {
+        transportType: "http",
+        url: "https://server-1.example.com/mcp",
+        headers: {},
+        authMethod: "bearer",
+      }
+    );
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      { "server-1": "request-token" }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config.requestInit?.headers?.Authorization).toBe(
+      "Bearer request-token"
+    );
+  });
+
+  it("connects a tokenless auto (discover) server unauthenticated and tags a live 401", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: {},
+                authMethod: "auto",
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    // No pre-connect throw: discover attempts the server without credentials.
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      undefined,
+      undefined,
+      { serverNames: ["Asana"] }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config.requestInit?.headers?.Authorization).toBeUndefined();
+    // A live 401 converts into the tagged oauthRequired shape via the
+    // discover onUnauthorized handler.
+    await expect(
+      config.onUnauthorized({
+        serverId: "server-1",
+        error: Object.assign(new Error("HTTP 401"), { statusCode: 401 }),
+      })
+    ).rejects.toMatchObject<WebRouteError>({
+      status: 401,
+      code: "UNAUTHORIZED",
+      setupFailureSource: "authorization_required",
+      message: 'Server "Asana" requires authorization.',
+      details: {
+        oauthRequired: true,
+        serverId: "server-1",
+        serverName: "Asana",
+        serverUrl: "https://server-1.example.com/mcp",
+      },
+    });
+
+    // A 401 on a protected operation MID-SESSION carries its parsed
+    // challenge: that is a per-call sign-in request, answered as a 403
+    // UPSTREAM_AUTH_FAILED (never 401, which authFetch would answer with a
+    // guest-session retry) carrying the challenge stamped "discover", and
+    // WITHOUT `oauthRequired`, which several surfaces escalate on by
+    // themselves.
+    const challenged = await config
+      .onUnauthorized({
+        serverId: "server-1",
+        error: Object.assign(new Error("HTTP 401"), {
+          status: 401,
+          data: {
+            authChallenge: parseChallengeHeader('Bearer scope="orders:read"'),
+          },
+        }),
+      })
+      .catch((error: unknown) => error);
+    expect(challenged).toMatchObject({
+      status: 403,
+      code: "UPSTREAM_AUTH_FAILED",
+      details: {
+        upstreamAuthRequired: true,
+        authChallenge: {
+          source: "http_401",
+          requiredScope: "orders:read",
+          effectiveAuth: "discover",
+        },
+        serverId: "server-1",
+      },
+    });
+    expect((challenged as WebRouteError).details).not.toHaveProperty(
+      "oauthRequired",
+    );
+  });
+
+  it("keeps the oauth path for an auto (discover) server whose batch returned a token", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              oauthAccessToken: "stored-token",
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: {},
+                authMethod: "auto",
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      undefined,
+      undefined,
+      { serverNames: ["Asana"] }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config.requestInit?.headers?.Authorization).toBe(
+      "Bearer stored-token"
+    );
+    // Stored-token rung: the refresh handler is attached, not the tagging one.
+    expect(typeof config.onUnauthorized).toBe("function");
+  });
+
+  // Codex P2 regression: client now forwards
+  // `mcpProfile.initialize.clientInfo` and `supportedProtocolVersions`
+  // on every hosted route call. Verify `createAuthorizedManager`
+  // threads `initializePins` into the per-server HttpServerConfig so
+  // the SDK Client honors the pins on `initialize`. Without this,
+  // hosted connects silently fell back to SDK defaults even when the
+  // active profile pinned an explicit identity.
+  it("threads mcpProfile.initialize pins into the SDK Client config", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: {},
+                useOAuth: false,
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000,
+      undefined,
+      undefined,
+      {
+        initializePins: {
+          clientInfo: {
+            name: "chatgpt",
+            version: "1.0.0",
+            // Forward-compat extras (e.g. SEP `title`) must survive.
+            title: "ChatGPT",
+          },
+          supportedProtocolVersions: ["2025-11-25", "2025-06-18"],
+          // `mcpProfile.toolListChanged.listens` / `.refetches`. Both were
+          // computed client-side and accepted by every hop below this one, but
+          // never placed on the SDK config — so hosted connections opened the
+          // listen channel and refetched no matter what the host asked for.
+          suppressListenChannel: true,
+          dropToolListChanged: true,
+        },
+      }
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config).toMatchObject({
+      url: "https://server-1.example.com/mcp",
+      clientInfo: {
+        name: "chatgpt",
+        version: "1.0.0",
+        title: "ChatGPT",
+      },
+      supportedProtocolVersions: ["2025-11-25", "2025-06-18"],
+      suppressListenChannel: true,
+      dropToolListChanged: true,
+    });
+  });
+
+  it("omits mcpProfile.initialize pins when no profile is set", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-1": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://server-1.example.com/mcp",
+                headers: {},
+                useOAuth: false,
+              },
+            },
+          },
+        }),
+        {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-1"],
+      10_000
+      // No options.initializePins → SDK Client uses its hardcoded
+      // `LATEST_PROTOCOL_VERSION` and default clientInfo.
+    );
+
+    const config = mcpClientManagerMock.mock.calls[0]?.[0]?.["server-1"];
+    expect(config).not.toHaveProperty("clientInfo");
+    expect(config).not.toHaveProperty("supportedProtocolVersions");
+    // Absence is what makes the connection conforming: the SDK opens the
+    // listen channel and honors `notifications/tools/list_changed` unless a
+    // suppression switch is actually present.
+    expect(config).not.toHaveProperty("suppressListenChannel");
+    expect(config).not.toHaveProperty("dropToolListChanged");
+  });
+
+  // Verify the public `projectServerSchema` declares the two new
+  // optional fields so Zod doesn't strip them at the route boundary.
+  // The earlier shape declared neither, which is exactly what dropped
+  // the wire payload before it reached toHttpConfig.
+  it("projectServerSchema accepts clientInfo and supportedProtocolVersions", async () => {
+    const { projectServerSchema } = await import("../auth.js");
+    const parsed = projectServerSchema.parse({
+      projectId: "project-1",
+      serverId: "server-1",
+      clientInfo: {
+        name: "chatgpt",
+        version: "1.0.0",
+        // passthrough extras (future spec fields) must survive
+        title: "ChatGPT",
+      },
+      supportedProtocolVersions: ["2025-11-25", "2025-06-18"],
+    });
+    expect(parsed.clientInfo).toEqual({
+      name: "chatgpt",
+      version: "1.0.0",
+      title: "ChatGPT",
+    });
+    expect(parsed.supportedProtocolVersions).toEqual([
+      "2025-11-25",
+      "2025-06-18",
+    ]);
+  });
+
+  // The hop that ate the two `toolListChanged` knobs. The client computed
+  // them and the body carried them, but `projectServerSchema` declared
+  // neither, so Zod stripped both before any route could read them — every
+  // hosted connection ran as a fully conforming client regardless of the
+  // switch.
+  it("projectServerSchema keeps the toolListChanged conformance knobs", async () => {
+    const { projectServerSchema } = await import("../auth.js");
+    const parsed = projectServerSchema.parse({
+      projectId: "project-1",
+      serverId: "server-1",
+      suppressListenChannel: true,
+      dropToolListChanged: true,
+    });
+    expect(parsed.suppressListenChannel).toBe(true);
+    expect(parsed.dropToolListChanged).toBe(true);
+  });
+
+  // The same hop had eaten `toolCallCancellation` since that knob shipped:
+  // the extractor read it and every pin site carried it, but this schema
+  // never declared it, so it was stripped before the extractor ran. Chat was
+  // unaffected (it extracts from the pre-parse raw body); every other hosted
+  // surface cancelled normally no matter what the host was configured to do.
+  it("projectServerSchema keeps the per-era cancellation record", async () => {
+    const { projectServerSchema } = await import("../auth.js");
+    const parsed = projectServerSchema.parse({
+      projectId: "project-1",
+      serverId: "server-1",
+      toolCallCancellation: { legacy: false, modern: false },
+    });
+    expect(parsed.toolCallCancellation).toEqual({
+      legacy: false,
+      modern: false,
+    });
+  });
+
+  it("extractMcpInitializeOptions pins the toolListChanged knobs from the body", async () => {
+    const { extractMcpInitializeOptions } = await import("../auth.js");
+    expect(
+      extractMcpInitializeOptions({
+        projectId: "project-1",
+        serverId: "server-1",
+        suppressListenChannel: true,
+        dropToolListChanged: true,
+      }).initializePins
+    ).toEqual({ suppressListenChannel: true, dropToolListChanged: true });
+  });
+
+  it("extractMcpInitializeOptions ignores the conforming value of the toolListChanged knobs", async () => {
+    const { extractMcpInitializeOptions } = await import("../auth.js");
+    // Same one-explicit-value rule as the sibling knobs: only `true` opts into
+    // the non-conforming simulation, so a body that spells out the default
+    // must produce no pins at all rather than a `false` the SDK would read as
+    // "field present".
+    expect(
+      extractMcpInitializeOptions({
+        projectId: "project-1",
+        serverId: "server-1",
+        suppressListenChannel: false,
+        dropToolListChanged: false,
+      }).initializePins
+    ).toBeUndefined();
+  });
+
+  it("extractMcpInitializeOptions carries one toolListChanged knob without the other", async () => {
+    const { extractMcpInitializeOptions } = await import("../auth.js");
+    // The two switches are independent: a host that listens but ignores the
+    // notification is a real configuration, not a half-applied one.
+    expect(
+      extractMcpInitializeOptions({
+        projectId: "project-1",
+        serverId: "server-1",
+        dropToolListChanged: true,
+      }).initializePins
+    ).toEqual({ dropToolListChanged: true });
+  });
+
+  // CONTRACT: the swarm runner threads each pinned server's
+  // `requestTimeoutOverride` through `options.requestTimeoutByServerId`. Each
+  // server's connection `timeout` must reflect ITS pin (falling back to the
+  // host-level timeout when absent) — before the fix every server got the
+  // single host-level timeout uniformly.
+  it("applies per-server requestTimeoutByServerId overrides to each connection", async () => {
+    global.fetch = vi.fn(async () => {
+      return new Response(
+        JSON.stringify({
+          results: {
+            "server-fast": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://fast.example.com/mcp",
+                headers: {},
+                useOAuth: false,
+              },
+            },
+            "server-default": {
+              ok: true,
+              role: "member",
+              accessLevel: "project_member",
+              permissions: { chatOnly: false },
+              serverConfig: {
+                transportType: "http",
+                url: "https://default.example.com/mcp",
+                headers: {},
+                useOAuth: false,
+              },
+            },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }) as typeof fetch;
+
+    await createAuthorizedManager(
+      callerContextFromHono(mockContext),
+      "bearer-token",
+      "project-1",
+      ["server-fast", "server-default"],
+      10_000,
+      undefined,
+      undefined,
+      {
+        accessScope: "project_member",
+        // Only server-fast is pinned; server-default falls back to 10_000.
+        requestTimeoutByServerId: { "server-fast": 3_000 },
+      }
+    );
+
+    const configs = mcpClientManagerMock.mock.calls[0]?.[0] as Record<
+      string,
+      { timeout: number }
+    >;
+    expect(configs["server-fast"]!.timeout).toBe(3_000);
+    expect(configs["server-default"]!.timeout).toBe(10_000);
+
+    // Manager-level defaultTimeout stays the host-level timeout.
+    const managerOpts = mcpClientManagerMock.mock.calls[0]?.[1] as {
+      defaultTimeout: number;
+    };
+    expect(managerOpts.defaultTimeout).toBe(10_000);
+  });
+});

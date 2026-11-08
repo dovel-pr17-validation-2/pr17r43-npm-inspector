@@ -1,0 +1,519 @@
+import { describe, expect, it, vi } from "vitest";
+import {
+  createModelContextController,
+  PluginContextHeld,
+  PluginContextNotPersisted,
+  PluginContextUpdateRejected,
+} from "../model-context-controller";
+const result = (id: string) => ({
+  _meta: { "openai/modelContext": { updateId: id } },
+});
+describe("context refused before it was stored", () => {
+  it("lets the next, smaller update go at once", async () => {
+    const send = vi
+      .fn()
+      .mockRejectedValueOnce(
+        new PluginContextNotPersisted("INSTANCE_CONTEXT_RATE_LIMITED"),
+      )
+      .mockResolvedValueOnce(result("second"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+    });
+    const refused = await update({ content: [] }).catch((error) => error);
+    expect(refused).toBeInstanceOf(PluginContextUpdateRejected);
+    expect(refused).toMatchObject({
+      code: -32000,
+      message: "The host could not persist the model context update",
+    });
+    await expect(update({ content: [] })).resolves.toEqual(result("second"));
+    // The refused update never advanced the sequence.
+    expect(send.mock.calls.map(([request]) => request.sequence)).toEqual([
+      1, 1,
+    ]);
+  });
+
+  it("refuses an update no policy admits without sending it", async () => {
+    const send = vi.fn().mockResolvedValue(result("small"));
+    const onRefused = vi.fn();
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      onRefused,
+    });
+    const text = "x".repeat(4 * 1024 * 1024);
+    expect(() => update({ content: [{ type: "text", text }] })).toThrow(
+      PluginContextNotPersisted,
+    );
+    expect(send).not.toHaveBeenCalled();
+    expect(onRefused.mock.calls[0][0]).toMatchObject({
+      code: -32000,
+      reason: "PLUGIN_CONTEXT_TOO_LARGE",
+      excess: { budget: "updateMaxBytes", allowed: 4 * 1024 * 1024 },
+    });
+    await expect(update({ content: [] })).resolves.toEqual(result("small"));
+  });
+
+  it("leaves an update over the default budget to the server's policy", async () => {
+    const send = vi.fn().mockResolvedValue(result("large"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+    });
+    const text = "x".repeat(300_000);
+    await expect(
+      update({ content: [{ type: "text", text }] }),
+    ).resolves.toEqual(result("large"));
+    expect(send).toHaveBeenCalledOnce();
+  });
+
+  it("remounts on a stored snapshot larger than the default budgets", () => {
+    const onSnapshot = vi.fn();
+    const update = createModelContextController({
+      requireLive: () => {},
+      send: vi.fn(),
+      onSnapshot,
+    });
+    // 256 images, about 2.5 MB, as a ChatGPT-sized policy admits.
+    const content = Array.from({ length: 256 }, () => ({
+      type: "image",
+      mimeType: "image/png",
+      data: "A".repeat(10_000),
+    }));
+    expect(
+      update.restore({
+        revision: 1,
+        sequence: 1,
+        state: { updateId: "stored", content },
+      }),
+    ).toBe(true);
+    expect(onSnapshot.mock.calls[0][0].state.content).toHaveLength(256);
+  });
+
+  it("still holds updates whose outcome is unknown", async () => {
+    const send = vi.fn().mockRejectedValueOnce(new Error("network"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+    });
+    await expect(update({ content: [] })).rejects.toThrow("network");
+    await expect(update({ content: [] })).rejects.toThrow("outcome unknown");
+  });
+
+  it("reads current context before sending a new replacement after a lost response", async () => {
+    const events: string[] = [];
+    const read = vi.fn(async () => {
+      events.push("read");
+      return { revision: 1, sequence: 1, state: { updateId: "first", content: [] } };
+    });
+    const send = vi.fn()
+      .mockImplementationOnce(async () => {
+        events.push("first");
+        throw new Error("lost response");
+      })
+      .mockImplementationOnce(async () => {
+        events.push("second");
+        return result("second");
+      });
+    const update = createModelContextController({ requireLive: () => {}, send, read });
+    await expect(update({ structuredContent: { view: "first" } })).rejects.toThrow("lost response");
+    await expect(update({ structuredContent: { view: "second" } })).resolves.toEqual(result("second"));
+    expect(events).toEqual(["first", "read", "second"]);
+    expect(send.mock.calls[1][0]).toMatchObject({ sequence: 2, params: { structuredContent: { view: "second" } } });
+    expect(send.mock.calls[1][0].operationId).not.toBe(send.mock.calls[0][0].operationId);
+    expect(read).toHaveBeenCalledOnce();
+  });
+
+  it("does not send the next replacement when reconciliation cannot read current context", async () => {
+    const send = vi.fn().mockRejectedValueOnce(new Error("lost response"));
+    const read = vi.fn().mockRejectedValueOnce(new Error("read unavailable"));
+    const update = createModelContextController({ requireLive: () => {}, send, read });
+    await expect(update({})).rejects.toThrow("lost response");
+    await expect(update({ structuredContent: { next: true } })).rejects.toThrow("read unavailable");
+    expect(send).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledOnce();
+  });
+
+  it("checks the owner after a reconciliation read before sending any replacement", async () => {
+    let live = true;
+    const send = vi.fn().mockRejectedValueOnce(new Error("lost response"));
+    const read = vi.fn(async () => {
+      live = false;
+      return { revision: 1, sequence: 1, state: null };
+    });
+    const update = createModelContextController({
+      requireLive: () => { if (!live) throw new Error("owner closed"); },
+      send,
+      read,
+    });
+    await expect(update({})).rejects.toThrow("lost response");
+    await expect(update({ structuredContent: { next: true } })).rejects.toThrow("owner closed");
+    expect(send).toHaveBeenCalledOnce();
+  });
+});
+
+describe("context replace queue", () => {
+  it("settles an unknown remove-all only by re-sending the same operation", async () => {
+    const onSnapshot = vi.fn();
+    const removed = {
+      outcome: "applied",
+      snapshot: {
+        revision: 2,
+        sequence: 1,
+        state: null,
+        held: true,
+        cursor: 1,
+        removedAt: 1,
+        attachedAt: 0,
+      },
+    };
+    const sendRemoveAll = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("lost acknowledgement"))
+      .mockResolvedValueOnce(removed);
+    const send = vi.fn().mockResolvedValue({
+      ...result("next"),
+      snapshot: {
+        revision: 3,
+        sequence: 2,
+        state: { updateId: "next", content: [{ type: "text", text: "next" }] },
+        cursor: 2,
+        removedAt: 1,
+        attachedAt: 2,
+      },
+    });
+    let using = false;
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      sendRemoveAll,
+      onSnapshot,
+      userAttaching: () => using,
+    });
+    update.restore({
+      revision: 1,
+      sequence: 1,
+      state: { updateId: "first", content: [{ type: "text", text: "first" }] },
+    });
+    const operation = { operationId: "op", basis: 0 };
+    await expect(update.removeAll(operation)).rejects.toThrow(
+      "lost acknowledgement",
+    );
+    // Nothing may change while the outcome is unknown.
+    await expect(update({})).rejects.toThrow("outcome unknown");
+    expect(await update.removeAll(operation)).toBe("applied");
+    expect(sendRemoveAll.mock.calls).toEqual([[operation], [operation]]);
+    // The server's hold now refuses the App's own update without a request.
+    await expect(update({})).rejects.toBeInstanceOf(PluginContextHeld);
+    using = true;
+    await update({ content: [{ type: "text", text: "next" }] });
+    expect(send.mock.calls[0][0]).toMatchObject({
+      sequence: 2,
+      attach: "user",
+    });
+    expect(
+      onSnapshot.mock.calls.map(([snapshot]) => snapshot.revision),
+    ).toEqual([1, 2, 3]);
+  });
+  it("rejects contradictory or invalid restored cursors before publishing them", () => {
+    const onSnapshot = vi.fn();
+    const update = createModelContextController({
+      requireLive: () => {},
+      send: vi.fn(),
+      onSnapshot,
+    });
+    expect(() =>
+      update.restore({ revision: 0, sequence: 1, state: null }),
+    ).toThrow();
+    update.restore({ revision: 1, sequence: 1, state: null });
+    expect(() =>
+      update.restore({
+        revision: 1,
+        sequence: 1,
+        state: { updateId: "forged", content: [] },
+      }),
+    ).toThrow("revision");
+    expect(onSnapshot).toHaveBeenCalledOnce();
+  });
+  it("serializes remove-all with replacements and ignores older snapshots", async () => {
+    const snapshots = vi.fn();
+    const state = (id: string, text: string) => ({
+      updateId: id,
+      content: [{ type: "text", text }],
+    });
+    const send = vi.fn(async (request) => ({
+      ...result("new"),
+      snapshot: {
+        revision: 5,
+        sequence: request.sequence,
+        state: state("new", "replacement"),
+        cursor: 2,
+        removedAt: 1,
+        attachedAt: 2,
+      },
+    }));
+    let finish!: (value: unknown) => void;
+    const sendRemoveAll = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      sendRemoveAll,
+      onSnapshot: snapshots,
+      // The replacement comes from the person using the App, so it may
+      // follow their removal.
+      userAttaching: () => true,
+    });
+    update.restore({ revision: 3, sequence: 2, state: state("old", "first") });
+    const removing = update.removeAll({ operationId: "op", basis: 0 });
+    const replacing = update({
+      content: [{ type: "text", text: "replacement" }],
+    });
+    await vi.waitFor(() => expect(sendRemoveAll).toHaveBeenCalledOnce());
+    expect(send).not.toHaveBeenCalled();
+    finish({
+      outcome: "applied",
+      snapshot: {
+        revision: 4,
+        sequence: 2,
+        state: null,
+        held: true,
+        cursor: 1,
+        removedAt: 1,
+      },
+    });
+    await Promise.all([removing, replacing]);
+    expect(send.mock.calls[0][0]).toMatchObject({
+      sequence: 3,
+      attach: "user",
+    });
+    expect(snapshots.mock.lastCall![0]).toMatchObject({
+      revision: 5,
+      sequence: 3,
+      state: { updateId: "new" },
+    });
+    update.restore({ revision: 4, sequence: 2, state: null });
+    expect(snapshots.mock.lastCall![0].revision).toBe(5);
+  });
+  it("does not retry an unknown remove-all on its own or change presentation optimistically", async () => {
+    const snapshots = vi.fn();
+    const send = vi.fn();
+    const sendRemoveAll = vi.fn().mockRejectedValue(new Error("lost response"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      sendRemoveAll,
+      onSnapshot: snapshots,
+    });
+    update.restore({
+      revision: 1,
+      sequence: 1,
+      state: { updateId: "old", content: [{ type: "text", text: "kept" }] },
+    });
+    await expect(
+      update.removeAll({ operationId: "op", basis: 0 }),
+    ).rejects.toThrow("lost response");
+    await expect(update({})).rejects.toThrow("outcome unknown");
+    expect(snapshots).toHaveBeenCalledOnce();
+    expect(send).not.toHaveBeenCalled();
+    expect(sendRemoveAll).toHaveBeenCalledOnce();
+  });
+  it("leaves the App unheld when the person's newer context was kept", async () => {
+    const send = vi.fn(async (request) => result(`u${request.sequence}`));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      sendRemoveAll: vi.fn(async () => ({
+        outcome: "stale",
+        snapshot: {
+          revision: 3,
+          sequence: 2,
+          state: { updateId: "u2", content: [{ type: "text", text: "new" }] },
+          cursor: 1,
+          attachedAt: 1,
+        },
+      })),
+      userAttaching: () => false,
+    });
+    expect(await update.removeAll({ operationId: "op", basis: 0 })).toBe(
+      "stale",
+    );
+    await update({ content: [{ type: "text", text: "own" }] });
+    expect(send).toHaveBeenCalledOnce();
+  });
+  it("snapshots queued params and does not dispatch the second update before the first settles", async () => {
+    let finish!: (value: unknown) => void;
+    const send = vi
+      .fn()
+      .mockImplementationOnce(
+        () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          }),
+      )
+      .mockResolvedValueOnce(result("second"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+    });
+    const params = { content: [{ type: "text", text: "first" }] };
+    const first = update(params);
+    const second = update({ structuredContent: { second: true } });
+    params.content[0].text = "changed";
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send.mock.calls[0][0].params.content[0].text).toBe("first");
+    finish(result("first"));
+    await Promise.all([first, second]);
+    expect(send.mock.calls.map(([request]) => request.sequence)).toEqual([
+      1, 2,
+    ]);
+  });
+  it("allows a known precommit denial but fences uncertain delivery without retry", async () => {
+    const send = vi
+      .fn()
+      .mockRejectedValueOnce(new PluginContextUpdateRejected("unsupported"))
+      .mockResolvedValueOnce(result("accepted"))
+      .mockRejectedValueOnce(new Error("lost response"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+    });
+    await expect(update({})).rejects.toThrow("unsupported");
+    await update({});
+    const next = (n: number) => ({ structuredContent: { n } });
+    await expect(update(next(2))).rejects.toThrow("lost response");
+    await expect(update(next(3))).rejects.toThrow("outcome unknown");
+    expect(send.mock.calls.map(([request]) => request.sequence)).toEqual([
+      1, 1, 2,
+    ]);
+  });
+  it("rejects invalid content before transport and checks lifetime again after delivery", async () => {
+    let alive = true;
+    const send = vi.fn(async () => {
+      alive = false;
+      return result("late");
+    });
+    const update = createModelContextController({
+      requireLive: () => {
+        if (!alive) throw new Error("closed");
+      },
+      send,
+    });
+    expect(() =>
+      update({
+        content: [{ type: "audio", data: "AAAA", mimeType: "audio/wav" }],
+      }),
+    ).toThrow("UNSUPPORTED");
+    expect(send).not.toHaveBeenCalled();
+    await expect(update({})).rejects.toThrow("closed");
+  });
+  it("keeps a removal removed until the person uses the App again", async () => {
+    let using = false;
+    const onHeld = vi.fn();
+    const send = vi.fn(async (request) => ({
+      ...result(`u${request.sequence}`),
+      snapshot: {
+        revision: request.sequence + 1,
+        sequence: request.sequence,
+        state: {
+          updateId: `u${request.sequence}`,
+          content: [{ type: "text", text: "view" }],
+        },
+      },
+    }));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      sendRemoveAll: vi.fn(async () => ({
+        outcome: "applied",
+        snapshot: {
+          revision: 2,
+          sequence: 1,
+          state: null,
+          held: true,
+          cursor: 1,
+          removedAt: 1,
+        },
+      })),
+      onSnapshot: () => {},
+      userAttaching: () => using,
+      onHeld,
+    });
+    update.restore({
+      revision: 1,
+      sequence: 1,
+      state: { updateId: "u1", content: [{ type: "text", text: "view" }] },
+    });
+    await update.removeAll({ operationId: "op", basis: 0 });
+    // The App re-sends its view on its own (Bits & Bolts redraws): refused
+    // here, without a request, and not an unknown outcome.
+    const view = { content: [{ type: "text", text: "view" }] };
+    await expect(update(view)).rejects.toBeInstanceOf(PluginContextHeld);
+    expect(send).not.toHaveBeenCalled();
+    expect(onHeld).toHaveBeenCalledOnce();
+    // The person clicks into the App and attaches again.
+    using = true;
+    await update(view);
+    expect(send).toHaveBeenLastCalledWith(
+      expect.objectContaining({ sequence: 2, attach: "user" }),
+    );
+    // Attached again, the App's own updates flow as before.
+    using = false;
+    await update({ content: [{ type: "text", text: "moved" }] });
+    expect(send).toHaveBeenCalledTimes(2);
+    expect(send.mock.lastCall![0]).not.toHaveProperty("attach");
+  });
+  it("acknowledges an App's identical re-send without another write", async () => {
+    let using = false;
+    const send = vi.fn(async (request) => ({
+      ...result(`u${request.sequence}`),
+      snapshot: {
+        revision: request.sequence * 10,
+        sequence: request.sequence,
+        state: { updateId: `u${request.sequence}`, content: [] },
+      },
+    }));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      onSnapshot: () => {},
+      userAttaching: () => using,
+    });
+    const view = { content: [{ type: "text", text: "view" }] };
+    const first = await update(view);
+    // Bits & Bolts re-sends its view on every redraw.
+    expect(await update(view)).toEqual(first);
+    expect(send).toHaveBeenCalledOnce();
+    // A person using the App always sends.
+    using = true;
+    await update(view);
+    expect(send).toHaveBeenCalledTimes(2);
+    using = false;
+    // Once something else replaced that state, the same view goes again.
+    update.restore({
+      revision: 25,
+      sequence: 2,
+      state: { updateId: "elsewhere", content: [] },
+    });
+    await update(view);
+    expect(send).toHaveBeenCalledTimes(3);
+  });
+  it("learns a hold from the server after a remount", async () => {
+    const send = vi
+      .fn()
+      .mockRejectedValueOnce(new PluginContextHeld("held"))
+      .mockResolvedValueOnce(result("u2"));
+    const update = createModelContextController({
+      requireLive: () => {},
+      send,
+      userAttaching: () => false,
+    });
+    await expect(update({})).rejects.toBeInstanceOf(PluginContextHeld);
+    await expect(update({})).rejects.toBeInstanceOf(PluginContextHeld);
+    expect(send).toHaveBeenCalledOnce();
+  });
+});

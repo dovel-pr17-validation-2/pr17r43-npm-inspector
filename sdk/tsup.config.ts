@@ -1,0 +1,70 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { defineConfig } from "tsup";
+
+const here = dirname(fileURLToPath(import.meta.url));
+const { version: SDK_VERSION } = JSON.parse(
+  readFileSync(join(here, "package.json"), "utf8"),
+) as { version: string };
+
+export default defineConfig({
+  entry: [
+    "src/index.ts",
+    "src/platform-auth.ts",
+    "src/browser.ts",
+    "src/worker.ts",
+    "src/operations.ts",
+    "src/skill-reference.ts",
+    "src/model-factory.ts",
+    "src/model-native-ids.ts",
+    "src/matchers.ts",
+    "src/assertions/index.ts",
+    "src/predicates/index.ts",
+    // Versioned evaluation contract (score definitions/results + pinned
+    // cross-runtime hashing) shared by the SDK, the CLI gate engine, the
+    // inspector client, and the backend's hand-mirrored validators.
+    "src/contract/index.ts",
+    "src/host-config/index.ts",
+    // Low-level first-party entry used by the backend and SDK tooling.
+    "src/host-config/internal.ts",
+    // Node-safe host-template seeding (server `--template` resolver + CLI).
+    "src/host-config/templates/index.ts",
+    // Runtime-agnostic Platform API client (Workers/browser/Node safe).
+    "src/platform/index.ts",
+    // Framework-free public-API wire contract (error codes + envelopes) shared
+    // by the Inspector gateway and (eventually) the Convex backend.
+    "src/public-api/index.ts",
+    // MCP Events (triggers): wire, coordinator, identities, profiles —
+    // runtime-agnostic, shared by the inspector server, client and CLI.
+    "src/events/index.ts",
+    // Framework-free widget/app runtime building blocks (SEP-1865).
+    "src/widget-runtime/index.ts",
+    // Shared host-compatibility verdict engine (UI / CLI / API / MCP).
+    "src/host-compat/index.ts",
+    // Pure OpenAI plugin bundle parser shared with the backend importer.
+    "src/plugin-bundle/index.ts",
+    // First-party (@experimental) plugin extension host: capability registry
+    // and instance session reducer. Published as `./internal/plugin-host`.
+    "src/internal/plugin-host.ts",
+    "src/internal/telemetry.ts",
+    "src/internal/deployment.ts",
+    "src/internal/network-proxy.ts",
+    // Node-only SSRF-hardened OAuth networking (classifier + DNS-pinned
+    // transport) for backend actions that must not load the whole SDK graph.
+    "src/oauth/node.ts",
+  ],
+  external: ["@sentry/node"],
+  format: ["esm"],
+  target: "node20",
+  dts: true,
+  splitting: false,
+  sourcemap: true,
+  clean: true,
+  treeshake: true,
+  minify: false,
+  loader: { '.md': 'text' },
+  define: {
+    __MCPJAM_SDK_VERSION__: JSON.stringify(SDK_VERSION),
+  },
+});

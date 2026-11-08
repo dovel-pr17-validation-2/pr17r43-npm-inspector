@@ -1,0 +1,716 @@
+import { conformanceDeadlineFields } from "../shared/conformance-deadline.js";
+import { Hono } from "hono";
+import { withTasksDeadline } from "./tasks-deadline.js";
+import { z } from "zod";
+import {
+  MCP_APPS_CHECK_IDS,
+  MCP_CHECK_IDS,
+  MCP_PROTOCOL_VERSIONS,
+  MCP_READINESS_IDS,
+  MCP_OAUTH_READINESS_IDS,
+  MCP_TASKS_CHECK_IDS,
+  MCP_TASKS_READINESS_IDS,
+  oauthConformanceProfileSchema,
+  type MCPServerConfig,
+} from "@mcpjam/sdk";
+import { handleRoute, projectServerSchema } from "./auth.js";
+import {
+  ErrorCode,
+  WebRouteError,
+  assertBearerToken,
+  readJsonBody,
+  parseWithSchema,
+} from "./errors.js";
+import {
+  OAUTH_SESSION_EXPIRED_MESSAGE,
+  OAuthConformanceSessionFailedError,
+  OAuthConformanceSessionNotFoundError,
+  UnsupportedTransportError,
+  completeOAuthConformance,
+  cancelOAuthConformance,
+  runAppsConformance,
+  runProtocolConformance,
+  runTasksConformance,
+  startOAuthConformance,
+  submitOAuthConformanceCode,
+} from "../shared/conformance";
+import {
+  conformanceInputResponsesSchema,
+  conformanceTaskOverridesSchema,
+  conformanceProbeFields,
+} from "../shared/conformance-probes";
+import { authorizeServer, toHttpConfig } from "./auth.js";
+import { WEB_CALL_TIMEOUT_MS } from "../../config.js";
+import {
+  BlockedEgressTargetError,
+  EgressResolutionError,
+  assertAllowedHostedTargetUrl,
+} from "../../utils/hosted-egress-guard.js";
+import { principalKey } from "../../utils/request-principal.js";
+import { toBrowserOAuthResult } from "../../utils/oauth-conformance-browser-result.js";
+import { checkConformanceConnection } from "../shared/conformance-connection.js";
+import { getConvexBearerForRequest } from "../../utils/v1-convex-token.js";
+import { reportRouteFailure } from "../../utils/route-error-report.js";
+import {
+  awaitRendezvousResult,
+  createRendezvous,
+  cancelRendezvous,
+  isConformanceOAuthRendezvousEnabled,
+  runRendezvousOnThisReplica,
+  submitRendezvousCode,
+} from "../../services/conformance-oauth-rendezvous.js";
+
+const conformanceWeb = new Hono();
+
+// ── Helpers ─────────────────────────────────────────────────────────────
+
+/**
+ * Every URL these routes will dial passes through here.
+ *
+ * Hosted, a conformance run is an anonymous caller naming a target and our
+ * cloud backend connecting to it — an SSRF primitive unless the target is
+ * checked. Two inputs reach the dialer: the URL Convex resolved for the
+ * authorized server row, and `oauthProfile.serverUrl`, which the OAuth suite
+ * lets a caller supply directly. Neither was validated before.
+ *
+ * Local/desktop mode is exempt by construction (the guard no-ops outside
+ * `HOSTED_MODE`): testing a server on localhost is the inspector's whole job.
+ *
+ * Only the TARGET is judged, never the Host headers the protocol suite sends
+ * — its `localhost-host-rebinding-rejected` checks deliberately send
+ * rebinding-shaped Host values to grade the server's own defenses.
+ */
+async function assertConformanceTarget(
+  rawUrl: string,
+  label: string
+): Promise<void> {
+  try {
+    await assertAllowedHostedTargetUrl(rawUrl, label);
+  } catch (error) {
+    if (error instanceof BlockedEgressTargetError) {
+      throw new WebRouteError(400, ErrorCode.VALIDATION_ERROR, error.message);
+    }
+    // We could not reach a verdict. That is our outage, not a bad request —
+    // answer 503 so the caller knows it is worth trying again.
+    if (error instanceof EgressResolutionError) {
+      throw new WebRouteError(503, ErrorCode.SERVER_UNREACHABLE, error.message);
+    }
+    throw error;
+  }
+}
+
+/**
+ * Resolve HTTP server URL and headers for conformance from authorized config.
+ *
+ * `withLogin` adds the user's login as `Authorization: Bearer`: the one saved
+ * in Convex when they connected (`authorizeServer` hands it back). A token in
+ * the request body is ignored. Hosted OAuth never leaves a token in the page,
+ * and when the backend withholds its saved token on purpose (a repointed URL,
+ * an export policy), a body token must not get past that refusal.
+ */
+async function resolveHostedHttpConfig(
+  c: any,
+  bearerToken: string,
+  body: Record<string, unknown>,
+  options: { withLogin: boolean }
+): Promise<{
+  serverUrl: string;
+  accessToken?: string;
+  customHeaders?: Record<string, string>;
+}> {
+  const wsBody = parseWithSchema(projectServerSchema, body);
+  const auth = await authorizeServer(
+    c,
+    bearerToken,
+    wsBody.projectId,
+    wsBody.serverId,
+    {
+      accessScope: wsBody.accessScope,
+      scenarioId: wsBody.scenarioId,
+      accessVersion: wsBody.accessVersion,
+    }
+  );
+
+  if (auth.serverConfig.transportType !== "http") {
+    throw new WebRouteError(
+      400,
+      ErrorCode.FEATURE_NOT_SUPPORTED,
+      "Protocol conformance requires HTTP transport"
+    );
+  }
+
+  if (!auth.serverConfig.url) {
+    throw new WebRouteError(
+      500,
+      ErrorCode.INTERNAL_ERROR,
+      "Authorized server is missing URL"
+    );
+  }
+
+  const oauthToken = options.withLogin
+    ? (auth.oauthAccessToken ?? undefined)
+    : undefined;
+  const headers: Record<string, string> = {
+    ...(auth.serverConfig.headers ?? {}),
+  };
+  if (oauthToken) {
+    // Replace a saved header in any case, or the request would carry two
+    // Authorization values and the server would see them joined.
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "authorization") delete headers[key];
+    }
+    headers["Authorization"] = `Bearer ${oauthToken}`;
+  }
+
+  await assertConformanceTarget(auth.serverConfig.url, "Server URL");
+
+  return {
+    serverUrl: auth.serverConfig.url,
+    accessToken: undefined, // OAuth token goes in headers
+    customHeaders: Object.keys(headers).length > 0 ? headers : undefined,
+  };
+}
+
+/** Resolve any-transport server config for Apps/Tasks conformance on hosted. */
+async function resolveHostedServerConfig(
+  c: any,
+  bearerToken: string,
+  body: Record<string, unknown>
+): Promise<MCPServerConfig> {
+  const wsBody = parseWithSchema(projectServerSchema, body);
+  const auth = await authorizeServer(
+    c,
+    bearerToken,
+    wsBody.projectId,
+    wsBody.serverId,
+    {
+      accessScope: wsBody.accessScope,
+      scenarioId: wsBody.scenarioId,
+      accessVersion: wsBody.accessVersion,
+    }
+  );
+
+  // Saved login only — see `resolveHostedHttpConfig`.
+  const httpConfig = toHttpConfig(
+    auth,
+    WEB_CALL_TIMEOUT_MS,
+    auth.oauthAccessToken ?? undefined,
+    wsBody.clientCapabilities as Record<string, unknown> | undefined
+  );
+
+  // Apps/Tasks accept any transport, so there may be no URL to judge (a stdio
+  // config never leaves the box). Guard the ones that do.
+  const url = (httpConfig as { url?: unknown }).url;
+  if (typeof url === "string" && url) {
+    await assertConformanceTarget(url, "Server URL");
+  }
+
+  return httpConfig as MCPServerConfig;
+}
+
+/**
+ * Bound a whole conformance run by wall-clock, not just its individual legs.
+ * Losing the race rejects with a 504 so the route always answers inside the
+ * hosted budget. Cancellable runs abort their active work at the same deadline.
+ */
+async function withHostedDeadline<T>(
+  run: Promise<T>,
+  deadlineMs: number,
+  message: string,
+  controller?: AbortController
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const error = new WebRouteError(504, ErrorCode.TIMEOUT, message);
+      reject(error);
+      controller?.abort(error);
+    }, deadlineMs);
+  });
+  // Never leave the losing run as an unhandled rejection.
+  run.catch(() => {});
+  try {
+    return await Promise.race([run, deadline]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function toWebError(error: unknown): WebRouteError {
+  if (error instanceof WebRouteError) return error;
+  if (error instanceof UnsupportedTransportError) {
+    return new WebRouteError(
+      400,
+      ErrorCode.FEATURE_NOT_SUPPORTED,
+      error.message
+    );
+  }
+  if (error instanceof OAuthConformanceSessionNotFoundError) {
+    return new WebRouteError(404, ErrorCode.NOT_FOUND, error.message);
+  }
+  if (error instanceof OAuthConformanceSessionFailedError) {
+    return new WebRouteError(500, ErrorCode.INTERNAL_ERROR, error.message);
+  }
+  return new WebRouteError(
+    500,
+    ErrorCode.INTERNAL_ERROR,
+    error instanceof Error ? error.message : "Unknown error"
+  );
+}
+
+const connectionCheckSchema = z
+  .object({
+    ...conformanceDeadlineFields,
+    protocolVersion: z.enum(["auto", ...MCP_PROTOCOL_VERSIONS]),
+  })
+  .passthrough();
+
+conformanceWeb.post("/connection-check", async (c) =>
+  handleRoute(c, async () => {
+    const bearerToken = assertBearerToken(c);
+    const requestStartedAt = Date.now();
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const parsed = parseWithSchema(connectionCheckSchema, body);
+    const resolved = await resolveHostedHttpConfig(c, bearerToken, body, {
+      withLogin: true,
+    });
+    return checkConformanceConnection(
+      {
+        url: resolved.serverUrl,
+        accessToken: resolved.accessToken,
+        requestInit: { headers: resolved.customHeaders },
+      },
+      parsed.protocolVersion,
+      { requestStartedAt, signal: c.req.raw.signal, runTimeoutSeconds: parsed.runTimeoutSeconds, remainingRunTimeoutMs: parsed.remainingRunTimeoutMs },
+    );
+  }),
+);
+
+// ── POST /protocol ──────────────────────────────────────────────────────
+
+/**
+ * Each check gets the CLI's default limit, so a slow request costs one check
+ * instead of the whole suite, and the suite gives up on a server that stops
+ * answering after two checks.
+ */
+const HOSTED_CHECK_TIMEOUT_MS = 15_000;
+/**
+ * Wall-clock ceiling for a protocol or apps run, under the proxy's 100 s
+ * limit so the route answers with its own message instead of a bare 524.
+ */
+const HOSTED_SUITE_DEADLINE_MS = 85_000;
+
+function suiteDeadlineMessage(suite: string): string {
+  return `The ${suite} checks took longer than the ${
+    HOSTED_SUITE_DEADLINE_MS / 1000
+  }-second limit for a hosted run, so no results came back. Run them again, or pick fewer checks for this suite.`;
+}
+
+const protocolSchema = z
+  .object({
+    ...conformanceDeadlineFields,
+    /** Pin the run to one protocol version; absent ⇒ adopt the negotiated one. */
+    protocolVersion: z.enum(MCP_PROTOCOL_VERSIONS).optional(),
+    /** Run only these checks, as picked before Run; absent ⇒ all of them. */
+    checkIds: z.array(z.enum(MCP_CHECK_IDS)).min(1).optional(),
+    /** Run only this advice; absent ⇒ all of it, empty ⇒ none. */
+    readinessIds: z.array(z.enum(MCP_READINESS_IDS)).optional(),
+    /** Tools named as safe for the checks that must call one. */
+    ...conformanceProbeFields,
+  })
+  .passthrough(); // project/guest fields pass through to resolveHostedHttpConfig
+
+conformanceWeb.post("/protocol", async (c) =>
+  handleRoute(c, async () => {
+    const bearerToken = assertBearerToken(c);
+    const requestStartedAt = Date.now();
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const resolved = await resolveHostedHttpConfig(c, bearerToken, body, {
+      withLogin: true,
+    });
+    const parsed = parseWithSchema(protocolSchema, body);
+
+    const controller = new AbortController();
+    try {
+      const { result } = await withHostedDeadline(
+        runProtocolConformance({
+          requestStartedAt,
+          runTimeoutSeconds: parsed.runTimeoutSeconds,
+          remainingRunTimeoutMs: parsed.remainingRunTimeoutMs,
+          ...resolved,
+          signal: AbortSignal.any([controller.signal, c.req.raw.signal]),
+          protocolVersion: parsed.protocolVersion,
+          checkIds: parsed.checkIds,
+          readinessIds: parsed.readinessIds,
+          logProbe: parsed.logProbe,
+          logLevelFilteringProbe: parsed.logLevelFilteringProbe,
+          inputRequiredProbe: parsed.inputRequiredProbe,
+          toolCallProbe: parsed.toolCallProbe,
+          checkTimeout: HOSTED_CHECK_TIMEOUT_MS,
+        }),
+        HOSTED_SUITE_DEADLINE_MS,
+        suiteDeadlineMessage("Protocol"),
+        controller
+      );
+      return { success: true, result };
+    } catch (error) {
+      throw toWebError(error);
+    }
+  })
+);
+
+// ── POST /apps ──────────────────────────────────────────────────────────
+
+const appsSchema = z
+  .object({
+    ...conformanceDeadlineFields,
+    protocolVersion: z.enum(MCP_PROTOCOL_VERSIONS).optional(),
+    /** Run only these checks, as picked before Run; absent ⇒ all of them. */
+    checkIds: z.array(z.enum(MCP_APPS_CHECK_IDS)).min(1).optional(),
+  })
+  .passthrough(); // project/guest fields pass through to resolveHostedServerConfig
+
+conformanceWeb.post("/apps", async (c) =>
+  handleRoute(c, async () => {
+    const bearerToken = assertBearerToken(c);
+    const requestStartedAt = Date.now();
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const config = await resolveHostedServerConfig(c, bearerToken, body);
+    const parsed = parseWithSchema(appsSchema, body);
+
+    const controller = new AbortController();
+    try {
+      const { result } = await withHostedDeadline(
+        runAppsConformance({
+          requestStartedAt,
+          runTimeoutSeconds: parsed.runTimeoutSeconds,
+          remainingRunTimeoutMs: parsed.remainingRunTimeoutMs,
+          ...config,
+          protocolVersion: parsed.protocolVersion,
+          signal: AbortSignal.any([controller.signal, c.req.raw.signal]),
+          ...(parsed.checkIds ? { checkIds: parsed.checkIds } : {}),
+        }),
+        HOSTED_SUITE_DEADLINE_MS,
+        suiteDeadlineMessage("Apps"),
+        controller,
+      );
+      return { success: true, result };
+    } catch (error) {
+      throw toWebError(error);
+    }
+  })
+);
+
+// ── POST /tasks ─────────────────────────────────────────────────────────
+
+/**
+ * Tasks conformance provokes a real task and polls it to a terminal status,
+ * all inside this single request — the runner opens its own ephemeral client,
+ * so it needs no long-lived connection.
+ *
+ * Fitting that into the hosted budget takes three bounds, not one. Capping the
+ * poll window alone leaves connect, `tools/list` and the provoking
+ * `tools/call` free to burn a full `WEB_CALL_TIMEOUT_MS` *each* before polling
+ * even starts, so the request could run for minutes:
+ *
+ * - `HOSTED_TASKS_CALL_TIMEOUT_MS` bounds each individual MCP leg, replacing
+ *   the route-wide `WEB_CALL_TIMEOUT_MS` this run's config would otherwise
+ *   carry.
+ * - `HOSTED_TASKS_POLL_TIMEOUT_MS` bounds the poll window regardless of what
+ *   the caller asks for.
+ * - `HOSTED_TASKS_DEADLINE_MS` bounds the *whole* run, so however the legs
+ *   compose, the route answers with a 504 instead of hanging past the budget.
+ *   Cancellation aborts active requests and polling, and the SDK closes its
+ *   ephemeral client before the route returns and the next group can start.
+ */
+const HOSTED_TASKS_POLL_TIMEOUT_MS = 20_000;
+/** Per-MCP-call ceiling inside a hosted tasks run (connect, list, call). */
+const HOSTED_TASKS_CALL_TIMEOUT_MS = 10_000;
+/** Wall-clock ceiling for the whole run, held just under the call budget. */
+const HOSTED_TASKS_DEADLINE_MS = WEB_CALL_TIMEOUT_MS - 2_000;
+
+const tasksSchema = z
+  .object({
+    ...conformanceDeadlineFields,
+    protocolVersion: z.enum(MCP_PROTOCOL_VERSIONS).optional(),
+    /** Tool used to provoke a task; required on the extension wire, where
+     *  tools carry no task metadata to pick from. */
+    toolName: z.string().min(1).optional(),
+    toolArguments: z.record(z.string(), z.unknown()).optional(),
+    inputResponses: conformanceInputResponsesSchema,
+    checkOverrides: conformanceTaskOverridesSchema,
+    pollTimeoutMs: z.number().int().positive().max(120_000).optional(),
+    /** Run only these checks, as picked before Run; absent ⇒ all of them. */
+    checkIds: z.array(z.enum(MCP_TASKS_CHECK_IDS)).min(1).optional(),
+    /** Report only this advice; absent ⇒ all of it, empty ⇒ none. */
+    readinessIds: z.array(z.enum(MCP_TASKS_READINESS_IDS)).optional(),
+  })
+  .passthrough(); // project/guest fields pass through to resolveHostedServerConfig
+
+conformanceWeb.post("/tasks", async (c) =>
+  handleRoute(c, async () => {
+    const bearerToken = assertBearerToken(c);
+    const requestStartedAt = Date.now();
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const config = await resolveHostedServerConfig(c, bearerToken, body);
+    const parsed = parseWithSchema(tasksSchema, body);
+
+    try {
+      const result = await withTasksDeadline(
+        (signal) =>
+          runTasksConformance({
+            ...config,
+            requestStartedAt,
+            signal: AbortSignal.any([signal, c.req.raw.signal]),
+            runTimeoutSeconds: parsed.runTimeoutSeconds,
+            remainingRunTimeoutMs: parsed.remainingRunTimeoutMs,
+            protocolVersion: parsed.protocolVersion,
+            timeout: HOSTED_TASKS_CALL_TIMEOUT_MS,
+            ...(parsed.checkIds ? { checkIds: parsed.checkIds } : {}),
+            ...(parsed.readinessIds
+              ? { readinessIds: parsed.readinessIds }
+              : {}),
+            ...(parsed.checkOverrides
+              ? { checkOverrides: parsed.checkOverrides }
+              : {}),
+            ...(parsed.toolName ? { toolName: parsed.toolName } : {}),
+            ...(parsed.toolArguments
+              ? { toolArguments: parsed.toolArguments }
+              : {}),
+            ...(parsed.inputResponses
+              ? { inputResponses: parsed.inputResponses }
+              : {}),
+            pollTimeoutMs: Math.min(
+              parsed.pollTimeoutMs ?? HOSTED_TASKS_POLL_TIMEOUT_MS,
+              HOSTED_TASKS_POLL_TIMEOUT_MS,
+            ),
+          }),
+        HOSTED_TASKS_DEADLINE_MS,
+        `Tasks conformance exceeded the hosted request budget (${HOSTED_TASKS_DEADLINE_MS}ms); run it from the local inspector for a longer poll window`,
+      ).then((r) => r.result);
+      return { success: true, result };
+    } catch (error) {
+      throw toWebError(error);
+    }
+  })
+);
+
+// ── POST /oauth/start ───────────────────────────────────────────────────
+
+const oauthStartSchema = z
+  .object({
+    ...conformanceDeadlineFields,
+    oauthProfile: oauthConformanceProfileSchema.optional(),
+    callbackOrigin: z.string().optional(),
+    /** Report only this advice; absent ⇒ all of it, empty ⇒ none. */
+    readinessIds: z.array(z.enum(MCP_OAUTH_READINESS_IDS)).optional(),
+  })
+  .passthrough(); // project/guest fields pass through to resolveHostedHttpConfig
+
+conformanceWeb.post("/oauth/start", async (c) =>
+  handleRoute(c, async () => {
+    const bearerToken = assertBearerToken(c);
+    const requestStartedAt = Date.now();
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    // No login here: the OAuth suite grades the server from an
+    // unauthenticated request and runs its own fresh authorization. Its probes
+    // merge these headers, so a bearer would make the server answer 200 and
+    // the suite would grade OAuth as not required.
+    const resolved = await resolveHostedHttpConfig(c, bearerToken, body, {
+      withLogin: false,
+    });
+    const parsed = parseWithSchema(oauthStartSchema, body);
+
+    if (!parsed.callbackOrigin) {
+      throw new WebRouteError(
+        400,
+        ErrorCode.VALIDATION_ERROR,
+        "callbackOrigin is required to run OAuth conformance"
+      );
+    }
+
+    // The profile's `serverUrl` OVERRIDES the Convex-resolved one inside the
+    // suite, so authorizing the server row is not enough — this string is
+    // caller-controlled and must clear the same bar.
+    if (parsed.oauthProfile?.serverUrl) {
+      await assertConformanceTarget(
+        parsed.oauthProfile.serverUrl,
+        "OAuth profile server URL"
+      );
+    }
+
+    // Prod runs several replicas with no sticky sessions: the run stays here,
+    // but the code and the result cross over through Convex (see
+    // services/conformance-oauth-rendezvous.ts).
+    const convexBearer = isConformanceOAuthRendezvousEnabled()
+      ? await getConvexBearerForRequest(c)
+      : undefined;
+
+    try {
+      const started = await startOAuthConformance({
+      requestStartedAt,
+      runTimeoutSeconds: parsed.runTimeoutSeconds,
+      remainingRunTimeoutMs: parsed.remainingRunTimeoutMs,
+        defaultServerUrl: resolved.serverUrl,
+        defaultCustomHeaders: resolved.customHeaders,
+        redirectUrl: `${parsed.callbackOrigin.replace(
+          /\/$/,
+          ""
+        )}/oauth/callback/debug`,
+        oauthProfile: parsed.oauthProfile,
+        readinessIds: parsed.readinessIds,
+        owner: principalKey(c),
+        ...(convexBearer
+          ? {
+              onAuthorizationNeeded: async (session) => {
+                try {
+                  await createRendezvous(convexBearer, session.id);
+                } catch (error) {
+                  reportRouteFailure(
+                    "conformance OAuth rendezvous not created",
+                    error,
+                    {
+                      source: "web.conformance.oauth.start.rendezvous",
+                      hop: "mcpjam_internal",
+                    }
+                  );
+                  throw new WebRouteError(
+                    503,
+                    ErrorCode.INTERNAL_ERROR,
+                    "Couldn't start the OAuth checks. Run the checks again."
+                  );
+                }
+                runRendezvousOnThisReplica(session);
+              },
+            }
+          : {}),
+      });
+      return started.phase === "complete"
+        ? { ...started, result: toBrowserOAuthResult(started.result) }
+        : started;
+    } catch (error) {
+      throw toWebError(error);
+    }
+  })
+);
+
+// ── POST /oauth/authorize ───────────────────────────────────────────────
+
+const oauthAuthorizeSchema = z.object({
+  sessionId: z.string().min(1),
+  code: z.string().min(1),
+  state: z.string().optional(),
+});
+
+conformanceWeb.post("/oauth/authorize", async (c) =>
+  handleRoute(c, async () => {
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const parsed = parseWithSchema(oauthAuthorizeSchema, body);
+
+    if (isConformanceOAuthRendezvousEnabled()) {
+      // The run may live on another replica: leave the code in Convex for it.
+      const bearer = await getConvexBearerForRequest(c);
+      let outcome: "accepted" | "gone";
+      try {
+        outcome = await submitRendezvousCode(bearer, parsed);
+      } catch (error) {
+        reportRouteFailure("conformance OAuth code not submitted", error, {
+          source: "web.conformance.oauth.authorize.rendezvous",
+          hop: "mcpjam_internal",
+        });
+        throw new WebRouteError(
+          503,
+          ErrorCode.INTERNAL_ERROR,
+          "Couldn't send the sign-in code to the OAuth checks. Run the checks again."
+        );
+      }
+      if (outcome === "gone") {
+        throw new WebRouteError(
+          404,
+          ErrorCode.NOT_FOUND,
+          OAUTH_SESSION_EXPIRED_MESSAGE
+        );
+      }
+      return { success: true };
+    }
+
+    const delivered = submitOAuthConformanceCode({
+      ...parsed,
+      owner: principalKey(c),
+    });
+    if (!delivered) {
+      throw new WebRouteError(
+        404,
+        ErrorCode.NOT_FOUND,
+        OAUTH_SESSION_EXPIRED_MESSAGE
+      );
+    }
+    return { success: true };
+  })
+);
+
+conformanceWeb.post("/oauth/cancel", async (c) =>
+  handleRoute(c, async () => {
+    assertBearerToken(c);
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const parsed = parseWithSchema(z.object({ sessionId: z.string().min(1) }), body);
+    try {
+      if (isConformanceOAuthRendezvousEnabled()) {
+        await cancelRendezvous(await getConvexBearerForRequest(c), parsed.sessionId);
+      }
+    } finally {
+      cancelOAuthConformance({ sessionId: parsed.sessionId, owner: principalKey(c) });
+    }
+    return { success: true };
+  })
+);
+
+// ── POST /oauth/complete ────────────────────────────────────────────────
+
+const oauthCompleteSchema = z.object({
+  sessionId: z.string().min(1),
+});
+
+conformanceWeb.post("/oauth/complete", async (c) =>
+  handleRoute(c, async () => {
+    const body = await readJsonBody<Record<string, unknown>>(c);
+    const parsed = parseWithSchema(oauthCompleteSchema, body);
+
+    if (isConformanceOAuthRendezvousEnabled()) {
+      // Written by whichever replica ran the checks, already shaped for the
+      // browser.
+      const outcome = await awaitRendezvousResult(
+        await getConvexBearerForRequest(c),
+        parsed.sessionId
+      );
+      switch (outcome.phase) {
+        case "complete":
+          return { phase: "complete" as const, result: outcome.result };
+        case "pending":
+          return { phase: "pending" as const, completedSteps: [] };
+        case "failed":
+          throw new WebRouteError(500, ErrorCode.INTERNAL_ERROR, outcome.error);
+        case "gone":
+          throw new WebRouteError(
+            404,
+            ErrorCode.NOT_FOUND,
+            OAUTH_SESSION_EXPIRED_MESSAGE
+          );
+      }
+    }
+
+    try {
+      const completed = await completeOAuthConformance({
+        ...parsed,
+        owner: principalKey(c),
+      });
+      return completed.phase === "complete"
+        ? { ...completed, result: toBrowserOAuthResult(completed.result) }
+        : completed;
+    } catch (error) {
+      throw toWebError(error);
+    }
+  })
+);
+
+export default conformanceWeb;

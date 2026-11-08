@@ -1,0 +1,1212 @@
+import type { GroundingReport } from "../../shared/swarm-grounding";
+import { getServiceCredential } from "./service-credential.js";
+import type { Harness } from "@mcpjam/sdk";
+import type {
+  HostConfigMcpProfileV1,
+  McpToolResultImageRenderingPolicy,
+  ModelVisibleMcpToolResults,
+} from "@mcpjam/sdk/host-config/internal";
+import type { Predicate } from "@mcpjam/sdk/predicates";
+import type { HostComputerResource } from "../utils/built-in-tools/registry.js";
+import type { PinnedSkillArtifact } from "../../shared/skill-types.js";
+import {
+  localHarnessCapabilities,
+  runnerCapabilities,
+  swarmSponsorshipCapabilities,
+} from "./evals/runner-capabilities.js";
+import {
+  parseFundingSummary,
+  parseSessionFunding,
+  SWARM_SPONSORSHIP_CAPABILITY,
+  SWARM_SPONSORSHIP_REJECTED_CODE,
+  type SwarmFundingSummary,
+  type SwarmSessionFunding,
+} from "../../shared/swarm-sponsorship";
+
+/**
+ * Inspector-side adapter for the backend swarm (journey-execution)
+ * runner-control API. The journey snapshot, persona driver, run record, and
+ * attempt state machine live in `mcpjam-backend/convex/journeyExecution/`.
+ * This file is a thin fetch wrapper that trusts the backend's already-pinned
+ * snapshot — it NEVER refetches a live host config.
+ *
+ * Every call is authenticated with the launching member's user bearer and is
+ * LAUNCHER-gated + PROJECT-member-gated server-side.
+ */
+
+/**
+ * Pinned host execution spec — one entry in `snapshot.hosts[]`. Carries the
+ * host's runtime config as of run-create time. Connection defaults / overrides
+ * are secret-free (the backend strips secrets before returning the snapshot).
+ */
+/**
+ * Reference to the environment an ENV-BASED execution target was resolved from
+ * (Project Environments). `environmentId` is the first-class id the session-id
+ * mint keys on — never derive it from `targetId`.
+ */
+export interface JourneyEnvironmentRef {
+  environmentId: string;
+  name: string;
+  revision: number;
+}
+
+/**
+ * Per-skill metadata pinned onto a snapshot target (bodies are NOT inline —
+ * the runner fetches them via {@link fetchPinnedSkill}). Mirrors the backend
+ * `PinnedSkillMeta`; `channels` is the P0.2 host/environment provenance and is
+ * absent on pre-P0.2 snapshots.
+ */
+export interface PinnedSkillMeta {
+  skillId?: string;
+  name: string;
+  description: string;
+  contentHash: string;
+  sharing?: "user" | "project";
+  /** Stable `host` → `environment` → `plugin` order; see PinnedSkillArtifact. */
+  channels?: Array<"host" | "environment" | "plugin">;
+}
+
+export interface PinnedHostExecutionSpec {
+  hostId: string;
+  hostName: string;
+  hostConfigId: string;
+  modelId: string;
+  /** Optional routing provenance from the immutable host snapshot. Omitted keeps legacy lookup. */
+  hosted?: boolean;
+  /**
+   * The saved selection behind `modelId`, frozen into the swarm snapshot at
+   * launch (`resolvedSelection`). Untrusted until read with
+   * `readStoredModelSelection`; absent ⇒ `modelId` reads as legacy.
+   */
+  resolvedSelection?: unknown;
+  systemPrompt: string;
+  temperature?: number;
+  requireToolApproval: boolean;
+  serverIds: string[];
+  optionalServerIds?: string[];
+  builtInToolIds?: string[];
+  /**
+   * What THIS target's `browser_*` tools may do, pinned from the host config
+   * at launch. A swarm session never pauses to ask, so approval — the gate
+   * every interactive surface uses — does not exist here and this declared
+   * policy is the ONLY thing that can authorize a browser tool. Absent or
+   * malformed ⇒ no browser tools are advertised (fail-closed).
+   *
+   * `unknown` on purpose: the snapshot is member-readable JSON, so it is
+   * parsed by `parseBrowserToolPolicy` at the point of use rather than trusted
+   * as a shape here.
+   */
+  browserToolPolicy?: unknown;
+  /** Explicit profile pin; unattended targets never inherit chat defaults. */
+  browserProfileId?: string;
+  computer?: HostComputerResource;
+  /**
+   * PRESENCE-ONLY signal that this target has a bootable environment image
+   * frozen for its ephemeral sandbox (B-isolation). The runner never reads the
+   * ids — it asks the control plane to provision by
+   * `(runId, targetId, sessionIdx)` and the backend resolves the image from the
+   * same snapshot, so these fields exist to answer "is a sandbox obtainable?",
+   * not to name one. Vendor identifiers are deliberately absent: this snapshot
+   * is readable by every project member.
+   */
+  computerEnvironment?: {
+    environmentId: string;
+    environmentBuildId: string;
+  };
+  /**
+   * Why this target has NO image, when it wanted one. Forms an explicit
+   * tri-state with the field above:
+   *   `computerEnvironment` ⇒ a sandbox is obtainable,
+   *   `computerUnavailableReason` ⇒ known-unavailable, say so in the run (a
+   *     hosted harness target with a broken pin is now refused at launch, so
+   *     only older runs carry it for one),
+   *   BOTH absent ⇒ for a HARNESS target with a computer, boot the default
+   *     template; otherwise a pre-B-isolation run (or a target that never
+   *     wanted bash), which must keep today's behaviour rather than being
+   *     treated as "unavailable".
+   */
+  computerUnavailableReason?: string;
+  harness?: Harness;
+  agentLoop?: Harness;
+  respectToolVisibility?: boolean;
+  progressiveToolDiscovery?: boolean;
+  requireNativeToolDiscovery?: boolean;
+  modelVisibleMcpToolResults?: ModelVisibleMcpToolResults;
+  mcpToolResultImageRendering?: McpToolResultImageRenderingPolicy;
+  /**
+   * Pinned host MCP profile — the INITIALIZE pins (`mcpProtocolVersion` +
+   * `initialize.{clientInfo,supportedProtocolVersions}`) captured at run-create
+   * time. The backend's `materializeHostSpec` copies the host's `mcpProfile`
+   * VERBATIM onto the snapshot (secret-free); the swarm route reads the
+   * initialize pins from HERE, not from the scrubbed `connectionDefaults` (which
+   * the backend strips down to just `{ requestTimeout }`).
+   */
+  mcpProfile?: HostConfigMcpProfileV1;
+  /**
+   * The host's style, frozen with the target so sparse `mcpProfile` app
+   * overrides resolve against the same preset an eval run uses. Absent on
+   * runs created before the backend pinned it.
+   */
+  hostStyle?: string;
+  /**
+   * Pinned MCP client capabilities advertised on INITIALIZE, captured at
+   * run-create time. Passed into `createAuthorizedManager` so the run negotiates
+   * with the SAME capabilities the host declared (mirrors the scenario path's
+   * `clientCapabilities`), not whatever the current live config would send.
+   */
+  clientCapabilities?: Record<string, unknown>;
+  /**
+   * Secret-free per-server connection defaults. The backend strips this to just
+   * `{ requestTimeout }` (header values are dropped) — INITIALIZE pins live on
+   * `mcpProfile`, NOT here.
+   */
+  connectionDefaults?: Record<string, unknown>;
+  /** Secret-free per-server connection overrides keyed by serverId. */
+  serverConnectionOverrides?: Record<string, unknown>;
+  /**
+   * Opaque execution-target id (Project Environments). Present on every fresh
+   * run's targets (`host:` / `environment:` shaped — NEVER parsed here); absent
+   * on historical pre-environments snapshots. Echoed verbatim on attempt
+   * claim/terminal and chat ingestion so two targets sharing a host stay
+   * unambiguous.
+   */
+  targetId?: string;
+  /** Set for ENVIRONMENT-based targets only; absent ⇒ legacy host target. */
+  environmentRef?: JourneyEnvironmentRef;
+  /** The environment's standalone server-group pointer (provenance only). */
+  serverAttachmentId?: string;
+  /**
+   * Servers contributed by the environment's pinned plugin VERSIONS. A
+   * deliberate SIBLING of `serverIds`, never merged into it by the backend: the
+   * snapshot is immutable, so a plugin-materialized id inside `serverIds` would
+   * be a permanent grant and a re-run would reconnect an uninstalled plugin
+   * forever.
+   *
+   * A RECORD OF WHAT WAS PINNED, NOT A LIST TO CONNECT. Decision D2: the runner
+   * re-gates these against the live plugin lifecycle at execution time — see
+   * `services/journeys/plugin-servers.ts`. Absent ⇒ the target's environment
+   * pinned no server-bearing plugin (or the run predates the field).
+   */
+  pluginServerIds?: string[];
+  /**
+   * Host-carried skill selection snapshotted from the host config (#767 —
+   * inline, no skill-group ref). Provenance only on this side: the runner
+   * never resolves it live — pinned bodies come from `pinnedSkills` +
+   * {@link fetchPinnedSkill}. Used to detect a pre-P0.2 snapshot whose host
+   * channel was NOT pinned (fail closed rather than silently dropping it).
+   */
+  skillSelection?: { mode: "explicit"; skillIds: string[] } | null;
+  /**
+   * Pinned skill METADATA for this target (bodies fetched separately). After
+   * P0.2 this is the deduped authoritative host+environment union with
+   * per-entry `channels` provenance. Absent on legacy host targets (live-pool
+   * semantics) AND on env targets whose composed selection is empty (the env
+   * target then runs skill-less — never the live pool).
+   */
+  pinnedSkills?: PinnedSkillMeta[];
+}
+
+export interface PersonaSnapshot {
+  personaId: string;
+  name: string;
+  role: string;
+  notes: string;
+}
+
+/**
+ * One row of a journey's deterministic rubric, as pinned onto the run.
+ *
+ * `id` is an opaque client-minted string the backend stores verbatim — the
+ * runner correlates verdicts by it and must never parse or regenerate it.
+ */
+export interface JourneyCriterion {
+  id: string;
+  label?: string;
+  predicate: Predicate;
+}
+
+export interface JourneySnapshot {
+  setupWrites?: boolean;
+  hosts: PinnedHostExecutionSpec[];
+  personaSnapshot: PersonaSnapshot;
+  goal?: string;
+  sessionsPerTarget: number;
+  maxTurns: number;
+  /**
+   * Deterministic criteria frozen at launch. Absent or empty ⇒ the run is not
+   * rubric-graded and the runner skips grading entirely (which is what makes
+   * "no `criteria` stamp" mean "no rubric" downstream).
+   */
+  rubric?: JourneyCriterion[];
+  standardCheckProfile?: { version: 1; criteria: JourneyCriterion[] };
+}
+
+export interface CreateJourneyRunResult {
+  runId: string;
+  projectId: string;
+  journeyRefId: string;
+  snapshot: JourneySnapshot;
+  /**
+   * True when the backend deduped this launch onto an EXISTING run (launchKey
+   * replay: same project + creator + journey). The original launch's runner
+   * owns that run — the caller MUST NOT start a second runner for it, or the
+   * duplicate's shutdown/cleanup (finalize-pending, abort finalizers) races
+   * the owner and can kill attempts the owner is still executing.
+   */
+  deduped: boolean;
+  /**
+   * How the backend funded this run's conversations. Absent from a backend
+   * that predates sponsorship (and from a replay it cannot re-derive), in which
+   * case every conversation is credit-funded exactly as before.
+   */
+  funding?: SwarmFundingSummary;
+  /** Per-conversation funding in planned target/session order. */
+  sessions?: SwarmSessionFunding[];
+}
+
+export type SwarmAttemptStatus =
+  | "pending"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "rate_limited";
+
+export interface SwarmPersonaNextTurnResponse {
+  message: string;
+  endSession: boolean;
+}
+
+/**
+ * Carries the backend HTTP status so the route can distinguish a transactional
+ * reject (e.g. a multi-host journey against `maxHosts: 1`) — surfaced as a 4xx
+ * — from a 5xx / transport failure.
+ */
+export class SwarmAgentError extends Error {
+  readonly status: number;
+  readonly bodyText: string;
+  /**
+   * The upstream `Retry-After`, verbatim, when the backend sent one.
+   *
+   * The status already crossed this boundary; the header did not, and on a 429
+   * the header is the actionable half. The backend's throttles know when they
+   * lift — a token bucket to the millisecond, a daily cap to the UTC roll —
+   * and re-deriving that on our side would be a guess. Carried as the raw
+   * string rather than parsed seconds so what we forward is exactly what we
+   * were told.
+   */
+  readonly retryAfter?: string;
+  constructor(
+    status: number,
+    bodyText: string,
+    message: string,
+    retryAfter?: string,
+  ) {
+    super(message);
+    this.name = "SwarmAgentError";
+    this.status = status;
+    this.bodyText = bodyText;
+    this.retryAfter = retryAfter;
+  }
+}
+
+/**
+ * `Retry-After` off an upstream response, or `undefined`.
+ *
+ * Bounded and shape-checked before it is allowed to become a header on OUR
+ * response: it arrives from another service, and a header we forward blind is
+ * a header we let someone else set. Delta-seconds only — the RFC also permits
+ * an HTTP-date, which nothing in the backend emits, so accepting it here would
+ * be carrying a format no producer produces.
+ */
+export function upstreamRetryAfter(response: Response): string | undefined {
+  const raw = response.headers.get("retry-after");
+  if (!raw) return undefined;
+  const trimmed = raw.trim();
+  return /^\d{1,7}$/.test(trimmed) ? trimmed : undefined;
+}
+
+// Cross-repo HTTP boundary — attach an AbortSignal timeout to every call.
+// Non-LLM control-plane calls (create/attempt/heartbeat) get 30s; the
+// LLM-backed persona driver gets 120s to cover slower models.
+const NON_LLM_TIMEOUT_MS = 30_000;
+const LLM_TIMEOUT_MS = 120_000;
+
+async function postJson<T>(
+  url: string,
+  bearer: string,
+  body: unknown,
+  timeoutMs: number,
+  // Optional caller signal (e.g. the run's abort) composed with the per-call
+  // timeout so EITHER a timeout OR a shutdown/cancel aborts the in-flight fetch.
+  signal?: AbortSignal,
+  extraHeaders?: Record<string, string>,
+): Promise<T> {
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${bearer}`,
+      ...(extraHeaders ?? {}),
+    },
+    body: JSON.stringify(body),
+    signal: signal
+      ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal])
+      : AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new SwarmAgentError(
+      response.status,
+      errorText,
+      `swarm-agent ${url} failed (${response.status}): ${errorText}`,
+      upstreamRetryAfter(response),
+    );
+  }
+  return (await response.json()) as T;
+}
+
+/**
+ * The proof the backend requires, on top of user auth, for a SPONSORED
+ * conversation's control-plane calls. Never attached to a credit-funded one:
+ * the backend decides sponsorship from the attempt's persisted funding, so the
+ * header cannot make a call sponsored, it only lets a sponsored call through.
+ *
+ * Throws a sponsorship-rejected error when the token is missing rather than
+ * sending a call the backend must refuse; the caller ends that conversation as
+ * a platform problem, never as a paid retry.
+ */
+function sponsoredCallHeaders(): Record<string, string> {
+  const token = getServiceCredential();
+  if (!token) {
+    throw new Error(
+      `INSPECTOR_SERVICE_TOKEN is not set, so this server cannot attest a sponsored conversation (${SWARM_SPONSORSHIP_REJECTED_CODE}).`,
+    );
+  }
+  return { "x-inspector-service-token": token };
+}
+
+/**
+ * The same proof, for the call that DECLARES the capability. The backend only
+ * honours `swarm-sponsorship-v1` on a request that carries it, because the
+ * capability is what lets a launch allocate platform money: a browser that puts
+ * the string in a request body must not be able to claim it. Attached exactly
+ * when the declared list carries the capability, which this process only
+ * declares while the token is set, so a server without one sends the same bare
+ * request it always has.
+ */
+function capabilityAttestationHeaders(
+  capabilities: readonly string[],
+): Record<string, string> | undefined {
+  return capabilities.includes(SWARM_SPONSORSHIP_CAPABILITY)
+    ? sponsoredCallHeaders()
+    : undefined;
+}
+
+async function getJson<T>(
+  url: string,
+  bearer: string,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<T> {
+  const response = await fetch(url, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${bearer}` },
+    signal: signal
+      ? AbortSignal.any([AbortSignal.timeout(timeoutMs), signal])
+      : AbortSignal.timeout(timeoutMs),
+  });
+  if (!response.ok) {
+    const errorText = await response.text().catch(() => "");
+    throw new SwarmAgentError(
+      response.status,
+      errorText,
+      `swarm-agent ${url} failed (${response.status}): ${errorText}`,
+      upstreamRetryAfter(response),
+    );
+  }
+  return (await response.json()) as T;
+}
+
+/**
+ * The served pinned-skill body does not match the snapshot metadata it was
+ * fetched for (hash mismatch or a malformed envelope). NEVER retried and NEVER
+ * cached — it signals snapshot/store inconsistency, not a transient fault.
+ */
+export class PinnedSkillIntegrityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PinnedSkillIntegrityError";
+  }
+}
+
+/**
+ * Fetch ONE pinned skill's complete runtime artifact for an env-based target:
+ * `GET /journey-execution/runs/skill?runId&projectId&targetId&contentHash`.
+ * Same bearer/authorization as the attempt/heartbeat routes (project member +
+ * run launcher). The response mirrors P0.2's complete artifact envelope
+ * ({@link PinnedSkillArtifact}) — the shipped backend serves the SKILL.md-only
+ * subset, which is the same shape with the optional extensions absent.
+ *
+ * Error contract (consumed by the pinned-skill cache's retry policy):
+ *   - 404 → {@link SwarmAgentError} with `status: 404` (never retried — the
+ *     target/hash pairing is not in the immutable snapshot).
+ *   - 5xx / transport → {@link SwarmAgentError} / fetch error (retryable).
+ *   - served hash ≠ requested hash → {@link PinnedSkillIntegrityError}
+ *     (never retried, never cached).
+ */
+export async function fetchPinnedSkill(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    targetId: string;
+    contentHash: string;
+    signal?: AbortSignal;
+  },
+): Promise<PinnedSkillArtifact> {
+  const query = new URLSearchParams({
+    runId: args.runId,
+    projectId: args.projectId,
+    targetId: args.targetId,
+    contentHash: args.contentHash,
+  });
+  const data = await getJson<{
+    ok?: boolean;
+    skill?: PinnedSkillArtifact;
+    error?: string;
+  }>(
+    `${convexHttpUrl}/journey-execution/runs/skill?${query.toString()}`,
+    bearer,
+    NON_LLM_TIMEOUT_MS,
+    args.signal,
+  );
+  const skill = data.skill;
+  if (
+    data.ok !== true ||
+    !skill ||
+    typeof skill.name !== "string" ||
+    // `description` is REQUIRED on the artifact (it becomes the skill's
+    // frontmatter description in the sandbox), so validate it here rather than
+    // letting `undefined` reach the runtime as a well-typed lie.
+    typeof skill.description !== "string" ||
+    typeof skill.content !== "string" ||
+    typeof skill.contentHash !== "string"
+  ) {
+    throw new PinnedSkillIntegrityError(
+      `Invalid pinned-skill response from backend: ${
+        data.error ?? "malformed envelope"
+      }`,
+    );
+  }
+  if (skill.contentHash !== args.contentHash) {
+    throw new PinnedSkillIntegrityError(
+      `Pinned skill hash mismatch: requested ${args.contentHash}, served ${skill.contentHash}`,
+    );
+  }
+  return skill;
+}
+
+/**
+ * What this process declares on `runs/create` and on the funding preview. One
+ * list for both, so the preview describes exactly the allocation the launch
+ * will get. A launch for the local venue also names the harnesses it will run
+ * (`local-harness:<id>`), which only `runs/create` carries.
+ */
+export function swarmRunnerCapabilities(local?: {
+  runtimeVenue?: "hosted" | "local";
+  localHarnessIds?: readonly string[];
+}): string[] {
+  return [
+    ...runnerCapabilities(),
+    "swarm-standard-checks-v1",
+    ...(local?.runtimeVenue === "local"
+      ? localHarnessCapabilities(local.localHarnessIds)
+      : []),
+    ...swarmSponsorshipCapabilities(),
+  ];
+}
+
+/** One planned run in a funding preview; mirrors the launch parameters. */
+export interface SwarmFundingPreviewRunInput {
+  journeyRefId: string;
+  /** What the launch will create the run as (see the client's twin type). */
+  kind?: "swarm" | "user_testing";
+  environmentIds?: string[];
+  sessionsPerTarget?: number;
+}
+
+export interface SwarmFundingPreviewRun extends SwarmFundingSummary {
+  targets: Array<{ targetId: string; eligible: boolean; reason?: string }>;
+}
+
+export interface SwarmFundingPreview {
+  /** False when sponsorship cannot apply to this caller or this server. */
+  supported: boolean;
+  /** Sponsored conversations left in the caller's allowance. */
+  remaining: number;
+  granted: number;
+  runs: SwarmFundingPreviewRun[];
+}
+
+const UNSUPPORTED_FUNDING_PREVIEW: SwarmFundingPreview = {
+  supported: false,
+  remaining: 0,
+  granted: 0,
+  runs: [],
+};
+
+/**
+ * Read-only preview of how a wave's conversations would be funded. Counts are
+ * cumulative across `runs` in order, mirroring the wave's sequential
+ * allocation. A server without INSPECTOR_SERVICE_TOKEN never advertises the
+ * capability, so it answers `supported: false` without asking the backend; a
+ * backend that predates the route (404/405) reads the same way.
+ */
+export async function previewSwarmFunding(
+  convexHttpUrl: string,
+  bearer: string,
+  args: { projectId: string; runs: SwarmFundingPreviewRunInput[] },
+): Promise<SwarmFundingPreview> {
+  if (swarmSponsorshipCapabilities().length === 0) {
+    return UNSUPPORTED_FUNDING_PREVIEW;
+  }
+  const capabilities = swarmRunnerCapabilities();
+  let data: Record<string, unknown>;
+  try {
+    data = await postJson<Record<string, unknown>>(
+      `${convexHttpUrl}/journey-execution/funding-preview`,
+      bearer,
+      {
+        projectId: args.projectId,
+        runnerCapabilities: capabilities,
+        runs: args.runs,
+      },
+      NON_LLM_TIMEOUT_MS,
+      undefined,
+      capabilityAttestationHeaders(capabilities),
+    );
+  } catch (error) {
+    if (
+      error instanceof SwarmAgentError &&
+      (error.status === 404 || error.status === 405)
+    ) {
+      return UNSUPPORTED_FUNDING_PREVIEW;
+    }
+    throw error;
+  }
+  const nonNegative = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) && value >= 0
+      ? Math.floor(value)
+      : 0;
+  const runs: SwarmFundingPreviewRun[] = Array.isArray(data.runs)
+    ? data.runs.map((entry): SwarmFundingPreviewRun => {
+        const run = (entry ?? {}) as Record<string, unknown>;
+        return {
+          sponsored: nonNegative(run.sponsored),
+          credits: nonNegative(run.credits),
+          total: nonNegative(run.total),
+          targets: Array.isArray(run.targets)
+            ? run.targets.flatMap((t) => {
+                const target = (t ?? {}) as Record<string, unknown>;
+                return typeof target.targetId === "string"
+                  ? [
+                      {
+                        targetId: target.targetId,
+                        eligible: target.eligible === true,
+                        ...(typeof target.reason === "string"
+                          ? { reason: target.reason }
+                          : {}),
+                      },
+                    ]
+                  : [];
+              })
+            : [],
+        };
+      })
+    : [];
+  return {
+    supported: data.supported === true,
+    remaining: nonNegative(data.remaining),
+    granted: nonNegative(data.granted),
+    runs,
+  };
+}
+
+/**
+ * Create a journey run and return the pinned execution snapshot.
+ *
+ * `maxHosts` is an optional upper bound the backend enforces transactionally
+ * BEFORE any run row is created (a journey exceeding it is rejected — surfaced
+ * here as a {@link SwarmAgentError} with a 4xx status). The single-host slice
+ * (PR 3c) passed `maxHosts: 1`; the fan-out runner (PR 3d) omits it and lets
+ * the backend pin the journey's full host set.
+ */
+export async function createJourneyRun(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    runtimeVenue?: "hosted" | "local";
+    /**
+     * The harnesses this runner will execute locally for this wave, checked
+     * by the launch. Declared as `local-harness:<id>` so the backend stamps
+     * exactly those targets local.
+     */
+    localHarnessIds?: readonly string[];
+    projectId: string;
+    journeyRefId: string;
+    launchKey: string;
+    kind?: "swarm" | "user_testing";
+    maxHosts?: number;
+    /**
+     * Opaque id shared by every run of one co-launched swarm wave. Omitted by
+     * older callers, and silently ignored by a backend that predates it — the
+     * run is then simply ungrouped and the Inspector falls back to clustering
+     * by `createdAt`.
+     */
+    swarmRunGroupId?: string;
+    /** Per-run environment fan-out, overriding the journey's stored list. */
+    environmentIds?: string[];
+    /** Iterations for THIS run, overriding the journey's stored fan-out. */
+    sessionsPerTarget?: number;
+    /**
+     * How many of this request's conversations the caller was told are
+     * sponsored. The backend refuses the launch (409 `swarm_funding_changed`)
+     * instead of silently shifting conversations to the organization's credits.
+     */
+    expectedSponsored?: number;
+  },
+): Promise<CreateJourneyRunResult> {
+  // Asserted by this process, never a caller: the runner is the only honest
+  // source for what it can execute. One list feeds the body and the
+  // attestation header, so they cannot disagree.
+  const capabilities = swarmRunnerCapabilities({
+    runtimeVenue: args.runtimeVenue,
+    localHarnessIds: args.localHarnessIds,
+  });
+  const data = await postJson<{
+    ok?: boolean;
+    runId?: string;
+    projectId?: string;
+    journeyRefId?: string;
+    snapshot?: JourneySnapshot;
+    deduped?: boolean;
+    funding?: unknown;
+    sessions?: unknown;
+    error?: string;
+  }>(
+    `${convexHttpUrl}/journey-execution/runs/create`,
+    bearer,
+    {
+      // `projectId` is REQUIRED by the backend route (it reads `body.projectId`
+      // and 400s without it); it scopes the LAUNCHER + project-member gate.
+      runtimeVenue: args.runtimeVenue ?? "hosted",
+      projectId: args.projectId,
+      journeyRefId: args.journeyRefId,
+      launchKey: args.launchKey,
+      kind: args.kind ?? "swarm",
+      ...(args.maxHosts !== undefined ? { maxHosts: args.maxHosts } : {}),
+      ...(args.swarmRunGroupId
+        ? { swarmRunGroupId: args.swarmRunGroupId }
+        : {}),
+      ...(args.environmentIds?.length
+        ? { environmentIds: args.environmentIds }
+        : {}),
+      ...(args.sessionsPerTarget !== undefined
+        ? { sessionsPerTarget: args.sessionsPerTarget }
+        : {}),
+      ...(args.expectedSponsored !== undefined
+        ? { expectedSponsored: args.expectedSponsored }
+        : {}),
+      runnerCapabilities: capabilities,
+    },
+    NON_LLM_TIMEOUT_MS,
+    undefined,
+    capabilityAttestationHeaders(capabilities),
+  );
+  if (
+    !data.ok ||
+    typeof data.runId !== "string" ||
+    typeof data.projectId !== "string" ||
+    typeof data.journeyRefId !== "string" ||
+    !data.snapshot
+  ) {
+    throw new Error(
+      `Invalid response from backend createJourneyRun: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+  return {
+    runId: data.runId,
+    projectId: data.projectId,
+    journeyRefId: data.journeyRefId,
+    snapshot: data.snapshot,
+    // Strict `=== true`: an absent field means a fresh run (never wrongly skip
+    // starting the runner for a genuinely new launch).
+    deduped: data.deduped === true,
+    ...(() => {
+      const funding = parseFundingSummary(data.funding);
+      const sessions = parseSessionFunding(data.sessions);
+      return {
+        ...(funding ? { funding } : {}),
+        ...(sessions.length > 0 ? { sessions } : {}),
+      };
+    })(),
+  };
+}
+
+/**
+ * Report an attempt state transition. The state machine is
+ * `pending → running → terminal`:
+ *   - The `running` transition (the CLAIM) REQUIRES `chatSessionId`; it is
+ *     immutable thereafter.
+ *   - A `succeeded` terminal REQUIRES the SAME `chatSessionId`.
+ * So the caller must claim (`running` + the deterministic chatSessionId)
+ * BEFORE executing the session and report the terminal only AFTER the
+ * transcript is persisted.
+ *
+ * Returns the backend's `{ ok, applied }` outcome. `applied` is `true` when the
+ * transition actually applied and `false` when it was a no-op replay — i.e.
+ * ANOTHER runner already drove this exact (run, host, sessionIdx) attempt to (or
+ * past) the reported state. The CLAIM step (`status: "running"`) uses this to
+ * detect a duplicate-delivered launch: an `applied: false` claim means a sibling
+ * runner already owns the attempt, so this runner MUST NOT execute/persist/bill
+ * it (see swarm-runner). A conflicting transition (e.g. a terminal replay to a
+ * different state) is rejected by the backend with a 4xx and surfaces here as a
+ * thrown {@link SwarmAgentError}, never as `applied: false`.
+ */
+export async function reportAttempt(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    hostId: string;
+    /**
+     * Opaque snapshot target id, echoed VERBATIM from the pinned spec. Required
+     * in practice for env-based runs (the backend rejects a host-only lookup as
+     * ambiguous when two targets share a host); omitted only for historical
+     * snapshots whose targets carry no id.
+     */
+    targetId?: string;
+    sessionIdx: number;
+    status: SwarmAttemptStatus;
+    chatSessionId?: string;
+    errorCode?: string;
+    errorMessage?: string;
+  },
+): Promise<{ ok: true; applied: boolean; canceled?: boolean }> {
+  const data = await postJson<{
+    ok?: boolean;
+    applied?: boolean;
+    canceled?: boolean;
+    error?: string;
+  }>(
+    `${convexHttpUrl}/journey-execution/runs/attempt`,
+    bearer,
+    {
+      projectId: args.projectId,
+      runId: args.runId,
+      hostId: args.hostId,
+      ...(args.targetId ? { targetId: args.targetId } : {}),
+      sessionIdx: args.sessionIdx,
+      status: args.status,
+      ...(args.chatSessionId ? { chatSessionId: args.chatSessionId } : {}),
+      ...(args.errorCode ? { errorCode: args.errorCode } : {}),
+      ...(args.errorMessage ? { errorMessage: args.errorMessage } : {}),
+    },
+    NON_LLM_TIMEOUT_MS,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend reportAttempt: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+  // The backend (`journeyRuns.recordAttempt`, PR 3c backend #693) always returns
+  // an explicit `applied` boolean on a 200. Treat only an explicit `false` as a
+  // no-op replay; anything else (incl. a defensively-absent field) is "applied"
+  // so a missing field can never wrongly suppress a fresh claim's execution.
+  return {
+    ok: true,
+    applied: data.applied !== false,
+    ...(data.canceled === true ? { canceled: true } : {}),
+  };
+}
+
+/**
+ * One graded criterion, sent back to the backend as the verdict's full
+ * evidence. Keyed by `criterionId` — never by position — so a re-ordered or
+ * partially-evaluated result set still lands on the right rows.
+ */
+export interface SwarmCriterionResult {
+  criterionId: string;
+  passed: boolean;
+  /** An evaluator error is unmeasured, not a failed assertion. */
+  status?: "scored" | "error";
+  reason: string;
+  scope?: { kind: "turn"; promptIndex: number };
+}
+
+export interface SwarmChecksClaim {
+  claimed: true;
+  /** Freshness token the backend owns; echoed back on complete/fail. */
+  generation: number;
+  checkDocId: string;
+  sessionDocId: string;
+  criteria: JourneyCriterion[];
+  /**
+   * Persisted transcript envelope, or null when it could not be read.
+   * `widgetRenderObservations` rides along when the session's browser harness
+   * recorded any — the signal the `widget*` predicates grade against.
+   */
+  envelope: {
+    messages?: unknown[];
+    spans?: unknown[];
+    widgetRenderObservations?: unknown[];
+    traceComplete?: boolean;
+    recordedContext?: unknown;
+  } | null;
+  /**
+   * Session-level token totals (Σ of turn-trace usage), or null when no turn
+   * reported usage. Null is semantic — it keeps `tokenBudgetUnder` failing
+   * closed — so it must never be coerced to zeros.
+   */
+  usage: { inputTokens?: number; outputTokens?: number } | null;
+}
+
+/**
+ * Claim a session for rubric grading and receive the transcript to grade.
+ *
+ * The two are ONE call on purpose: the claim must be durable before evaluation
+ * starts, so a runner that dies mid-grade leaves a visible `pending` state
+ * rather than nothing at all. Returns `null` when the run carries no rubric —
+ * a normal outcome, not an error.
+ */
+export async function claimSwarmChecks(
+  convexHttpUrl: string,
+  bearer: string,
+  args: { projectId: string; runId: string; chatSessionId: string },
+  signal?: AbortSignal,
+): Promise<SwarmChecksClaim | null> {
+  const data = await postJson<
+    { ok?: boolean; claimed?: boolean; error?: string } & Partial<
+      Omit<SwarmChecksClaim, "claimed">
+    >
+  >(
+    `${convexHttpUrl}/journey-execution/runs/checks/claim`,
+    bearer,
+    {
+      projectId: args.projectId,
+      runId: args.runId,
+      chatSessionId: args.chatSessionId,
+      checkCapability: "swarm-standard-checks-v1",
+    },
+    NON_LLM_TIMEOUT_MS,
+    signal,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend claimSwarmChecks: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+  if (data.claimed !== true) return null;
+  if (
+    typeof data.generation !== "number" ||
+    typeof data.checkDocId !== "string" ||
+    typeof data.sessionDocId !== "string" ||
+    !Array.isArray(data.criteria)
+  ) {
+    throw new Error(
+      "Invalid response from backend claimSwarmChecks: malformed claim",
+    );
+  }
+  return {
+    claimed: true,
+    generation: data.generation,
+    checkDocId: data.checkDocId,
+    sessionDocId: data.sessionDocId,
+    criteria: data.criteria,
+    envelope: data.envelope ?? null,
+    // Tolerates a backend that predates the field: `undefined` collapses to
+    // the same null as "no usage recorded", both of which fail closed.
+    usage: data.usage ?? null,
+  };
+}
+
+/**
+ * Persist a finished rubric verdict. Generation-guarded backend-side.
+ *
+ * A 2xx is NOT enough: the route answers `{ ok: false, error }` on a rejected
+ * payload, and treating that as persisted would let the runner report
+ * `completed` while the check row sat `pending` forever. Same `ok !== true`
+ * guard `reportAttempt` and `heartbeatJourneyRun` use.
+ */
+export async function completeSwarmChecks(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    sessionDocId: string;
+    checkDocId: string;
+    generation: number;
+    criterionResults: SwarmCriterionResult[];
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const data = await postJson<{ ok?: boolean; error?: string }>(
+    `${convexHttpUrl}/journey-execution/runs/checks/complete`,
+    bearer,
+    args,
+    NON_LLM_TIMEOUT_MS,
+    signal,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend completeSwarmChecks: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+}
+
+/**
+ * Record that GRADING failed — an unreadable transcript, an evaluator throw.
+ * Distinct from criteria failing, which is a completed verdict.
+ *
+ * Same `ok !== true` guard as `completeSwarmChecks`: a rejected payload must
+ * not read as "the failure was recorded".
+ */
+export async function failSwarmChecks(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    sessionDocId: string;
+    checkDocId: string;
+    generation: number;
+    error: string;
+  },
+  signal?: AbortSignal,
+): Promise<void> {
+  const data = await postJson<{ ok?: boolean; error?: string }>(
+    `${convexHttpUrl}/journey-execution/runs/checks/fail`,
+    bearer,
+    args,
+    NON_LLM_TIMEOUT_MS,
+    signal,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend failSwarmChecks: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+}
+
+type JourneyHeartbeatStatus =
+  | "running"
+  | "completed"
+  | "partial"
+  | "failed"
+  | "rate_limited"
+  | "missing";
+
+export async function heartbeatJourneyRun(
+  convexHttpUrl: string,
+  bearer: string,
+  args: { projectId: string; runId: string },
+): Promise<JourneyHeartbeatStatus | undefined> {
+  const data = await postJson<{
+    ok?: boolean;
+    error?: string;
+    status?: JourneyHeartbeatStatus;
+    cancelRequested?: boolean;
+  }>(
+    `${convexHttpUrl}/journey-execution/runs/heartbeat`,
+    bearer,
+    { projectId: args.projectId, runId: args.runId },
+    NON_LLM_TIMEOUT_MS,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend heartbeatJourneyRun: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+  // Older backends only acknowledge the heartbeat. Missing status must not
+  // cancel a healthy run during a rolling upgrade.
+  if (
+    data.status !== undefined &&
+    ![
+      "running",
+      "completed",
+      "partial",
+      "failed",
+      "rate_limited",
+      "missing",
+    ].includes(data.status)
+  ) {
+    throw new Error("Invalid run status in backend heartbeat response");
+  }
+  return data.cancelRequested === true ? "failed" : data.status;
+}
+
+/**
+ * Best-effort finalize of a run's still-`pending` attempts to a terminal state.
+ * WHOLE-RUN scoped (the backend body carries no `hostId`), used by the fan-out
+ * runner for the two run-level short-circuits:
+ *   - org spend-cap breach → `terminalStatus: "rate_limited"`,
+ *     `errorCode: "spend_cap_exceeded"`
+ *   - controlled shutdown / cancel → `errorCode: "runner_shutdown"`
+ *
+ * A provider rate-limit is per-HOST (it stops one host, not the run), so a
+ * credit-funded host's remaining attempts are marked via {@link reportAttempt}
+ * instead. A SPONSORED conversation cannot be: claiming it `running` counts as
+ * execution and spends the launcher's allowance. So a target's unstarted
+ * sponsored conversations are closed here, scoped with `fundingScope:
+ * "sponsored"` and `targetId`, which the backend refunds. The backend stale-run
+ * cron is the hard backstop for anything this best-effort call misses.
+ */
+export async function finalizePendingAttempts(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    terminalStatus?: Exclude<SwarmAttemptStatus, "pending" | "running">;
+    errorCode?: string;
+    errorMessage?: string;
+    /**
+     * `"credits"` finalizes credit-funded attempts only and leaves sponsored
+     * ones pending, so an organization spend cap cannot stop (or refund) a
+     * conversation the platform is paying for. `"sponsored"` finalizes the
+     * sponsored ones only; pair it with `targetId` to close one target's.
+     */
+    fundingScope?: "credits" | "sponsored";
+    /**
+     * Only this target's attempts. Always pair it with a `fundingScope` the
+     * runner means: without one the backend would close the target's
+     * credit-funded conversations too.
+     */
+    targetId?: string;
+  },
+): Promise<void> {
+  const data = await postJson<{ ok?: boolean; error?: string }>(
+    `${convexHttpUrl}/journey-execution/runs/finalize-pending`,
+    bearer,
+    {
+      projectId: args.projectId,
+      runId: args.runId,
+      ...(args.fundingScope ? { fundingScope: args.fundingScope } : {}),
+      ...(args.targetId ? { targetId: args.targetId } : {}),
+      ...(args.terminalStatus ? { terminalStatus: args.terminalStatus } : {}),
+      ...(args.errorCode ? { errorCode: args.errorCode } : {}),
+      ...(args.errorMessage ? { errorMessage: args.errorMessage } : {}),
+    },
+    NON_LLM_TIMEOUT_MS,
+  );
+  if (data.ok !== true) {
+    throw new Error(
+      `Invalid response from backend finalizePendingAttempts: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+}
+
+/**
+ * Platform-billed swarm persona driver: produce the next simulated USER message
+ * from the run's immutable snapshot. The swarm sibling of the scenario
+ * `/session-simulation/persona-next-turn`.
+ */
+export async function swarmPersonaNextTurn(
+  convexHttpUrl: string,
+  bearer: string,
+  args: {
+    projectId: string;
+    runId: string;
+    hostId: string;
+    // Two env targets may resolve to the SAME host, so the backend cannot
+    // identify the target from `hostId` alone and refuses the turn as
+    // ambiguous. Absent only on legacy runs, where hosts are already unique.
+    targetId?: string;
+    // Billed per (target, session, turn): the backend validates this against
+    // the run's immutable fan-out and refuses the turn when it is missing.
+    sessionIdx: number;
+    transcriptSoFar: Array<{ role: "user" | "assistant"; content: string }>;
+    // Run abort signal. This call can PARK for up to LLM_TIMEOUT_MS (120s) in
+    // an uncancellable place; forwarding the run's signal lets a shutdown/cancel
+    // abort the parked fetch immediately so the session can unwind.
+    signal?: AbortSignal;
+    /** True for a sponsored conversation: attaches the service-token proof. */
+    sponsored?: boolean;
+  },
+): Promise<SwarmPersonaNextTurnResponse> {
+  const data = await postJson<{
+    ok?: boolean;
+    message?: string;
+    endSession?: boolean;
+    error?: string;
+  }>(
+    `${convexHttpUrl}/journey-execution/persona-next-turn`,
+    bearer,
+    {
+      projectId: args.projectId,
+      runId: args.runId,
+      hostId: args.hostId,
+      ...(args.targetId ? { targetId: args.targetId } : {}),
+      // Unconditional: session 0 is the common case and a truthiness spread
+      // would drop exactly the index the backend validates most often.
+      sessionIdx: args.sessionIdx,
+      transcriptSoFar: args.transcriptSoFar,
+    },
+    LLM_TIMEOUT_MS,
+    args.signal,
+    args.sponsored ? sponsoredCallHeaders() : undefined,
+  );
+  if (!data.ok || typeof data.message !== "string") {
+    throw new Error(
+      `Invalid response from backend swarmPersonaNextTurn: ${
+        data.error ?? "unknown error"
+      }`,
+    );
+  }
+  return {
+    message: data.message,
+    endSession: data.endSession === true,
+  };
+}
+
+/** Old backends have no grounding route; discovery remains optional. */
+export async function reportTargetGrounding(
+  baseUrl: string,
+  bearer: string,
+  body: GroundingReport,
+  signal?: AbortSignal,
+  /** True when the target has sponsored conversations: attaches the token. */
+  sponsored?: boolean,
+): Promise<{ unavailable?: boolean }> {
+  try {
+    return await postJson(
+      `${baseUrl}/journey-execution/runs/grounding`,
+      bearer,
+      body,
+      LLM_TIMEOUT_MS,
+      signal,
+      sponsored ? sponsoredCallHeaders() : undefined,
+    );
+  } catch (error) {
+    if (error instanceof SwarmAgentError && error.status === 404)
+      return { unavailable: true };
+    throw error;
+  }
+}

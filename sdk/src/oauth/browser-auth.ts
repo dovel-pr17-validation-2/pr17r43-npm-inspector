@@ -1,0 +1,1256 @@
+import pkceChallenge from "pkce-challenge";
+import {
+  RESOURCE_METADATA_NO_RESPONSE,
+  RESOURCE_METADATA_NOT_IMPLEMENTED,
+} from "./state-machines/shared/resource-metadata-error.js";
+import type {
+  AuthResult,
+  AuthorizationServerMetadata,
+  OAuthClientInformationFull,
+  OAuthClientInformationMixed,
+  OAuthClientMetadata,
+  OAuthClientProvider,
+  OAuthDiscoveryState,
+  OAuthMetadata,
+  OAuthProtectedResourceMetadata,
+  OAuthServerInfo,
+  OAuthTokens,
+  OpenIdProviderDiscoveryMetadata,
+} from "@modelcontextprotocol/client";
+import { evaluateResourceIndicator } from "./resource-policy.js";
+
+const AUTHORIZATION_CODE_RESPONSE_TYPE = "code";
+const AUTHORIZATION_CODE_CHALLENGE_METHOD = "S256";
+const LATEST_PROTOCOL_VERSION = "2025-11-25";
+
+type FetchFn = typeof fetch;
+type ClientAuthMethod =
+  | "client_secret_basic"
+  | "client_secret_post"
+  | "none";
+
+type OAuthErrorResponse = {
+  error?: string;
+  error_description?: string;
+  error_uri?: string;
+};
+
+class OAuthResponseError extends Error {
+  code?: string;
+  uri?: string;
+
+  constructor(message: string, code?: string, uri?: string) {
+    super(message);
+    this.name = "OAuthResponseError";
+    this.code = code;
+    this.uri = uri;
+  }
+}
+
+type DiscoverMetadataOptions = {
+  protocolVersion?: string;
+  metadataUrl?: string | URL;
+  metadataServerUrl?: string | URL;
+};
+
+type DiscoverAuthorizationServerMetadataOptions = {
+  fetchFn?: FetchFn;
+  protocolVersion?: string;
+};
+
+type DiscoverOAuthMetadataOptions = {
+  authorizationServerUrl?: string | URL;
+  protocolVersion?: string;
+};
+
+type DiscoverProtectedResourceMetadataOptions = {
+  resourceMetadataUrl?: string | URL;
+  protocolVersion?: string;
+};
+
+type DiscoverOAuthServerInfoOptions = {
+  resourceMetadataUrl?: string | URL;
+  fetchFn?: FetchFn;
+};
+
+type StartAuthorizationOptions = {
+  metadata?: OAuthMetadata | AuthorizationServerMetadata;
+  clientInformation: OAuthClientInformationMixed;
+  redirectUrl: string | URL;
+  scope?: string;
+  state?: string;
+  resource?: URL | string;
+};
+
+type ExchangeAuthorizationOptions = {
+  metadata?: OAuthMetadata | AuthorizationServerMetadata;
+  clientInformation: OAuthClientInformationMixed;
+  authorizationCode: string;
+  codeVerifier: string;
+  redirectUri: string | URL;
+  // A string is sent verbatim (echoing an advertised identifier exactly);
+  // a URL is serialized via .href.
+  resource?: URL | string;
+  addClientAuthentication?: OAuthClientProvider["addClientAuthentication"];
+  fetchFn?: FetchFn;
+};
+
+type FetchTokenOptions = {
+  metadata?: OAuthMetadata | AuthorizationServerMetadata;
+  // A string is sent verbatim (echoing an advertised identifier exactly);
+  // a URL is serialized via .href.
+  resource?: URL | string;
+  authorizationCode?: string;
+  scope?: string;
+  fetchFn?: FetchFn;
+};
+
+type RegisterClientOptions = {
+  metadata?: OAuthMetadata | AuthorizationServerMetadata;
+  clientMetadata: OAuthClientMetadata;
+  scope?: string;
+  fetchFn?: FetchFn;
+};
+
+type OAuthServerMetadata =
+  | AuthorizationServerMetadata
+  | OpenIdProviderDiscoveryMetadata;
+
+function getFetch(fetchFn?: FetchFn): FetchFn {
+  return fetchFn ?? fetch;
+}
+
+function isOAuthMetadataDocument(
+  value: OAuthServerMetadata | undefined,
+): value is OAuthMetadata {
+  return (
+    !!value &&
+    typeof value === "object" &&
+    "token_endpoint_auth_methods_supported" in value
+  );
+}
+
+function isClientAuthMethod(method: string): method is ClientAuthMethod {
+  return ["client_secret_basic", "client_secret_post", "none"].includes(method);
+}
+
+function isHttpsUrl(value: string | undefined): boolean {
+  if (!value) return false;
+
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" && url.pathname !== "/";
+  } catch {
+    return false;
+  }
+}
+
+function resourceUrlFromServerUrl(url: string | URL): URL {
+  const resourceUrl = typeof url === "string" ? new URL(url) : new URL(url.href);
+  resourceUrl.hash = "";
+  return resourceUrl;
+}
+
+function selectClientAuthMethod(
+  clientInformation: OAuthClientInformationMixed,
+  supportedMethods: string[],
+): ClientAuthMethod {
+  const hasClientSecret =
+    "client_secret" in clientInformation &&
+    clientInformation.client_secret !== undefined;
+
+  if (supportedMethods.length === 0) {
+    return hasClientSecret ? "client_secret_post" : "none";
+  }
+
+  const explicitMethod =
+    "token_endpoint_auth_method" in clientInformation
+      ? clientInformation.token_endpoint_auth_method
+      : undefined;
+
+  if (
+    explicitMethod &&
+    isClientAuthMethod(explicitMethod) &&
+    supportedMethods.includes(explicitMethod)
+  ) {
+    return explicitMethod;
+  }
+
+  if (hasClientSecret && supportedMethods.includes("client_secret_basic")) {
+    return "client_secret_basic";
+  }
+
+  if (hasClientSecret && supportedMethods.includes("client_secret_post")) {
+    return "client_secret_post";
+  }
+
+  if (supportedMethods.includes("none")) {
+    return "none";
+  }
+
+  return hasClientSecret ? "client_secret_post" : "none";
+}
+
+function applyClientAuthentication(
+  method: ClientAuthMethod,
+  clientInformation: OAuthClientInformationMixed,
+  headers: Headers,
+  params: URLSearchParams,
+) {
+  const clientId = clientInformation.client_id;
+  const clientSecret =
+    "client_secret" in clientInformation
+      ? clientInformation.client_secret
+      : undefined;
+
+  switch (method) {
+    case "client_secret_basic": {
+      if (!clientSecret) {
+        throw new Error(
+          "client_secret_basic authentication requires a client_secret",
+        );
+      }
+      const credentials = btoa(`${clientId}:${clientSecret}`);
+      headers.set("Authorization", `Basic ${credentials}`);
+      return;
+    }
+    case "client_secret_post":
+      params.set("client_id", clientId);
+      if (clientSecret) {
+        params.set("client_secret", clientSecret);
+      }
+      return;
+    case "none":
+      params.set("client_id", clientId);
+      return;
+  }
+}
+
+async function parseErrorResponse(input: Response | string): Promise<Error> {
+  const statusCode = input instanceof Response ? input.status : undefined;
+  const body = input instanceof Response ? await input.text() : input;
+
+  try {
+    const parsed = JSON.parse(body) as OAuthErrorResponse;
+    const message =
+      parsed.error_description ||
+      parsed.error ||
+      `${statusCode ? `HTTP ${statusCode}: ` : ""}OAuth request failed`;
+    return new OAuthResponseError(message, parsed.error, parsed.error_uri);
+  } catch (error) {
+    const prefix = statusCode ? `HTTP ${statusCode}: ` : "";
+    return new Error(`${prefix}Invalid OAuth error response: ${body}`);
+  }
+}
+
+async function fetchWithCorsRetry(
+  url: string | URL,
+  headers?: HeadersInit,
+  fetchFn: FetchFn = fetch,
+): Promise<Response | undefined> {
+  try {
+    return await fetchFn(url, { headers });
+  } catch (error) {
+    if (!(error instanceof TypeError)) {
+      throw error;
+    }
+
+    if (!headers) {
+      return undefined;
+    }
+
+    try {
+      return await fetchFn(url, {});
+    } catch (retryError) {
+      if (!(retryError instanceof TypeError)) {
+        throw retryError;
+      }
+      return undefined;
+    }
+  }
+}
+
+function buildWellKnownPath(
+  wellKnownPrefix: string,
+  pathname = "",
+  options: { prependPathname?: boolean } = {},
+) {
+  const normalizedPath = pathname.endsWith("/")
+    ? pathname.slice(0, -1)
+    : pathname;
+  return options.prependPathname
+    ? `${normalizedPath}/.well-known/${wellKnownPrefix}`
+    : `/.well-known/${wellKnownPrefix}${normalizedPath}`;
+}
+
+/**
+ * Mirrors `MAX_OAUTH_PROXY_REDIRECTS` in `oauth-proxy.ts`, the cap the local
+ * proxy applies when it follows redirects itself. Under `httpsOnly` the proxy
+ * returns the first 3xx before that cap is reached, so on the hosted path this
+ * is the only bound on the chain.
+ */
+const MAX_METADATA_DISCOVERY_REDIRECTS = 5;
+
+const METADATA_REDIRECT_STATUSES: ReadonlySet<number> = new Set([
+  301, 302, 303, 307, 308,
+]);
+
+type MetadataRedirect =
+  | { kind: "follow"; url: URL }
+  | { kind: "refused"; reason: string };
+
+/**
+ * What to do with a well-known metadata answer that redirects, or undefined
+ * when it is not a redirect (or has no `Location`) and should be returned as is.
+ *
+ * A native `fetch` follows these on its own; the case that motivated this is
+ * the hosted proxy, which answers `redirect: "manual"` by design (it validates
+ * one hop per call), but any manual-redirect `fetchFn` lands here too. Every
+ * follow-up hop goes back through the same `fetchFn`, so the proxy still vets
+ * each destination. An HTTPS document is never followed down to plain HTTP.
+ *
+ * The proxy's chain rule (a later hop may be private only if hop 1 was) is not
+ * carried across hops here. That is safe because `httpsOnly`, the only mode
+ * that forces `redirect: "manual"`, also forces `allowPrivateNetwork: false`.
+ */
+function metadataRedirectTarget(
+  response: Response,
+  currentUrl: URL,
+): MetadataRedirect | undefined {
+  if (!METADATA_REDIRECT_STATUSES.has(response.status)) return undefined;
+  const location = response.headers.get("location");
+  if (!location) return undefined;
+  let nextUrl: URL;
+  try {
+    nextUrl = new URL(location, currentUrl);
+  } catch {
+    return {
+      kind: "refused",
+      reason: `Refused redirect to ${location}: not a valid URL`,
+    };
+  }
+  if (nextUrl.protocol !== "https:" && nextUrl.protocol !== "http:") {
+    return {
+      kind: "refused",
+      reason: `Refused redirect to ${nextUrl.protocol} URL: metadata discovery only follows HTTP(S)`,
+    };
+  }
+  if (currentUrl.protocol === "https:" && nextUrl.protocol !== "https:") {
+    return {
+      kind: "refused",
+      reason: `Refused redirect to ${nextUrl.href}: metadata discovery never downgrades HTTPS to HTTP`,
+    };
+  }
+  return { kind: "follow", url: nextUrl };
+}
+
+async function tryMetadataDiscovery(
+  url: URL,
+  protocolVersion: string,
+  fetchFn: FetchFn = fetch,
+) {
+  const headers = {
+    "MCP-Protocol-Version": protocolVersion,
+    Accept: "application/json",
+  };
+  let currentUrl = url;
+  for (let redirectCount = 0; ; redirectCount += 1) {
+    const response = await fetchWithCorsRetry(currentUrl, headers, fetchFn);
+    const redirect = response
+      ? metadataRedirectTarget(response, currentUrl)
+      : undefined;
+    if (!response || !redirect) {
+      return response;
+    }
+    await response.text().catch(() => {});
+    if (redirect.kind === "refused") {
+      throw new Error(`HTTP ${response.status}: ${redirect.reason}`);
+    }
+    if (redirectCount >= MAX_METADATA_DISCOVERY_REDIRECTS) {
+      throw new Error(
+        `HTTP ${response.status}: Stopped after ${MAX_METADATA_DISCOVERY_REDIRECTS} redirects; last Location was ${redirect.url.href}`,
+      );
+    }
+    currentUrl = redirect.url;
+  }
+}
+
+function shouldAttemptFallback(
+  response: Response | undefined,
+  pathname: string,
+): boolean {
+  if (!response) return true;
+  if (pathname === "/") return false;
+  return (
+    response.status >= 400 && response.status < 500 && response.status !== 429
+  );
+}
+
+/**
+ * `response` is the last attempt's. `sawNoResponse` records whether ANY attempt
+ * failed at the transport, because the fallback can turn a path-specific URL we
+ * never reached into a root 404 — and that 404 says nothing about the path.
+ */
+async function discoverMetadataWithFallback(
+  serverUrl: string | URL,
+  wellKnownType: string,
+  fetchFn: FetchFn,
+  opts?: DiscoverMetadataOptions,
+): Promise<{ response: Response | undefined; sawNoResponse: boolean }> {
+  const issuer = new URL(serverUrl);
+  const protocolVersion = opts?.protocolVersion ?? LATEST_PROTOCOL_VERSION;
+
+  let url: URL;
+  if (opts?.metadataUrl) {
+    url = new URL(opts.metadataUrl);
+  } else {
+    const wellKnownPath = buildWellKnownPath(wellKnownType, issuer.pathname);
+    url = new URL(wellKnownPath, opts?.metadataServerUrl ?? issuer);
+    url.search = issuer.search;
+  }
+
+  let response = await tryMetadataDiscovery(url, protocolVersion, fetchFn);
+  let sawNoResponse = !response;
+
+  if (!opts?.metadataUrl && shouldAttemptFallback(response, issuer.pathname)) {
+    response = await tryMetadataDiscovery(
+      new URL(`/.well-known/${wellKnownType}`, issuer),
+      protocolVersion,
+      fetchFn,
+    );
+    sawNoResponse ||= !response;
+  }
+
+  return { response, sawNoResponse };
+}
+
+function buildDiscoveryUrls(authorizationServerUrl: string | URL) {
+  const url =
+    typeof authorizationServerUrl === "string"
+      ? new URL(authorizationServerUrl)
+      : authorizationServerUrl;
+  const hasPath = url.pathname !== "/";
+
+  if (!hasPath) {
+    return [
+      {
+        url: new URL("/.well-known/oauth-authorization-server", url.origin),
+        type: "oauth" as const,
+      },
+      {
+        url: new URL("/.well-known/openid-configuration", url.origin),
+        type: "oidc" as const,
+      },
+    ];
+  }
+
+  const normalizedPath = url.pathname.endsWith("/")
+    ? url.pathname.slice(0, -1)
+    : url.pathname;
+
+  return [
+    {
+      url: new URL(
+        `/.well-known/oauth-authorization-server${normalizedPath}`,
+        url.origin,
+      ),
+      type: "oauth" as const,
+    },
+    {
+      url: new URL(
+        `/.well-known/openid-configuration${normalizedPath}`,
+        url.origin,
+      ),
+      type: "oidc" as const,
+    },
+    {
+      url: new URL(
+        `${normalizedPath}/.well-known/openid-configuration`,
+        url.origin,
+      ),
+      type: "oidc" as const,
+    },
+  ];
+}
+
+function prepareAuthorizationCodeRequest(
+  authorizationCode: string,
+  codeVerifier: string,
+  redirectUri: string | URL,
+) {
+  return new URLSearchParams({
+    grant_type: "authorization_code",
+    code: authorizationCode,
+    code_verifier: codeVerifier,
+    redirect_uri: String(redirectUri),
+  });
+}
+
+async function executeTokenRequest(
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    tokenRequestParams,
+    clientInformation,
+    addClientAuthentication,
+    resource,
+    fetchFn,
+  }: {
+    metadata?: OAuthMetadata | AuthorizationServerMetadata;
+    tokenRequestParams: URLSearchParams;
+    clientInformation?: OAuthClientInformationMixed;
+    addClientAuthentication?: OAuthClientProvider["addClientAuthentication"];
+    resource?: URL | string;
+    fetchFn?: FetchFn;
+  },
+) {
+  const tokenEndpoint =
+    metadata && "token_endpoint" in metadata && metadata.token_endpoint
+      ? metadata.token_endpoint
+      : new URL("/token", authorizationServerUrl).toString();
+  const tokenUrl = new URL(tokenEndpoint);
+  const headers = new Headers({
+    "Content-Type": "application/x-www-form-urlencoded",
+    Accept: "application/json",
+  });
+
+  if (resource) {
+    tokenRequestParams.set(
+      "resource",
+      typeof resource === "string" ? resource : resource.href,
+    );
+  }
+
+  if (addClientAuthentication) {
+    await addClientAuthentication(headers, tokenRequestParams, tokenUrl, metadata);
+  } else if (clientInformation) {
+    const supportedMethods = isOAuthMetadataDocument(metadata)
+      ? metadata.token_endpoint_auth_methods_supported ?? []
+      : [];
+    applyClientAuthentication(
+      selectClientAuthMethod(clientInformation, supportedMethods),
+      clientInformation,
+      headers,
+      tokenRequestParams,
+    );
+  }
+
+  const response = await getFetch(fetchFn)(tokenUrl, {
+    method: "POST",
+    headers,
+    body: tokenRequestParams,
+  });
+
+  if (!response.ok) {
+    throw await parseErrorResponse(response);
+  }
+
+  return (await response.json()) as OAuthTokens;
+}
+
+export async function refreshAuthorization(
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    clientInformation,
+    refreshToken,
+    resource,
+    addClientAuthentication,
+    fetchFn,
+  }: {
+    metadata?: OAuthMetadata | AuthorizationServerMetadata;
+    clientInformation: OAuthClientInformationMixed;
+    refreshToken: string;
+    resource?: URL | string;
+    addClientAuthentication?: OAuthClientProvider["addClientAuthentication"];
+    fetchFn?: FetchFn;
+  },
+) {
+  return {
+    refresh_token: refreshToken,
+    ...(await executeTokenRequest(authorizationServerUrl, {
+      metadata,
+      tokenRequestParams: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+      }),
+      clientInformation,
+      addClientAuthentication,
+      resource,
+      fetchFn,
+    })),
+  } as OAuthTokens;
+}
+
+export async function auth(
+  provider: OAuthClientProvider,
+  options: {
+    serverUrl: string | URL;
+    authorizationCode?: string;
+    scope?: string;
+    resourceMetadataUrl?: string | URL;
+    fetchFn?: FetchFn;
+  },
+): Promise<AuthResult> {
+  try {
+    return await authInternal(provider, options);
+  } catch (error) {
+    const code =
+      error instanceof OAuthResponseError ? error.code : undefined;
+
+    if (code === "invalid_client" || code === "unauthorized_client") {
+      await provider.invalidateCredentials?.("all");
+      return authInternal(provider, options);
+    }
+
+    if (code === "invalid_grant") {
+      await provider.invalidateCredentials?.("tokens");
+      return authInternal(provider, options);
+    }
+
+    throw error;
+  }
+}
+
+async function authInternal(
+  provider: OAuthClientProvider,
+  {
+    serverUrl,
+    authorizationCode,
+    scope,
+    resourceMetadataUrl,
+    fetchFn,
+  }: {
+    serverUrl: string | URL;
+    authorizationCode?: string;
+    scope?: string;
+    resourceMetadataUrl?: string | URL;
+    fetchFn?: FetchFn;
+  },
+): Promise<AuthResult> {
+  const cachedState = await provider.discoveryState?.();
+  const effectiveResourceMetadataUrl =
+    resourceMetadataUrl ?? cachedState?.resourceMetadataUrl;
+
+  let resourceMetadata = cachedState?.resourceMetadata;
+  let authorizationServerUrl = cachedState?.authorizationServerUrl;
+  let metadata = cachedState?.authorizationServerMetadata;
+
+  if (authorizationServerUrl) {
+    metadata =
+      metadata ??
+      (await discoverAuthorizationServerMetadata(authorizationServerUrl, {
+        fetchFn,
+      }));
+
+    if (!resourceMetadata) {
+      try {
+        resourceMetadata = await discoverOAuthProtectedResourceMetadata(
+          serverUrl,
+          {
+            resourceMetadataUrl: effectiveResourceMetadataUrl,
+          },
+          fetchFn,
+        );
+      } catch {
+        // Ignore RFC 9728 discovery failures here; we can still continue.
+      }
+    }
+
+    if (
+      metadata !== cachedState?.authorizationServerMetadata ||
+      resourceMetadata !== cachedState?.resourceMetadata
+    ) {
+      await provider.saveDiscoveryState?.({
+        authorizationServerUrl: String(authorizationServerUrl),
+        resourceMetadataUrl: effectiveResourceMetadataUrl
+          ? String(effectiveResourceMetadataUrl)
+          : undefined,
+        resourceMetadata,
+        authorizationServerMetadata: metadata,
+      } satisfies OAuthDiscoveryState);
+    }
+  } else {
+    const discovered = await discoverOAuthServerInfo(serverUrl, {
+      resourceMetadataUrl: effectiveResourceMetadataUrl,
+      fetchFn,
+    });
+    authorizationServerUrl = discovered.authorizationServerUrl;
+    metadata = discovered.authorizationServerMetadata;
+    resourceMetadata = discovered.resourceMetadata;
+
+    await provider.saveDiscoveryState?.({
+      authorizationServerUrl: String(authorizationServerUrl),
+      resourceMetadataUrl: effectiveResourceMetadataUrl
+        ? String(effectiveResourceMetadataUrl)
+        : undefined,
+      resourceMetadata,
+      authorizationServerMetadata: metadata,
+    } satisfies OAuthDiscoveryState);
+  }
+
+  // Preserve a PRM-advertised identifier as a string on the wire. The public
+  // selectResourceURL() helper retains its historical URL return contract,
+  // but URL construction can normalize an advertised value (for example by
+  // adding a root slash or removing a default port).
+  const resource = await selectResourceForAuth(
+    serverUrl,
+    provider,
+    resourceMetadata,
+  );
+
+  let clientInformation = await provider.clientInformation();
+  if (!clientInformation) {
+    if (authorizationCode !== undefined) {
+      throw new Error(
+        "Existing OAuth client information is required when exchanging an authorization code",
+      );
+    }
+
+    const supportsUrlBasedClientId =
+      metadata &&
+      "client_id_metadata_document_supported" in metadata &&
+      metadata.client_id_metadata_document_supported === true;
+    const clientMetadataUrl = provider.clientMetadataUrl;
+
+    if (clientMetadataUrl && !isHttpsUrl(clientMetadataUrl)) {
+      throw new Error(
+        `clientMetadataUrl must be a valid HTTPS URL with a non-root pathname, got: ${clientMetadataUrl}`,
+      );
+    }
+
+    if (supportsUrlBasedClientId && clientMetadataUrl) {
+      clientInformation = {
+        client_id: clientMetadataUrl,
+      };
+      await provider.saveClientInformation?.(clientInformation);
+    } else {
+      if (!provider.saveClientInformation) {
+        throw new Error(
+          "OAuth client information must be saveable for dynamic registration",
+        );
+      }
+
+      const fullInformation = await registerClient(authorizationServerUrl, {
+        metadata,
+        clientMetadata: provider.clientMetadata,
+        fetchFn,
+      });
+      await provider.saveClientInformation(fullInformation);
+      clientInformation = fullInformation;
+    }
+  }
+
+  const nonInteractiveFlow = !provider.redirectUrl;
+  if (authorizationCode !== undefined || nonInteractiveFlow) {
+    const tokens = await fetchToken(provider, authorizationServerUrl, {
+      metadata,
+      resource,
+      authorizationCode,
+      fetchFn,
+    });
+    await provider.saveTokens(tokens);
+    return "AUTHORIZED";
+  }
+
+  const existingTokens = await provider.tokens();
+  if (existingTokens?.refresh_token) {
+    try {
+      const refreshedTokens = await refreshAuthorization(authorizationServerUrl, {
+        metadata,
+        clientInformation,
+        refreshToken: existingTokens.refresh_token,
+        resource,
+        addClientAuthentication: provider.addClientAuthentication,
+        fetchFn,
+      });
+      await provider.saveTokens(refreshedTokens);
+      return "AUTHORIZED";
+    } catch (error) {
+      if (
+        error instanceof OAuthResponseError &&
+        error.code &&
+        error.code !== "server_error"
+      ) {
+        throw error;
+      }
+    }
+  }
+
+  const state = provider.state ? await provider.state() : undefined;
+  const resolvedScope =
+    scope ||
+    resourceMetadata?.scopes_supported?.join(" ") ||
+    provider.clientMetadata.scope;
+  const { authorizationUrl, codeVerifier } = await startAuthorization(
+    authorizationServerUrl,
+    {
+      metadata,
+      clientInformation,
+      state,
+      redirectUrl: provider.redirectUrl,
+      scope: resolvedScope,
+      resource,
+    },
+  );
+  await provider.saveCodeVerifier(codeVerifier);
+  await provider.redirectToAuthorization(authorizationUrl);
+  return "REDIRECT";
+}
+
+async function selectResourceForAuth(
+  serverUrl: string | URL,
+  provider: OAuthClientProvider,
+  resourceMetadata?: OAuthProtectedResourceMetadata,
+): Promise<URL | string | undefined> {
+  const defaultResource = resourceUrlFromServerUrl(serverUrl);
+
+  if (provider.validateResourceURL) {
+    return provider.validateResourceURL(defaultResource, resourceMetadata?.resource);
+  }
+
+  if (!resourceMetadata) {
+    return undefined;
+  }
+
+  // RFC 9728 §2 makes `resource` REQUIRED; a PRM document without one is
+  // broken metadata, not license to fall back to the server URL.
+  if (!resourceMetadata.resource?.trim()) {
+    throw new Error(
+      `Protected resource metadata for ${defaultResource} is missing its required "resource" identifier (RFC 9728 §2)`,
+    );
+  }
+
+  // This mirrors the official MCP SDK's auth(), so it keeps the SDK's full
+  // strict binding (origin + path prefix) — unlike Quick OAuth and the debug
+  // flows, which accept same-origin values and warn instead.
+  const decision = evaluateResourceIndicator({
+    serverUrl: defaultResource.href,
+    prmResource: resourceMetadata.resource,
+  });
+
+  if (!decision.strictClientCompatible) {
+    throw new Error(
+      `Protected resource ${resourceMetadata.resource} does not match expected ${defaultResource} (or origin)${
+        decision.reason ? `: ${decision.reason}` : ""
+      }`,
+    );
+  }
+
+  return decision.value;
+}
+
+export async function selectResourceURL(
+  serverUrl: string | URL,
+  provider: OAuthClientProvider,
+  resourceMetadata?: OAuthProtectedResourceMetadata,
+): Promise<URL | undefined> {
+  const resource = await selectResourceForAuth(
+    serverUrl,
+    provider,
+    resourceMetadata,
+  );
+
+  // Backward compatibility for direct consumers of this public helper. auth()
+  // uses selectResourceForAuth() above so its authorization, exchange, and
+  // refresh requests retain the advertised string verbatim.
+  return typeof resource === "string" ? new URL(resource) : resource;
+}
+
+export async function discoverOAuthProtectedResourceMetadata(
+  serverUrl: string | URL,
+  opts?: DiscoverProtectedResourceMetadataOptions,
+  fetchFn: FetchFn = fetch,
+): Promise<OAuthProtectedResourceMetadata> {
+  const { response, sawNoResponse } = await discoverMetadataWithFallback(
+    serverUrl,
+    "oauth-protected-resource",
+    fetchFn,
+    {
+      protocolVersion: opts?.protocolVersion,
+      metadataUrl: opts?.resourceMetadataUrl,
+    },
+  );
+
+  if (!response) {
+    throw new Error(RESOURCE_METADATA_NO_RESPONSE);
+  }
+
+  if (response.status === 404) {
+    await response.text().catch(() => {});
+    // Only a 404 on every attempt means the server publishes no document.
+    throw new Error(
+      sawNoResponse
+        ? RESOURCE_METADATA_NO_RESPONSE
+        : RESOURCE_METADATA_NOT_IMPLEMENTED,
+    );
+  }
+
+  if (!response.ok) {
+    await response.text().catch(() => {});
+    throw new Error(
+      `HTTP ${response.status} trying to load well-known OAuth protected resource metadata.`,
+    );
+  }
+
+  // A 200 is not proof of a document: catch-all servers answer every unknown
+  // path with their HTML landing page. Name what came back instead of
+  // surfacing the parser's "Unexpected token '<'".
+  const body = await response.text();
+  try {
+    return JSON.parse(body) as OAuthProtectedResourceMetadata;
+  } catch {
+    const contentType =
+      response.headers.get("content-type")?.split(";")[0]?.trim() ||
+      "no content type";
+    throw new Error(
+      `Protected resource metadata is not valid JSON (got ${contentType}).`,
+    );
+  }
+}
+
+export async function discoverOAuthMetadata(
+  issuer: string | URL,
+  {
+    authorizationServerUrl,
+    protocolVersion,
+  }: DiscoverOAuthMetadataOptions = {},
+  fetchFn: FetchFn = fetch,
+): Promise<OAuthMetadata | undefined> {
+  const issuerUrl = typeof issuer === "string" ? new URL(issuer) : issuer;
+  const authServerUrl =
+    typeof authorizationServerUrl === "string"
+      ? new URL(authorizationServerUrl)
+      : authorizationServerUrl ?? issuerUrl;
+
+  const { response } = await discoverMetadataWithFallback(
+    authServerUrl,
+    "oauth-authorization-server",
+    fetchFn,
+    {
+      protocolVersion: protocolVersion ?? LATEST_PROTOCOL_VERSION,
+      metadataServerUrl: authServerUrl,
+    },
+  );
+
+  if (!response || response.status === 404) {
+    await response?.text?.().catch(() => {});
+    return undefined;
+  }
+
+  if (!response.ok) {
+    await response.text().catch(() => {});
+    throw new Error(
+      `HTTP ${response.status} trying to load well-known OAuth metadata`,
+    );
+  }
+
+  return (await response.json()) as OAuthMetadata;
+}
+
+export async function discoverAuthorizationServerMetadata(
+  authorizationServerUrl: string | URL,
+  {
+    fetchFn = fetch,
+    protocolVersion = LATEST_PROTOCOL_VERSION,
+  }: DiscoverAuthorizationServerMetadataOptions = {},
+): Promise<OAuthServerMetadata | undefined> {
+  const headers = {
+    "MCP-Protocol-Version": protocolVersion,
+    Accept: "application/json",
+  };
+
+  for (const { url, type } of buildDiscoveryUrls(authorizationServerUrl)) {
+    const response = await fetchWithCorsRetry(url, headers, fetchFn);
+
+    if (!response) {
+      continue;
+    }
+
+    if (!response.ok) {
+      await response.text().catch(() => {});
+      if (
+        response.status >= 400 &&
+        response.status < 500 &&
+        response.status !== 429
+      ) {
+        continue;
+      }
+      throw new Error(
+        `HTTP ${response.status} trying to load ${
+          type === "oauth" ? "OAuth" : "OpenID provider"
+        } metadata from ${url}`,
+      );
+    }
+
+    return (await response.json()) as OAuthServerMetadata;
+  }
+
+  return undefined;
+}
+
+function firstAuthorizationServer(document: object): string | undefined {
+  if (
+    !("authorization_servers" in document) ||
+    !Array.isArray(document.authorization_servers)
+  ) {
+    return undefined;
+  }
+  const first: unknown = document.authorization_servers[0];
+  if (typeof first !== "string") return undefined;
+  // Discovery builds well-known URLs from its origin, so only a web URL works.
+  try {
+    const { protocol } = new URL(first);
+    return protocol === "http:" || protocol === "https:" ? first : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isTransientMetadataFailure(error: unknown): boolean {
+  const status =
+    error instanceof Error
+      ? /^HTTP (\d{3}) /.exec(error.message)?.[1]
+      : undefined;
+  return status !== undefined && (status === "429" || status.startsWith("5"));
+}
+
+export async function discoverOAuthServerInfo(
+  serverUrl: string | URL,
+  opts?: DiscoverOAuthServerInfoOptions,
+): Promise<OAuthServerInfo> {
+  let resourceMetadata: OAuthProtectedResourceMetadata | undefined;
+  let authorizationServerUrl: string | URL | undefined;
+
+  try {
+    const document = await discoverOAuthProtectedResourceMetadata(
+      serverUrl,
+      {
+        resourceMetadataUrl: opts?.resourceMetadataUrl,
+      },
+      opts?.fetchFn,
+    );
+    // JSON `null` or another non-object is no metadata, the same as a failed
+    // fetch. An object keeps its `resource` for the resource indicator; with
+    // no usable authorization server named, the origin is the server.
+    if (
+      typeof document === "object" &&
+      document !== null &&
+      !Array.isArray(document)
+    ) {
+      resourceMetadata = document;
+      authorizationServerUrl = firstAuthorizationServer(document);
+    }
+  } catch (error) {
+    // A rate limit or server error is not "no metadata": falling back to the
+    // origin would cache an issuer the server never named. Anything else that
+    // yields no usable document (a 401, 403 or 405 from auth middleware in
+    // front of the well-known path, a 404, no response) falls back to the
+    // origin, as servers without Protected Resource Metadata rely on.
+    if (error instanceof TypeError || isTransientMetadataFailure(error))
+      throw error;
+  }
+
+  if (!authorizationServerUrl) {
+    authorizationServerUrl = String(new URL("/", serverUrl));
+  }
+
+  const authorizationServerMetadata = await discoverAuthorizationServerMetadata(
+    authorizationServerUrl,
+    { fetchFn: opts?.fetchFn },
+  );
+
+  return {
+    authorizationServerUrl: String(authorizationServerUrl),
+    authorizationServerMetadata,
+    resourceMetadata,
+  };
+}
+
+export async function startAuthorization(
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    clientInformation,
+    redirectUrl,
+    scope,
+    state,
+    resource,
+  }: StartAuthorizationOptions,
+): Promise<{ authorizationUrl: URL; codeVerifier: string }> {
+  let authorizationUrl: URL;
+
+  if (
+    metadata &&
+    "authorization_endpoint" in metadata &&
+    metadata.authorization_endpoint
+  ) {
+    authorizationUrl = new URL(metadata.authorization_endpoint);
+
+    if (
+      "response_types_supported" in metadata &&
+      metadata.response_types_supported &&
+      !metadata.response_types_supported.includes(AUTHORIZATION_CODE_RESPONSE_TYPE)
+    ) {
+      throw new Error(
+        `Incompatible auth server: does not support response type ${AUTHORIZATION_CODE_RESPONSE_TYPE}`,
+      );
+    }
+
+    if (
+      "code_challenge_methods_supported" in metadata &&
+      metadata.code_challenge_methods_supported &&
+      !metadata.code_challenge_methods_supported.includes(
+        AUTHORIZATION_CODE_CHALLENGE_METHOD,
+      )
+    ) {
+      throw new Error(
+        `Incompatible auth server: does not support code challenge method ${AUTHORIZATION_CODE_CHALLENGE_METHOD}`,
+      );
+    }
+  } else {
+    authorizationUrl = new URL("/authorize", authorizationServerUrl);
+  }
+
+  const challenge = await pkceChallenge();
+  const codeVerifier = challenge.code_verifier;
+  const codeChallenge = challenge.code_challenge;
+
+  authorizationUrl.searchParams.set(
+    "response_type",
+    AUTHORIZATION_CODE_RESPONSE_TYPE,
+  );
+  authorizationUrl.searchParams.set("client_id", clientInformation.client_id);
+  authorizationUrl.searchParams.set("code_challenge", codeChallenge);
+  authorizationUrl.searchParams.set(
+    "code_challenge_method",
+    AUTHORIZATION_CODE_CHALLENGE_METHOD,
+  );
+  authorizationUrl.searchParams.set("redirect_uri", String(redirectUrl));
+
+  if (state) {
+    authorizationUrl.searchParams.set("state", state);
+  }
+  if (scope) {
+    authorizationUrl.searchParams.set("scope", scope);
+  }
+  if (scope?.split(" ").includes("offline_access")) {
+    authorizationUrl.searchParams.append("prompt", "consent");
+  }
+  if (resource) {
+    authorizationUrl.searchParams.set(
+      "resource",
+      typeof resource === "string" ? resource : resource.href,
+    );
+  }
+
+  return {
+    authorizationUrl,
+    codeVerifier,
+  };
+}
+
+export async function exchangeAuthorization(
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    clientInformation,
+    authorizationCode,
+    codeVerifier,
+    redirectUri,
+    resource,
+    addClientAuthentication,
+    fetchFn,
+  }: ExchangeAuthorizationOptions,
+): Promise<OAuthTokens> {
+  return executeTokenRequest(authorizationServerUrl, {
+    metadata,
+    tokenRequestParams: prepareAuthorizationCodeRequest(
+      authorizationCode,
+      codeVerifier,
+      redirectUri,
+    ),
+    clientInformation,
+    addClientAuthentication,
+    resource,
+    fetchFn,
+  });
+}
+
+export async function fetchToken(
+  provider: OAuthClientProvider,
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    resource,
+    authorizationCode,
+    scope,
+    fetchFn,
+  }: FetchTokenOptions = {},
+): Promise<OAuthTokens> {
+  const effectiveScope = scope ?? provider.clientMetadata.scope;
+  let tokenRequestParams = await provider.prepareTokenRequest?.(effectiveScope);
+
+  if (!tokenRequestParams) {
+    if (!authorizationCode) {
+      throw new Error(
+        "Either provider.prepareTokenRequest() or authorizationCode is required",
+      );
+    }
+    if (!provider.redirectUrl) {
+      throw new Error("redirectUrl is required for authorization_code flow");
+    }
+    tokenRequestParams = prepareAuthorizationCodeRequest(
+      authorizationCode,
+      await provider.codeVerifier(),
+      provider.redirectUrl,
+    );
+  }
+
+  const clientInformation = await provider.clientInformation();
+  return executeTokenRequest(authorizationServerUrl, {
+    metadata,
+    tokenRequestParams,
+    clientInformation: clientInformation ?? undefined,
+    addClientAuthentication: provider.addClientAuthentication,
+    resource,
+    fetchFn,
+  });
+}
+
+export async function registerClient(
+  authorizationServerUrl: string | URL,
+  {
+    metadata,
+    clientMetadata,
+    scope,
+    fetchFn,
+  }: RegisterClientOptions,
+): Promise<OAuthClientInformationFull> {
+  let registrationUrl: URL;
+
+  if (
+    metadata &&
+    "registration_endpoint" in metadata &&
+    metadata.registration_endpoint
+  ) {
+    registrationUrl = new URL(metadata.registration_endpoint);
+  } else {
+    registrationUrl = new URL("/register", authorizationServerUrl);
+  }
+
+  const response = await getFetch(fetchFn)(registrationUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      ...clientMetadata,
+      ...(scope === undefined ? {} : { scope }),
+    }),
+  });
+
+  if (!response.ok) {
+    throw await parseErrorResponse(response);
+  }
+
+  return (await response.json()) as OAuthClientInformationFull;
+}

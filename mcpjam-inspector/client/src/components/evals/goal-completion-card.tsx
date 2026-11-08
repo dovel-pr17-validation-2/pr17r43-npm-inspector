@@ -1,0 +1,567 @@
+import { useMemo, useState } from "react";
+import { Loader2, RotateCw } from "lucide-react";
+import { Button } from "@mcpjam/design-system/button";
+import { Label } from "@mcpjam/design-system/label";
+import { cn } from "@/lib/utils";
+import type { ModelDefinition } from "@/shared/types";
+import type { EvalIteration, EvalJudgeConfig, EvalSuiteRun } from "./types";
+import type { GoalCompletionRequestArgs } from "./use-goal-completion";
+import {
+  ScoreBadge,
+  caseKeyForGroup,
+  deterministicCasePassed,
+  formatScore,
+  judgeDisagreesWithVerdict,
+} from "./goal-completion-presentation";
+import { groupRunIterationsByTestCase } from "./run-case-groups";
+import { JudgeModelPicker } from "./judge-model-picker";
+import { findModelForStoredChoice } from "@/components/chat-v2/shared/model-selection";
+import { judgeModelOptions } from "@/components/chat-v2/shared/available-models";
+import { judgeModelPatch } from "./judges-section";
+import { SelectionEffortControl } from "@/components/effort/selection-effort-control";
+import { useModelSelectionsSupported } from "@/hooks/use-project-environment-capability";
+import {
+  nonLegacySelection,
+  selectionReasoningEffort,
+} from "@/lib/reasoning-effort-selection";
+import {
+  selectionConfigKey,
+  type ModelSelection,
+  type RequestedModelSelection,
+} from "@mcpjam/sdk/browser";
+import {
+  MANAGED_DEFAULT_JUDGE_MODEL as DEFAULT_JUDGE_MODEL,
+  DEFAULT_JUDGE_THRESHOLD as DEFAULT_THRESHOLD,
+} from "@/components/shared/session-quality/judge-config";
+
+export interface GoalCompletionCardProps {
+  run: EvalSuiteRun;
+  iterations: EvalIteration[];
+  goalCompletion: EvalSuiteRun["goalCompletion"] | null;
+  availableModels: ModelDefinition[];
+  pending: boolean;
+  requested: boolean;
+  failedGeneration: boolean;
+  error: string | null;
+  onRun: (args: GoalCompletionRequestArgs, force?: boolean) => void;
+  /**
+   * Current suite-level judge config (live, not snapshotted on the run).
+   * When the suite has the judge enabled NOW, the card lets the user re-run
+   * even on older runs whose snapshot didn't have it on. When omitted,
+   * the card falls back to the run's snapshot — older parents
+   * (e.g. commit-detail) don't need to thread suite data through.
+   */
+  currentSuiteJudgeConfig?: EvalJudgeConfig | null;
+  /** Flush layout inside the run-detail split (no nested card chrome). */
+  embedded?: boolean;
+  /**
+   * The organization requires its own provider keys for AI features: only
+   * organization models are offered as the judge.
+   */
+  requireOrgKeys?: boolean;
+  /**
+   * Opens the organization's AI providers, for a viewer who may manage them
+   * while the organization requires its own keys (see `useAvailableModels`).
+   */
+  onManageOrgProviders?: () => void;
+  /**
+   * The same from a model search with no match, under any key policy, or
+   * `null` when the organization offers this viewer none.
+   */
+  onAddProvider: (() => void) | null;
+}
+
+export function GoalCompletionCard({
+  run,
+  iterations,
+  goalCompletion,
+  availableModels,
+  pending,
+  requested,
+  failedGeneration,
+  error,
+  onRun,
+  currentSuiteJudgeConfig,
+  embedded = false,
+  requireOrgKeys = false,
+  onManageOrgProviders,
+  onAddProvider,
+}: GoalCompletionCardProps) {
+  const completedRun = run.status === "completed";
+
+  // Seed inputs from (in order): persisted run override → suite snapshot →
+  // managed defaults. This way reopening a run with an override pre-populates
+  // it; reopening a run without one pre-populates suite config (so a click
+  // submits the suite default and the override field stays cleared on the
+  // backend).
+  const initialModel =
+    run.judgeConfigOverride?.goalCompletion?.judgeModel ??
+    run.configSnapshot?.judgeConfig?.goalCompletion?.judgeModel ??
+    (goalCompletion?.modelUsed && goalCompletion.modelUsed !== "n/a"
+      ? goalCompletion.modelUsed
+      : DEFAULT_JUDGE_MODEL);
+  const [selectedModelId, setSelectedModelId] = useState<string>(initialModel);
+
+  const titleByCaseKey = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const iter of iterations) {
+      const caseKey = iter.testCaseSnapshot?.caseKey;
+      const title = iter.testCaseSnapshot?.title;
+      if (caseKey && title && !map.has(caseKey)) {
+        map.set(caseKey, title);
+      }
+    }
+    return map;
+  }, [iterations]);
+
+  // Read the suite's effective config from the run's snapshot. The card
+  // displays this read-only; the model + threshold inputs on this card now
+  // populate a per-run *override* (run.judgeConfigOverride) instead of being
+  // the primary config source. Suite settings is the new home for default
+  // config (see JudgesSection in suite-iterations-view.tsx).
+  const suiteConfig = run.configSnapshot?.judgeConfig?.goalCompletion;
+  const suiteModel = suiteConfig?.judgeModel ?? DEFAULT_JUDGE_MODEL;
+  const suiteThreshold = suiteConfig?.threshold ?? DEFAULT_THRESHOLD;
+  // The suite judge's full selection (effort included), when it is a hosted
+  // selection for the suite model. A stored legacy one carries no settings.
+  const suiteSelection = fullSelection(suiteConfig?.judgeSelection, suiteModel);
+  // The run override can carry the judge's selection too, so the effort is
+  // editable per run: seeded from a persisted override, else the suite's.
+  const [selectedSelection, setSelectedSelection] = useState<
+    ModelSelection | undefined
+  >(
+    () =>
+      fullSelection(
+        run.judgeConfigOverride?.goalCompletion?.judgeSelection,
+        initialModel,
+      ) ?? (initialModel === suiteModel ? suiteSelection : undefined),
+  );
+  // An organization judge is stored under its canonical id, so its row is
+  // found through the selection.
+  const selectedRow = findModelForStoredChoice(
+    { modelId: selectedModelId, selection: selectedSelection },
+    availableModels,
+    undefined,
+  );
+  // Backend default is `enabled: true` (see GOAL_COMPLETION_DEFAULTS in
+  // convex/lib/judgeConfig.ts) — only an explicit `enabled: false` turns
+  // the judge off. The current suite config takes precedence over the
+  // snapshot when provided, so flipping the toggle on today re-opens the
+  // controls for older runs whose snapshot didn't have it set.
+  // Cost is gated by `autoRun: false` (default) + the explicit Run judge
+  // click, so an unconfigured/enabled-by-default suite still spends nothing
+  // until a click.
+  const currentSuiteGoalCompletion = currentSuiteJudgeConfig?.goalCompletion;
+  const resolvedEnabled =
+    currentSuiteGoalCompletion?.enabled ?? suiteConfig?.enabled;
+  const isJudgeConfigured = resolvedEnabled !== false;
+  // The persisted run override (`run.judgeConfigOverride.goalCompletion`)
+  // tells the trend story (this data point isn't graded against the suite
+  // contract). Surfacing it prominently is how the comparability promise
+  // is delivered — otherwise the persistence is invisible.
+  const runOverride = run.judgeConfigOverride?.goalCompletion;
+  const overrideModel =
+    runOverride?.judgeModel && runOverride.judgeModel !== suiteModel
+      ? runOverride.judgeModel
+      : undefined;
+  const overrideThresholdValue =
+    runOverride?.threshold !== undefined &&
+    runOverride.threshold !== suiteThreshold
+      ? runOverride.threshold
+      : undefined;
+  const overrideEffort =
+    runOverride?.judgeSelection !== undefined &&
+    selectionReasoningEffort(fullSelection(runOverride.judgeSelection)) !==
+      selectionReasoningEffort(suiteSelection)
+      ? (selectionReasoningEffort(fullSelection(runOverride.judgeSelection)) ??
+        "default")
+      : undefined;
+  const hasMeaningfulOverride =
+    overrideModel !== undefined ||
+    overrideThresholdValue !== undefined ||
+    overrideEffort !== undefined;
+
+  // A backend that predates saved selections refuses an override that names
+  // one, so on such a deployment the card sends the model id alone (as
+  // `JudgesSection` does) and offers no effort.
+  const saveSelections = useModelSelectionsSupported();
+  // While the organization requires its own keys only a judge chosen from an
+  // organization provider can grade: an unset judge, a saved model the policy
+  // no longer allows, and a saved organization judge the picker no longer
+  // offers (its connection removed or ineligible) all wait for that choice.
+  // Decided from the same options the picker lists.
+  const judgeOptions = useMemo(
+    () =>
+      requireOrgKeys
+        ? judgeModelOptions(availableModels, {
+            currentModelId: selectedModelId,
+            managedDefaultModelId: DEFAULT_JUDGE_MODEL,
+            currentSelection: selectedSelection,
+            requireOrgKeys,
+            selectionsSupported: saveSelections,
+          })
+        : undefined,
+    [
+      availableModels,
+      selectedModelId,
+      selectedSelection,
+      requireOrgKeys,
+      saveSelections,
+    ],
+  );
+  const judgeUnset =
+    requireOrgKeys &&
+    (selectedSelection?.source !== "org" ||
+      !judgeOptions?.current ||
+      judgeOptions.currentIneligible ||
+      judgeOptions.current.disabled === true);
+
+  const handleRun = (force: boolean) => {
+    // Only send a runOverride when the user's model selection DIFFERS from the
+    // suite config. Threshold is no longer adjustable from this card — it
+    // always inherits the suite default.
+    // ...or when the judge's selection (its effort) differs from the suite's.
+    const modelDiffers =
+      Boolean(selectedModelId) && selectedModelId !== suiteModel;
+    const selectionDiffers =
+      (selectedSelection ? selectionConfigKey(selectedSelection) : "") !==
+      (suiteSelection ? selectionConfigKey(suiteSelection) : "");
+    const runOverride =
+      modelDiffers || (saveSelections && selectionDiffers)
+        ? {
+            judgeModel: selectedModelId,
+            ...(saveSelections && selectedSelection
+              ? { judgeSelection: selectedSelection }
+              : {}),
+          }
+        : undefined;
+    onRun(
+      {
+        runOverride,
+        ...((failedGeneration ||
+          goalCompletion?.cases.some((c) => c.status === "error")) &&
+        !runOverride
+          ? { scope: "failed" as const }
+          : {}),
+      },
+      force,
+    );
+  };
+
+  const ungraded = (goalCompletion?.cases ?? []).filter(
+    (c) => c.status === "error" || c.status === "skipped",
+  );
+  const cases = (goalCompletion?.cases ?? []).filter(
+    (c) => c.status === undefined || c.status === "scored",
+  );
+  const advisoryPassed = cases.filter((c) => c.passed).length;
+
+  // The rail is a run-level SUMMARY surface, not a per-case dump: the table now
+  // carries every case's score inline. So the only per-case detail worth
+  // surfacing here is where the judge DISAGREES with the deterministic pass/fail
+  // — the actionable cases. Compute the deterministic verdict per case from the
+  // iterations, then keep just the disagreements. (Full per-case reason + rubric
+  // live in the case drill-in.)
+  const disagreements = useMemo(() => {
+    if (cases.length === 0) return [];
+    const deterministicByCaseKey = new Map<string, boolean | null>();
+    for (const group of groupRunIterationsByTestCase(iterations, "test")) {
+      const caseKey = caseKeyForGroup(group);
+      if (caseKey) {
+        deterministicByCaseKey.set(caseKey, deterministicCasePassed(group));
+      }
+    }
+    return cases.filter((c) =>
+      judgeDisagreesWithVerdict(
+        deterministicByCaseKey.get(c.caseKey) ?? null,
+        c.passed,
+      ),
+    );
+  }, [cases, iterations]);
+  // Treat an in-flight request (clicked, before the run doc flips to `pending`)
+  // as a grading state, so a re-run doesn't keep showing the previous run's
+  // stale scores/counts as if they were current.
+  const inFlight = pending || requested;
+
+  const headerSubtitle = (() => {
+    if (pending) return "Grading…";
+    if (requested) return "Requesting…";
+    if (error || failedGeneration) return "Grading failed";
+    if (!isJudgeConfigured) return "Disabled";
+    if (!goalCompletion) return "Not run yet";
+    if (cases.length === 0) return "Couldn’t grade";
+    return `${advisoryPassed}/${cases.length} meet goal (advisory)`;
+  })();
+
+  const runLabel = ungraded.some((c) => c.status === "error")
+    ? "Retry grading"
+    : goalCompletion
+      ? "Re-run judge"
+      : "Run judge";
+
+  return (
+    <section
+      className={cn(
+        "flex flex-col text-card-foreground",
+        embedded ? "bg-transparent" : "rounded-lg border border-border bg-card",
+      )}
+    >
+      <header className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className="text-sm font-medium text-foreground">
+            {embedded ? "Goal judge" : "LLM as Judge"}
+          </span>
+          <span className="truncate text-xs text-muted-foreground">
+            {headerSubtitle}
+          </span>
+        </div>
+        {error || failedGeneration ? (
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 gap-1 text-xs text-muted-foreground hover:text-foreground"
+            onClick={() => handleRun(true)}
+            disabled={!completedRun || inFlight || judgeUnset}
+          >
+            <RotateCw className="h-3 w-3" />
+            Retry
+          </Button>
+        ) : null}
+      </header>
+
+      {isJudgeConfigured ? (
+        <>
+          {/* Controls: judge model + threshold + run. Only shown when the
+              suite has goal completion enabled — otherwise we render the
+              "Configure on suite" CTA below so the user can't accidentally
+              trigger a no-op grading that still spends an LLM call. */}
+          <div className="flex flex-wrap items-end gap-3 border-t border-border/50 px-3 py-3">
+            <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
+              <Label htmlFor="goal-judge-model" className="text-xs">
+                Judge model
+              </Label>
+              {/* Judge-eligible hosted models, plus the managed default and
+                  the current value (shown, but not offered again when it is
+                  not eligible). */}
+              <JudgeModelPicker
+                id="goal-judge-model"
+                className="w-full"
+                value={selectedModelId}
+                selection={selectedSelection}
+                selectionsSupported={saveSelections}
+                requireOrgKeys={requireOrgKeys}
+                onManageOrgProviders={onManageOrgProviders}
+                onAddProvider={onAddProvider}
+                availableModels={availableModels}
+                managedDefaultModelId={DEFAULT_JUDGE_MODEL}
+                onChange={(row) => {
+                  // The picked row's selection, keeping the effort when the
+                  // new model offers it (an effort belongs to its model).
+                  const patch = judgeModelPatch(
+                    row,
+                    availableModels,
+                    saveSelections,
+                    selectionReasoningEffort(selectedSelection),
+                  );
+                  // An organization row saves under its canonical id.
+                  setSelectedModelId(patch.judgeModel ?? String(row.id));
+                  setSelectedSelection(fullSelection(patch.judgeSelection));
+                }}
+                disabled={inFlight}
+              />
+              {/* The run override carries the judge's selection, so the
+                  effort is editable for THIS run (the suite keeps its own). */}
+              <SelectionEffortControl
+                variant="suffix"
+                row={selectedRow}
+                selection={selectedSelection}
+                purpose="judge"
+                selectionsSupported={saveSelections}
+                disabled={inFlight}
+                hint="Applies to this run's judge only"
+                onChange={(write) => {
+                  setSelectedModelId(write.modelId);
+                  setSelectedSelection(write.selection);
+                }}
+              />
+            </div>
+            <Button
+              type="button"
+              size="sm"
+              className="h-8 gap-1 text-xs"
+              // force when re-grading an existing result OR retrying a failed run,
+              // so the shared insight lifecycle re-requests instead of no-opping.
+              onClick={() =>
+                handleRun(Boolean(goalCompletion) || failedGeneration)
+              }
+              // `inFlight` (pending OR requested) blocks the gap between the click
+              // and the run doc flipping to `pending`, so a double-click can't spend
+              // a second judge call.
+              disabled={!completedRun || inFlight || judgeUnset}
+            >
+              {inFlight ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : null}
+              {runLabel}
+            </Button>
+          </div>
+
+          {hasMeaningfulOverride ? (
+            <div className="mx-3 mb-3 rounded-md border border-warning/50 bg-warning/50 px-3 py-2 text-[12px]">
+              <div className="font-medium text-foreground">
+                This run used an override
+              </div>
+              <div className="mt-0.5 text-muted-foreground">
+                Suite default:{" "}
+                <span className="font-mono text-foreground/80">
+                  {suiteModel} @ {suiteThreshold}
+                </span>{" "}
+                · This run:{" "}
+                <span className="font-mono text-foreground/80">
+                  {overrideModel ?? suiteModel} @{" "}
+                  {overrideThresholdValue ?? suiteThreshold}
+                  {overrideEffort ? ` · effort ${overrideEffort}` : ""}
+                </span>
+              </div>
+              <div className="mt-1 text-[11px] text-muted-foreground/80">
+                Scores from this run aren't directly comparable to the suite's
+                trend. Re-run with the override cleared to re-grade against the
+                suite contract.
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        // Suite explicitly disabled the judge. Don't render run controls —
+        // clicking them would spend an LLM call to grade nothing. The
+        // suite settings toggle is the path back on.
+        <div className="border-t border-border/50 px-3 py-3 text-[12px] text-muted-foreground">
+          Disabled in suite settings. Turn it on to grade this run.
+        </div>
+      )}
+
+      {/* Skip the bottom body band entirely in the quiet "disabled, no
+          prior result" state — the CTA above is the whole story, no need
+          for an empty bordered strip below it. */}
+      {!isJudgeConfigured &&
+      !goalCompletion &&
+      !inFlight &&
+      !error &&
+      !failedGeneration ? null : (
+        <div className="border-t border-border/50">
+          {inFlight ? (
+            <div className="flex items-center gap-2 px-3 py-4 text-sm text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              {/* "Processed", not "graded": the counter advances on an
+                  iteration the judge could not grade as well as one it did,
+                  and a number that claims more grading than happened is the
+                  kind of small lie that makes the rest of the card suspect. */}
+              {run.goalCompletionProgress
+                ? `Processed ${run.goalCompletionProgress.completed} of ${run.goalCompletionProgress.total} iterations…`
+                : "Grading recorded traces…"}
+            </div>
+          ) : error ? (
+            <div className="px-3 py-4 text-sm text-destructive">{error}</div>
+          ) : failedGeneration &&
+            cases.length === 0 &&
+            ungraded.length === 0 ? (
+            <div className="px-3 py-4 text-sm text-muted-foreground">
+              We could not finish grading. Retry the ungraded iterations.
+            </div>
+          ) : !goalCompletion ? (
+            <div className="px-3 py-4 text-sm text-muted-foreground">
+              Advisory grading against each case&apos;s objective. Never changes
+              the run&apos;s pass/fail.
+            </div>
+          ) : cases.length === 0 && ungraded.length === 0 ? (
+            <div className="px-3 py-4 text-sm text-muted-foreground">
+              This run wasn&apos;t graded — no completed cases were available to
+              judge. Re-run the judge to grade against the current suite config.
+            </div>
+          ) : (
+            <>
+              {ungraded.length > 0 ? (
+                <ul className="px-3 py-2 text-sm text-muted-foreground">
+                  {ungraded.map((c) => (
+                    <li key={c.iterationId ?? c.gradingKey ?? c.caseKey}>
+                      {c.status === "skipped" ? "Skipped" : "Couldn’t grade"}:{" "}
+                      {c.reason}
+                    </li>
+                  ))}
+                </ul>
+              ) : null}
+              {goalCompletion.summary?.trim() ? (
+                <p className="border-b border-border/40 px-3 py-2.5 text-sm text-muted-foreground">
+                  {goalCompletion.summary.trim()}
+                </p>
+              ) : null}
+              {disagreements.length > 0 ? (
+                <>
+                  <div className="px-3 pb-1 pt-2.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/80">
+                    Disagrees with pass/fail · {disagreements.length}
+                  </div>
+                  <ul className="divide-y divide-border/40">
+                    {disagreements.map((c) => {
+                      const title = titleByCaseKey.get(c.caseKey) ?? c.caseKey;
+                      return (
+                        <li
+                          key={c.iterationId ?? c.gradingKey ?? c.caseKey}
+                          className="flex items-start gap-3 px-3 py-2.5"
+                        >
+                          <span className="mt-0.5 w-10 shrink-0 text-right text-sm font-semibold tabular-nums">
+                            {formatScore(c.score)}
+                          </span>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="truncate text-sm font-medium text-foreground">
+                                {title}
+                              </span>
+                              <ScoreBadge passed={c.passed} />
+                            </div>
+                            {c.reason ? (
+                              <div className="mt-0.5 text-[13px] text-muted-foreground">
+                                {c.reason}
+                              </div>
+                            ) : null}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </>
+              ) : (
+                <p className="px-3 py-2.5 text-[13px] text-muted-foreground">
+                  All {cases.length} graded{" "}
+                  {cases.length === 1 ? "case" : "cases"} agree with the
+                  deterministic pass/fail ({advisoryPassed}/{cases.length} meet
+                  goal). Per-case scores are inline on each case.
+                </p>
+              )}
+              <p className="px-3 py-2 text-[11px] text-muted-foreground/70">
+                Judged by {goalCompletion.modelUsed} · pass when score ≥{" "}
+                {goalCompletion.threshold}. Advisory only — never changes the
+                run&apos;s pass/fail.
+              </p>
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+/**
+ * A full (hosted / org / local) selection for `modelId`, or `undefined` for a
+ * stored legacy selection (no settings to edit) or one for another model.
+ */
+function fullSelection(
+  selection: unknown,
+  modelId?: string,
+): ModelSelection | undefined {
+  if (!selection || typeof selection !== "object") return undefined;
+  const full = nonLegacySelection(selection as RequestedModelSelection);
+  return full && (modelId === undefined || full.modelId === modelId)
+    ? full
+    : undefined;
+}

@@ -1,0 +1,65 @@
+name: Dependency Audit
+
+on:
+  # Run on every PR regardless of its base branch, like lint.yml and test.yml.
+  # `branches` filters on the PR's BASE, so a stacked PR never matched `main`
+  # and was never audited; once it was retargeted to `main`, nothing re-ran it
+  # and the required check never reported.
+  pull_request:
+  # The merge queue tests the merged result before it lands on main; without
+  # this trigger the queue's required checks never report and entries time out.
+  # No `push: main`, for the reason in test.yml.
+  merge_group:
+  schedule:
+    # Dependabot only reacts to new advisories against what we already have.
+    # A weekly run means the audit has a recorded cadence of its own, rather
+    # than only running when somebody happens to open a pull request.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a PR supersedes its in-flight audit. Every other event gets a
+# group of its own (run_id), so queue runs and the weekly run never cancel or
+# queue behind each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24.22.1"
+
+jobs:
+  audit:
+    # Blacksmith, not GitHub's shared 60-job pool; this job holds no secret or
+    # write token. TEST_RUNNER=ubuntu-latest moves it back during an outage.
+    runs-on: ${{ vars.TEST_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
+    timeout-minutes: 15
+    name: Dependency Audit
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # `npm audit` resolves package-lock.json against the registry, so this job
+      # deliberately skips `npm ci` — installing the workspace would add several
+      # minutes and change nothing about the result.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=critical
+
+      # Runs even when the gate above fails, so a red build still shows what is
+      # outstanding instead of only the advisory that tripped it. Dev-only
+      # advisories are reported here but never fail the build: they do not ship
+      # to users, and gating on them would block every unrelated pull request.
+      - name: Summarize advisories
+        if: always()
+        run: |
+          npm audit --omit=dev --json > audit-prod.json || true
+          npm audit --json > audit-all.json || true
+          node scripts/summarize-npm-audit.mjs audit-prod.json audit-all.json >> "$GITHUB_STEP_SUMMARY"

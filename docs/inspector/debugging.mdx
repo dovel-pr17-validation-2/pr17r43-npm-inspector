@@ -1,0 +1,36 @@
+---
+title: "Tracing & debugging"
+description: "See all messages sent to and from your MCP server"
+icon: "bug"
+---
+
+MCPJam Inspector gives you full visibility into every exchange between the inspector and your MCP server, across the Playground, Tools, Prompts, and Resources tabs.
+
+## JSON-RPC logging
+
+Every tab that talks to a connected server renders a live JSON-RPC logger. Each entry records the direction (client → server or server → client), the method name, a timestamp, and the full request/response payload. Click an entry to expand and inspect.
+
+See [Playground → JSON-RPC Logger](/inspector/playground#json-rpc-logger) and [MCP Inspector](/inspector/tools-prompts-resources#json-rpc-logging) for how it surfaces in each tab.
+
+## Widget debugging
+
+When using ChatGPT Apps or MCP Apps in the Playground, you can debug widget state and globals directly from tool call results.
+
+### Debugging in the chat
+
+Click on any tool call in the chat to expand its debug panel. For widgets, you'll see three tabs:
+
+- **Data** - The tool's input arguments and output result
+- **Widget State** - The current state persisted by the widget (updated in real-time as the widget calls `setWidgetState`)
+- **Globals** - Environment information passed to the widget including theme, display mode, locale, and device capabilities
+
+A "Click to debug" hint appears on tool calls that have widget debug information available.
+
+### Debugging in the Tools tab
+
+When testing OpenAI Apps or MCP Apps from the Tools tab, the results panel includes a **State/Globals** button alongside the Component and Raw JSON views. This shows the same widget state and globals information in a dedicated panel.
+
+<Tip>
+  Widget state persists across follow-up turns in a conversation. Keep state
+  under 4k tokens for optimal performance.
+</Tip>

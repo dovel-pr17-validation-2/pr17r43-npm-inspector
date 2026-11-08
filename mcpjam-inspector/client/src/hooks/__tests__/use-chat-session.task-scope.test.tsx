@@ -1,0 +1,400 @@
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { useChatSession } from "../use-chat-session";
+import {
+  getTrackedTasks,
+  setTrackedTaskScope,
+  setTrackedTaskOwner,
+} from "@/lib/task-tracker";
+
+/**
+ * Finding 4 (MCP Tasks): a task created by a chat turn belongs to the scope
+ * the turn was SUBMITTED under. The `data-task-created` part can arrive after
+ * the user switched projects mid-stream; before the fix the handler let
+ * `trackTask` stamp the live active scope, filing the task under the NEW
+ * project. The hook now captures the scope once, at submit (in the transport
+ * body builder), and passes it explicitly.
+ */
+
+const mockState = vi.hoisted(() => ({
+  chatOnData: null as ((part: unknown) => void) | null,
+  chatOnError: null as ((error: Error) => void) | null,
+  transportOptions: [] as Array<{ body?: () => unknown }>,
+  chatStatus: "ready" as string,
+  messages: [] as unknown[],
+  convexMutation: vi.fn(async () => ({ ok: true })),
+  setMessages: vi.fn(),
+  sendMessage: vi.fn(async () => {}),
+  stop: vi.fn(),
+  addToolApprovalResponse: vi.fn(),
+  getAccessToken: vi.fn(async () => null),
+  hasToken: vi.fn(() => false),
+  getToken: vi.fn(() => ""),
+  getOpenRouterSelectedModels: vi.fn(() => []),
+  getOllamaBaseUrl: vi.fn(() => "http://127.0.0.1:11434"),
+  getAzureBaseUrl: vi.fn(() => ""),
+  getCustomProviderByName: vi.fn(),
+  setSelectedModelId: vi.fn(),
+  getToolsMetadata: vi.fn(async () => ({
+    metadata: {},
+    toolServerMap: {},
+    tokenCounts: null,
+  })),
+  countTextTokens: vi.fn(async () => null),
+  convexAuth: { isAuthenticated: true, isLoading: false },
+  detectOllamaModels: vi.fn(async () => ({
+    isRunning: false,
+    availableModels: [],
+  })),
+  detectOllamaToolCapableModels: vi.fn(async () => []),
+  idCounter: 0,
+}));
+
+// A BYOK model that does NOT route through the org runtime, so the transport
+// body takes the non-hosted branch (no hosted project id is required).
+const byokModel = {
+  id: "gpt-4",
+  name: "GPT-4",
+  provider: "openai" as const,
+};
+
+function nextSessionId() {
+  mockState.idCounter += 1;
+  return `chat-session-${mockState.idCounter}`;
+}
+
+const mockApplyToolCallStepUp = vi.hoisted(() => vi.fn());
+vi.mock("@/state/oauth-orchestrator", () => ({
+  applyToolCallStepUp: (...args: unknown[]) => mockApplyToolCallStepUp(...args),
+}));
+
+vi.mock("@/lib/config", () => ({ HOSTED_MODE: false }));
+
+vi.mock("@/components/chat-v2/shared/model-helpers", () => ({
+  buildAvailableModels: vi.fn(() => [byokModel]),
+  getDefaultModel: vi.fn(() => byokModel),
+  isMCPJamProvidedModelMenuItem: vi.fn(() => false),
+}));
+
+vi.mock("@/hooks/use-hosted-model-catalog", () => ({
+  useHostedModelCatalog: () => ({ hostedCatalog: [], status: "fallback" }),
+}));
+
+vi.mock("@/hooks/use-ai-provider-keys", () => ({
+  useAiProviderKeys: () => ({
+    hasToken: mockState.hasToken,
+    getToken: mockState.getToken,
+    getOpenRouterSelectedModels: mockState.getOpenRouterSelectedModels,
+    getOllamaBaseUrl: mockState.getOllamaBaseUrl,
+    getAzureBaseUrl: mockState.getAzureBaseUrl,
+  }),
+}));
+
+vi.mock("@/hooks/use-custom-providers", () => ({
+  useCustomProviders: () => ({
+    customProviders: [],
+    getCustomProviderByName: mockState.getCustomProviderByName,
+  }),
+}));
+
+vi.mock("@/hooks/use-persisted-model", () => ({
+  usePersistedModel: () => ({
+    selectedModelId: "gpt-4",
+    setSelectedModelId: mockState.setSelectedModelId,
+    selectedModelIds: ["gpt-4"],
+    setSelectedModelIds: vi.fn(),
+    multiModelEnabled: false,
+    setMultiModelEnabled: vi.fn(),
+  }),
+}));
+
+vi.mock("@/hooks/useSharedChatWidgetCapture", () => ({
+  useSharedChatWidgetCapture: vi.fn(),
+}));
+
+vi.mock("@/lib/ollama-utils", () => ({
+  detectOllamaModels: mockState.detectOllamaModels,
+  detectOllamaToolCapableModels: mockState.detectOllamaToolCapableModels,
+}));
+
+vi.mock("@/lib/apis/mcp-tools-api", () => ({
+  getToolsMetadata: mockState.getToolsMetadata,
+}));
+
+vi.mock("@/lib/apis/mcp-tokenizer-api", () => ({
+  countTextTokens: mockState.countTextTokens,
+}));
+
+vi.mock("@/lib/session-token", () => ({
+  authFetch: vi.fn(),
+  getAuthHeaders: vi.fn(() => ({})),
+}));
+
+vi.mock("@workos-inc/authkit-react", () => ({
+  useAuth: () => ({ getAccessToken: mockState.getAccessToken }),
+}));
+
+// Soft reads (billing, credits, quota, notifications) go through useQueries;
+// withUseQueries answers them from this mock's useQuery.
+vi.mock("convex/react", async () =>
+  (await import("@/test/mocks/convex-use-queries")).withUseQueries({
+  useConvexAuth: () => mockState.convexAuth,
+  useQuery: () => undefined,
+  useConvex: () => ({ mutation: mockState.convexMutation }),
+}));
+
+vi.mock("@ai-sdk/react", () => ({
+  useChat: vi.fn((options: { onData?: (part: unknown) => void; onError?: (error: Error) => void }) => {
+    mockState.chatOnData = options.onData ?? null;
+    mockState.chatOnError = options.onError ?? null;
+    return {
+      messages: mockState.messages,
+      sendMessage: mockState.sendMessage,
+      stop: mockState.stop,
+      status: mockState.chatStatus,
+      error: undefined,
+      setMessages: mockState.setMessages,
+      addToolApprovalResponse: mockState.addToolApprovalResponse,
+    };
+  }),
+}));
+
+vi.mock("ai", () => ({
+  // Captures the transport options so a test can run the request-time `body`
+  // builder — the point where the hook snapshots the turn's task scope.
+  DefaultChatTransport: class MockTransport {
+    constructor(options: { body?: () => unknown }) {
+      mockState.transportOptions.push(options);
+    }
+  },
+  generateId: vi.fn(() => nextSessionId()),
+  lastAssistantMessageIsCompleteWithApprovalResponses: vi.fn(),
+  convertToModelMessages: vi.fn(async () => []),
+}));
+
+async function renderChatSession() {
+  const rendered = renderHook(() =>
+    useChatSession({ selectedServers: ["server-1"] })
+  );
+  await waitFor(() => {
+    expect(mockState.chatOnData).not.toBeNull();
+  });
+  return rendered;
+}
+
+function taskCreatedPart(taskId: string) {
+  return {
+    type: "data-task-created",
+    data: {
+      taskId,
+      serverId: "convex-doc-id",
+      serverName: "server-1",
+      wire: "extension" as const,
+      createdAt: new Date().toISOString(),
+      status: "working",
+    },
+  };
+}
+
+describe("useChatSession task-created scope capture", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    localStorage.clear();
+    setTrackedTaskOwner(null, null);
+    setTrackedTaskScope(undefined);
+    mockState.chatOnData = null;
+    mockState.transportOptions = [];
+    mockState.chatStatus = "ready";
+    mockState.idCounter = 0;
+    mockState.messages = [];
+  });
+
+  it("clears startup status on Stop, error and chat switch and rejects stale requests", async () => {
+    const { result, rerender } = await renderChatSession();
+    const requestId = () => {
+      let value: unknown;
+      act(() => { value = mockState.transportOptions.at(-1)?.body?.(); });
+      if (!value || typeof value !== "object" || !("harnessStartupRequestId" in value) ||
+          typeof value.harnessStartupRequestId !== "string") throw new Error("Missing request ID");
+      return value.harnessStartupRequestId;
+    };
+    const first = requestId();
+    const chat = result.current.chatSessionId;
+    const receive = (id: string) => act(() => mockState.chatOnData?.({
+      type: "data-harness-startup", transient: true,
+      data: { phase: "computer", requestId: id, chatSessionId: chat },
+    }));
+    mockState.chatStatus = "streaming";
+    rerender();
+    receive(first);
+    expect(result.current.harnessStartupPhase).toBe("computer");
+    const second = requestId();
+    expect(second).not.toBe(first);
+    receive(first);
+    expect(result.current.harnessStartupPhase).toBeNull();
+    receive(second);
+    expect(result.current.harnessStartupPhase).toBe("computer");
+    act(() => result.current.stop());
+    expect(mockState.stop).toHaveBeenCalled();
+    expect(result.current.harnessStartupPhase).toBeNull();
+    receive(second);
+    expect(result.current.harnessStartupPhase).toBeNull();
+    const third = requestId();
+    receive(third);
+    expect(result.current.harnessStartupPhase).toBe("computer");
+    act(() => mockState.chatOnError?.(new Error("Connection closed")));
+    expect(result.current.harnessStartupPhase).toBeNull();
+    mockState.chatStatus = "error";
+    rerender();
+    expect(result.current.harnessStartupPhase).toBeNull();
+    mockState.chatStatus = "streaming";
+    rerender();
+    receive(third);
+    expect(result.current.harnessStartupPhase).toBeNull();
+    const fourth = requestId();
+    receive(fourth);
+    expect(result.current.harnessStartupPhase).toBe("computer");
+    act(() => result.current.resetChat());
+    expect(result.current.chatSessionId).not.toBe(chat);
+    receive(fourth);
+    expect(result.current.harnessStartupPhase).toBeNull();
+    expect(result.current.messages).toEqual([]);
+  });
+
+  it("files a part delivered after a mid-stream scope switch under the turn-start scope", async () => {
+    setTrackedTaskScope("proj-a");
+    await renderChatSession();
+
+    // Submit: the transport body builder runs at request time and snapshots
+    // the scope the turn starts under.
+    const transport = mockState.transportOptions.at(-1);
+    expect(transport?.body).toBeTypeOf("function");
+    act(() => {
+      transport!.body!();
+    });
+
+    // The user switches projects while the turn is still streaming.
+    setTrackedTaskScope("proj-b");
+    act(() => {
+      mockState.chatOnData?.(taskCreatedPart("task-1"));
+    });
+
+    // Not filed under the now-active scope...
+    expect(getTrackedTasks()).toHaveLength(0);
+    // ...but under the scope the turn was submitted in, keyed by server NAME.
+    setTrackedTaskScope("proj-a");
+    expect(
+      getTrackedTasks().map((t) => ({
+        taskId: t.taskId,
+        serverId: t.serverId,
+        scope: t.scope,
+      }))
+    ).toEqual([{ taskId: "task-1", serverId: "server-1", scope: "proj-a" }]);
+  });
+
+  it("keeps filing under the ACTIVE scope when no submit preceded the part", async () => {
+    // Defensive: a part with no captured turn scope (nothing ran the body
+    // builder) falls back to trackTask's own active-scope stamping.
+    setTrackedTaskScope("proj-a");
+    await renderChatSession();
+
+    act(() => {
+      mockState.chatOnData?.(taskCreatedPart("task-2"));
+    });
+
+    expect(getTrackedTasks().map((t) => t.scope)).toEqual(["proj-a"]);
+  });
+  it("uses per-request owners when overlapping bound replies arrive out of order", async () => {
+    setTrackedTaskOwner("project", "actor-a");
+    await renderChatSession();
+    const transport = mockState.transportOptions.at(-1)!;
+    const first = transport.body!() as {
+      hostedTaskOwnerRequestId: string;
+      hostedTaskOwnerScope: string;
+    };
+    setTrackedTaskOwner("project", "actor-b");
+    const second = transport.body!() as {
+      hostedTaskOwnerRequestId: string;
+      hostedTaskOwnerScope: string;
+    };
+    expect(first.hostedTaskOwnerRequestId).not.toBe(
+      second.hostedTaskOwnerRequestId,
+    );
+    const reply = (
+      ownerRequestId: string,
+      sourceExecutionId: string,
+      ownerScope: string,
+    ) => {
+      const part = taskCreatedPart("same");
+      return {
+        ...part,
+        data: {
+          ...part.data,
+          connectionId: "account",
+          ownerRequestId,
+          sourceExecutionId,
+          ownerScope,
+        },
+      };
+    };
+    act(() => {
+      mockState.chatOnData?.(
+        reply(
+          second.hostedTaskOwnerRequestId,
+          "b",
+          second.hostedTaskOwnerScope,
+        ),
+      );
+      mockState.chatOnData?.(
+        reply(first.hostedTaskOwnerRequestId, "a", first.hostedTaskOwnerScope),
+      );
+    });
+    expect(getTrackedTasks().map((task) => task.sourceExecutionId)).toEqual([
+      "b",
+    ]);
+    setTrackedTaskOwner("project", "actor-a");
+    expect(getTrackedTasks().map((task) => task.sourceExecutionId)).toEqual([
+      "a",
+    ]);
+    expect(getTrackedTasks()[0].serverId).toBe("convex-doc-id");
+  });
+
+  it("does not assign an uncorrelated bound reply to the currently signed-in actor", async () => {
+    setTrackedTaskOwner("project", "actor-a");
+    await renderChatSession();
+    const part = taskCreatedPart("unknown");
+    act(() =>
+      mockState.chatOnData?.({
+        ...part,
+        data: {
+          ...part.data,
+          connectionId: "account",
+          ownerRequestId: "unknown-request",
+        },
+      }),
+    );
+    expect(getTrackedTasks()).toEqual([]);
+  });
+
+  it("rejects an authenticated owner mismatch even for a known request", async () => {
+    setTrackedTaskOwner("project", "actor-a");
+    await renderChatSession();
+    const request = mockState.transportOptions.at(-1)!.body!() as {
+      hostedTaskOwnerRequestId: string;
+    };
+    const part = taskCreatedPart("wrong-owner");
+    act(() =>
+      mockState.chatOnData?.({
+        ...part,
+        data: {
+          ...part.data,
+          connectionId: "account",
+          ownerRequestId: request.hostedTaskOwnerRequestId,
+          ownerScope: "another-owner",
+        },
+      }),
+    );
+    expect(getTrackedTasks()).toEqual([]);
+  });
+
+});

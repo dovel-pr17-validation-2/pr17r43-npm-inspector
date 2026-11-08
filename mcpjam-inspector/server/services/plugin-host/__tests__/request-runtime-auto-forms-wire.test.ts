@@ -1,0 +1,677 @@
+/**
+ * Wire-level regression for an unpinned (Auto) plugin client's form claims.
+ *
+ * The request runtime arms BOTH form services before connect, because the
+ * era is only known after negotiation: the OpenAI legacy handler
+ * (`openai/elicitation/create`) and the MRTR input collector. Neither answers
+ * a STANDARD legacy `elicitation/create`, so the 2025 `initialize` must not
+ * claim standard form support — a server relying on that claim would get
+ * `-32601` mid tool call. The 2026 era keeps both claims: the MRTR collector
+ * answers standard form elicitation there, and OpenAI's extended forms ride
+ * on it with their schema in `_meta["openai/elicitation"]`.
+ *
+ * Executor-selection tests mock the manager and so cannot see this; here the
+ * runtime's own capability set and handlers drive the real `MCPClientManager`
+ * against loopback HTTP servers.
+ */
+import http from "node:http";
+import { randomUUID } from "node:crypto";
+import { generateKeyPair, jwtVerify, SignJWT } from "jose";
+import type { AddressInfo } from "node:net";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { z } from "zod";
+import type { Context } from "hono";
+import {
+  createMcpHandler,
+  McpServer,
+} from "@modelcontextprotocol/server";
+import {
+  NodeStreamableHTTPServerTransport,
+  toNodeHandler,
+} from "@modelcontextprotocol/node";
+import { MCPClientManager } from "@mcpjam/sdk";
+import { createElicitInput, requestFormInput } from "@openai/mcp-extensions/server";
+import { projectSelectedMcpServersAsHostTools } from "../../../utils/harness/host-executed-mcp-tools";
+import { createModelFormExecutor, createModelFormDispatch } from "../model-forms";
+import { ownedPluginFormSchema } from "../owned-mrtr";
+import { installedFormClientCapabilities } from "../owned-legacy";
+import {
+  pluginHostBindingDigest,
+  pluginServerBindingDigest,
+} from "../bindings";
+
+const f = vi.hoisted(() => ({
+  query: vi.fn(),
+  url: "",
+  managers: [] as { disconnectAllServers: () => Promise<void> }[],
+  collector: vi.fn(),
+  answer: vi.fn(),
+  consumed: vi.fn(),
+  verifyToken: undefined as ((bearer: string) => Promise<void>) | undefined,
+}));
+
+vi.mock("../../../routes/web/hosted-elicitation.js", async (original) => {
+  const actual = await original<typeof import("../../../routes/web/hosted-elicitation.js")>();
+  return {
+    ...actual,
+    HostedElicitationBridge: class {
+      constructor(private options: ConstructorParameters<typeof actual.HostedElicitationBridge>[0]) {}
+      attachStreamWriter() {}
+      async callback(request: Parameters<InstanceType<typeof actual.HostedElicitationBridge>["callback"]>[0]) {
+        const source = await this.options.bindPluginForm?.({
+          rendezvousId: randomUUID(), serverId: request.serverId!,
+          schema: request.schema, expiresAt: Date.now() + 10_000,
+        });
+        try {
+          const result = await f.answer(request);
+          return source?.deliver ? await source.deliver(result) : result;
+        } finally {
+          source?.release();
+        }
+      }
+      async dispose() {}
+    },
+  };
+});
+vi.mock("../../evals/route-helpers.js", () => ({
+  createConvexClient: (bearer: string) => ({
+    query: async (...args: unknown[]) => {
+      await f.verifyToken?.(bearer);
+      return f.query(...args);
+    },
+  }),
+}));
+vi.mock("../owned-mrtr.js", async (original) => {
+  const actual = await original<typeof import("../owned-mrtr.js")>();
+  return {
+    ...actual,
+    createOwnedPluginMrtr: (
+      deps: Parameters<typeof actual.createOwnedPluginMrtr>[0],
+    ) => ({ ...actual.createOwnedPluginMrtr(deps), collector: f.collector }),
+  };
+});
+vi.mock("../receipt-store.js", async (original) => ({
+  ...(await original<typeof import("../receipt-store.js")>()),
+  createPluginInvocationReceiptPort: () => undefined,
+}));
+const identity = () => ({
+  serverId: "server",
+  credentialId: "saved-credential",
+  credentialAuthorizedAt: 100,
+  config: {
+    transportType: "http",
+    url: f.url,
+    credentialConfigurationId: "a".repeat(64),
+  },
+});
+// The real hosted builder, reduced to what reaches the wire: a real manager
+// with the runtime's extension handlers, and the runtime's capability set as
+// the server config's EXACT `clientCapabilities` (as `createAuthorizedManager`
+// stamps it). No protocol pin: Auto negotiation.
+vi.mock("../../../routes/web/auth.js", () => ({
+  projectServerSchema: z.object({
+    projectId: z.string(),
+    serverId: z.string(),
+  }),
+  createManualHostedConnection: async (
+    _c: unknown,
+    _body: unknown,
+    _schema: unknown,
+    options: {
+      extensionRequestHandlers?: ConstructorParameters<
+        typeof MCPClientManager
+      >[1] extends infer O
+        ? O extends { extensionRequestHandlers?: infer H }
+          ? H
+          : never
+        : never;
+      hostConfig: { clientCapabilities: Record<string, unknown> };
+    },
+  ) => {
+    const manager = new MCPClientManager(
+      {},
+      {
+        lazyConnect: true,
+        extensionRequestHandlers: options.extensionRequestHandlers,
+      },
+    );
+    f.managers.push(manager);
+    const caps = options.hostConfig.clientCapabilities;
+    return {
+      manager,
+      authorizedServerConfigs: {
+        server: {
+          url: f.url,
+          capabilities: caps,
+          clientCapabilities: caps,
+          timeout: 10_000,
+        },
+      },
+      authorizedServerIdentities: { server: identity() },
+    };
+  },
+}));
+
+import { admitPluginWorkspace } from "../admission";
+import { createPluginRequestRuntime } from "../request-runtime";
+import { pluginConnectionPool } from "../connection-pool";
+import { createModelMrtrAdapter } from "../model-mrtr";
+import { PluginInvocationError } from "../invocation";
+
+const formSchema = {
+  type: "object" as const,
+  properties: { answer: { type: "string" as const } },
+  required: ["answer"],
+};
+
+interface Served {
+  url: string;
+  /** `params.capabilities` of every `initialize` the server received. */
+  initialize: Record<string, unknown>[];
+  /** Client JSON-RPC responses to server-to-client requests. */
+  replies: { id: unknown; result?: unknown; error?: { code?: number } }[];
+  close: () => Promise<void>;
+}
+
+async function readBody(req: http.IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(Buffer.from(chunk));
+  const text = Buffer.concat(chunks).toString("utf8");
+  return text ? JSON.parse(text) : undefined;
+}
+
+/**
+ * A 2025-only stateful Streamable HTTP server: it answers the modern
+ * `server/discover` probe with `-32601` (Auto falls back to `initialize`), and
+ * its tool asks a STANDARD `elicitation/create` form exactly when the client
+ * declared form support — the behavior of any server that trusts the claim.
+ */
+async function serveLegacy(openaiForm = false): Promise<Served> {
+  const served: Omit<Served, "url" | "close"> = { initialize: [], replies: [] };
+  const transports = new Map<string, NodeStreamableHTTPServerTransport>();
+  const build = () => {
+    const server = new McpServer(
+      { name: "legacy-form-fixture", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    server.registerTool(
+      "app",
+      { description: "Asks a form when the client claims one." },
+      async (ctx) => {
+        if (openaiForm) {
+          const result = await createElicitInput(server)(ctx, {
+            mode: "form", message: "Answer?", requestedSchema: formSchema,
+          });
+          f.consumed(result);
+          return { content: [{ type: "text" as const, text: `form:${result.action === "accept" ? result.content.answer : result.action}` }] };
+        }
+        if (!server.server.getClientCapabilities()?.elicitation) {
+          return { content: [{ type: "text" as const, text: "no-form" }] };
+        }
+        const result = await ctx.mcpReq.elicitInput({
+          mode: "form",
+          message: "Answer?",
+          requestedSchema: formSchema,
+        });
+        return {
+          content: [{ type: "text" as const, text: `form:${result.action}` }],
+        };
+      },
+    );
+    return server;
+  };
+  const httpServer = http.createServer(async (req, res) => {
+    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    if (req.method !== "POST") {
+      const transport = sessionId ? transports.get(sessionId) : undefined;
+      if (!transport) {
+        res.writeHead(405).end();
+        return;
+      }
+      await transport.handleRequest(req, res);
+      return;
+    }
+    const body = (await readBody(req)) as {
+      id?: unknown;
+      method?: string;
+      params?: { capabilities?: Record<string, unknown> };
+      result?: unknown;
+      error?: { code?: number };
+    };
+    if (body?.method === "server/discover") {
+      res.writeHead(200, { "content-type": "application/json" }).end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          error: { code: -32601, message: "Method not found" },
+        }),
+      );
+      return;
+    }
+    if (body?.method === "initialize") {
+      served.initialize.push(body.params?.capabilities ?? {});
+      const server = build();
+      const transport: NodeStreamableHTTPServerTransport =
+        new NodeStreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (id) => {
+            transports.set(id, transport);
+          },
+        });
+      await server.connect(transport);
+      await transport.handleRequest(req, res, body);
+      return;
+    }
+    if (body && !body.method && body.id !== undefined) {
+      served.replies.push({
+        id: body.id,
+        result: body.result,
+        error: body.error,
+      });
+    }
+    const transport = sessionId ? transports.get(sessionId) : undefined;
+    if (!transport) {
+      res.writeHead(400).end();
+      return;
+    }
+    await transport.handleRequest(req, res, body);
+  });
+  await new Promise<void>((done) => httpServer.listen(0, "127.0.0.1", done));
+  return {
+    ...served,
+    url: `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/mcp`,
+    close: async () => {
+      await Promise.allSettled(
+        [...transports.values()].map((transport) => transport.close()),
+      );
+      httpServer.closeAllConnections();
+      await new Promise<void>((done) => httpServer.close(() => done()));
+    },
+  };
+}
+
+/** A dual-era server (2026-07-28 preferred) whose tool needs one MRTR form. */
+async function serveModern(): Promise<Served> {
+  const handler = createMcpHandler(() => {
+    const server = new McpServer(
+      { name: "modern-form-fixture", version: "1.0.0" },
+      { capabilities: { tools: {} } },
+    );
+    server.registerTool(
+      "search",
+      { description: "Returns a part without elicitation." },
+      async () => ({
+        content: [{ type: "text" as const, text: "part_joystick" }],
+      }),
+    );
+    server.registerTool(
+      "app",
+      { description: "Asks one MRTR form." },
+      async (ctx) => {
+        const answered = requestFormInput(ctx, {
+          mode: "form",
+          message: "Answer?",
+          requestedSchema: formSchema,
+          key: "q",
+          requestState: "state-1",
+        });
+        if ("resultType" in answered) return answered;
+        f.consumed(answered);
+        return {
+          content: [{ type: "text" as const, text: `form:${answered.action === "accept" ? answered.content.answer : answered.action}` }],
+        };
+      },
+    );
+    return server;
+  });
+  const httpServer = http.createServer(toNodeHandler(handler));
+  await new Promise<void>((done) => httpServer.listen(0, "127.0.0.1", done));
+  return {
+    initialize: [],
+    replies: [],
+    url: `http://127.0.0.1:${(httpServer.address() as AddressInfo).port}/mcp`,
+    close: async () => {
+      httpServer.closeAllConnections();
+      await new Promise<void>((done) => httpServer.close(() => done()));
+    },
+  };
+}
+
+const host = {
+  hostId: "host",
+  modelId: "model",
+  systemPrompt: "",
+  temperature: 0,
+  requireToolApproval: false,
+  hostStyle: "chatgpt",
+  executionScope: { kind: "project", projectId: "project" },
+  // The Codex and ChatGPT templates pin no protocol: Auto negotiation.
+  harness: "codex",
+  mcpProfile: {},
+};
+
+async function autoRuntime() {
+  const admission = await admitPluginWorkspace({
+    projectId: "project",
+    bearer: "fixture",
+    descriptor: { version: 1, workspaceId: "workspace" },
+  });
+  return createPluginRequestRuntime(
+    {} as Context,
+    admission,
+    "fixture",
+    { hostId: "host", serverId: "server" },
+    {
+      hostRevision: pluginHostBindingDigest(host),
+      serverIdentity: { kind: "standalone" as const, serverId: "server" },
+      owner: {
+        bindingId: pluginServerBindingDigest(identity()),
+        workspaceId: "workspace",
+      },
+    } as Parameters<typeof createPluginRequestRuntime>[4],
+  );
+}
+
+let served: Served | undefined;
+beforeEach(async () => {
+  await pluginConnectionPool.clear();
+  f.managers.length = 0;
+  f.verifyToken = undefined;
+  f.consumed.mockReset();
+  f.collector.mockReset();
+  f.answer.mockReset().mockResolvedValue({ action: "accept", content: { answer: "modern" } });
+  f.query.mockImplementation(async (_: unknown, args: any) => ({
+    actorId: "actor",
+    projectId: "project",
+    ...(args.hostId ? { hostConfig: host } : {}),
+    serverBindings: args.serverIds?.map((serverId: string) => ({
+      kind: "standalone",
+      serverId,
+    })),
+  }));
+});
+afterEach(async () => {
+  await pluginConnectionPool.clear();
+  await Promise.allSettled(f.managers.map((m) => m.disconnectAllServers()));
+  await served?.close();
+  served = undefined;
+});
+
+describe("an unpinned (Auto) plugin client's form claims on the wire", () => {
+  it("Auto → 2025: claims no standard form support nothing answers, so no tool call dies with -32601", async () => {
+    served = await serveLegacy();
+    f.url = served.url;
+    const live = await autoRuntime();
+    const resolved = await live.resolve("app", new AbortController().signal);
+    expect(resolved.protocolVersion).toBe("2025-11-25");
+    expect(resolved.transport).toBe("legacy");
+
+    // The legacy handshake carried the OpenAI claim (its handler answers it
+    // there) but no standard `elicitation`: no standard handler is installed.
+    expect(served.initialize).toHaveLength(1);
+    const advertised = served.initialize[0]!;
+    expect(advertised.extensions).toMatchObject({
+      "openai/elicitation": { form: {} },
+    });
+    expect(advertised.elicitation).toBeUndefined();
+
+    const result = (await resolved.manager.executeTool(
+      "server",
+      "app",
+      {},
+    )) as {
+      isError?: boolean;
+      content: { text?: string }[];
+    };
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toBe("no-form");
+    // No standard form request reached the client, so none was refused.
+    expect(served.replies.filter((r) => r.error?.code === -32601)).toEqual([]);
+    expect(f.collector).not.toHaveBeenCalled();
+    await live.release();
+  });
+
+  it("Auto → 2026-07-28: keeps modern form support and answers through the MRTR collector", async () => {
+    served = await serveModern();
+    f.url = served.url;
+    f.collector.mockImplementation(
+      async ({ inputRequests }: { inputRequests: Record<string, unknown> }) =>
+        Object.fromEntries(
+          Object.keys(inputRequests).map((key) => [
+            key,
+            { action: "accept", content: { answer: "modern" } },
+          ]),
+        ),
+    );
+    const live = await autoRuntime();
+    const resolved = await live.resolve("app", new AbortController().signal);
+    expect(resolved.protocolVersion).toBe("2026-07-28");
+    expect(resolved.transport).toBe("mrtr");
+
+    const caps = (resolved.manager.getInitializationInfo("server")
+      ?.clientCapabilities ?? {}) as Record<string, unknown>;
+    expect(caps.elicitation).toEqual({ form: {} });
+    // The MRTR collector also answers OpenAI's extended forms, so the claim
+    // the legacy handler would lose on this era is kept.
+    expect(
+      (caps.extensions as Record<string, unknown> | undefined)?.[
+        "openai/elicitation"
+      ],
+    ).toEqual({ form: {} });
+
+    // The server embeds a form only for a client that declared form support
+    // on the request envelope (otherwise -32021); the collector answers it.
+    const result = (await resolved.manager.executeTool(
+      "server",
+      "app",
+      {},
+    )) as {
+      isError?: boolean;
+      content: { text?: string }[];
+    };
+    expect(result.isError).not.toBe(true);
+    expect(result.content[0]?.text).toBe("form:modern");
+    expect(f.collector).toHaveBeenCalledOnce();
+    await live.release();
+  });
+});
+
+describe("model adapter joined to a real modern MCP server", () => {
+  it("executes an ordinary modern tool and retains an inner host refusal without repeating it", async () => {
+    served = await serveModern();
+    f.url = served.url;
+    const admission = await admitPluginWorkspace({
+      projectId: "project",
+      bearer: "fixture",
+      descriptor: { version: 1, workspaceId: "workspace" },
+    });
+    const adapter = createModelMrtrAdapter({
+      c: { req: { raw: { signal: new AbortController().signal } } } as Context,
+      admission,
+      bearer: "fixture",
+      identity: {
+        actorId: "actor",
+        projectId: "project",
+        workspaceId: "workspace",
+        subject: "subject",
+      },
+      hostId: "host",
+      hostRevision: pluginHostBindingDigest(host),
+      serverIds: ["server"],
+    });
+    // Original chat manager, distinct from the adapter's admission connection.
+    const dispatch = createModelFormDispatch(["server"]);
+    const manager = new MCPClientManager({}, {
+      lazyConnect: true,
+      extensionRequestHandlers: dispatch.handlers,
+    });
+    f.collector.mockImplementation(async ({ inputRequests }) =>
+      Object.fromEntries(Object.keys(inputRequests).map((key) => [
+        key, { action: "accept", content: { answer: "modern" } },
+      ])),
+    );
+    manager.setMrtrInputCollector(
+      "server", f.collector, adapter.collectorOptionsForServer("server"),
+    );
+    f.managers.push(manager);
+    await manager.connectToServer("server", {
+      url: f.url,
+      timeout: 10000,
+      clientCapabilities: installedFormClientCapabilities({}, {
+        legacy: { binding: dispatch.handlers }, mrtr: true,
+      }, true),
+    });
+    await manager.listTools("server");
+    expect(manager.getInitializationInfo("server")?.protocolVersion).toBe(
+      "2026-07-28",
+    );
+    expect(manager.getInitializationInfo("server")?.clientCapabilities).toMatchObject({
+      elicitation: { form: {} },
+      extensions: { "openai/elicitation": { form: {} } },
+    });
+    expect(adapter.collectorOptionsForServer("unadmitted")).toBeUndefined();
+    await expect(manager.executeTool("server", "app", {})).resolves.toMatchObject({
+      content: [{ type: "text", text: "form:modern" }],
+    });
+    expect(f.collector).toHaveBeenCalledOnce();
+    const run = vi.fn(() => manager.executeTool("server", "search", {}));
+    const execution = {
+      serverKey: "server",
+      toolName: "search",
+      toolCallId: randomUUID(),
+      input: {},
+    };
+    await expect(adapter.execute(execution, run)).resolves.toMatchObject({
+      content: [{ type: "text", text: "part_joystick" }],
+    });
+    await adapter.execute(execution, run);
+    expect(run).toHaveBeenCalledOnce();
+    const refused = { ...execution, toolCallId: randomUUID() };
+    const fail = vi.fn(async () => {
+      throw new PluginInvocationError("CONTINUATION_PROTOCOL_DENIED");
+    });
+    for (let attempt = 0; attempt < 2; attempt++)
+      await expect(adapter.execute(refused, fail)).rejects.toMatchObject({
+        code: "CONTINUATION_PROTOCOL_DENIED",
+        outcomeUnknown: true,
+      });
+    expect(fail).toHaveBeenCalledOnce();
+  });
+});
+
+
+it("keeps a Codex host-tool call pending through an owned modern form", async () => {
+  served = await serveModern();
+  f.url = served.url;
+  const admission = await admitPluginWorkspace({
+    projectId: "project", bearer: "fixture",
+    descriptor: { version: 1, workspaceId: "workspace" },
+  });
+  const dispatch = createModelFormDispatch(["server"]);
+  const manager = new MCPClientManager({}, {
+    lazyConnect: true, extensionRequestHandlers: dispatch.handlers,
+  });
+  f.managers.push(manager);
+  const signal = new AbortController().signal;
+  const execute = createModelFormExecutor({
+    c: { req: { raw: { signal } } } as Context,
+    admission, bearer: "fixture",
+    identity: { actorId: "actor", projectId: "project", workspaceId: "workspace", subject: "subject" },
+    hostId: "host", hostRevision: pluginHostBindingDigest(host),
+    serverIds: ["server"], eligibleServerIds: ["server"], dispatch, inlineMrtr: true,
+  });
+  manager.setMrtrInputCollector("server", dispatch.inlineCollectorForServer("server")!, {
+    extensionClaims: ["openai/elicitation"],
+    selectFormSchema: (params) => ownedPluginFormSchema(params, "server"),
+  });
+  await manager.connectToServer("server", {
+    url: f.url, timeout: 10_000,
+    clientCapabilities: installedFormClientCapabilities({}, { mrtr: true }, true),
+  });
+  const projected = await projectSelectedMcpServersAsHostTools({
+    manager, selectedServerIds: ["server"], executor: execute,
+  });
+  const key = Object.keys(projected.tools).find((name) => name.endsWith("__app"))!;
+  const tool = projected.tools[key] as {
+    execute(input: unknown, options: { toolCallId: string; abortSignal: AbortSignal }): Promise<unknown>;
+  };
+  await expect(tool.execute({}, { toolCallId: "original-codex-call", abortSignal: signal })).resolves.toMatchObject({
+    content: [{ type: "text", text: "form:modern" }],
+  });
+  expect(f.answer).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+    serverId: "server", schema: formSchema,
+  }));
+});
+
+
+it.each(["legacy", "modern"] as const)("%s owned form revalidates with the renewed signed token after six minutes", async (era) => {
+  await delayedSignedForm(era, "same-owner");
+});
+it.each(["legacy", "modern"] as const)("%s refuses a revoked or foreign replacement after input without repeating the tool", async (era) => {
+  await delayedSignedForm(era, "foreign");
+});
+it.each(["legacy", "modern"] as const)("%s refuses revoked authorization after input without delivering the answer", async (era) => {
+  await delayedSignedForm(era, "revoked");
+});
+
+async function delayedSignedForm(era: "legacy" | "modern", outcome: "same-owner" | "foreign" | "revoked") {
+  const { privateKey, publicKey } = await generateKeyPair("RS256");
+  let now = Math.floor(Date.now() / 1000);
+  const mint = (subject: string) => new SignJWT({ sid: "original-session", org_id: "original-org" })
+    .setProtectedHeader({ alg: "RS256" }).setSubject(subject)
+    .setIssuedAt(now).setExpirationTime(now + 300).sign(privateKey);
+  const original = await mint("actor");
+  let current = original;
+  let revoked = false;
+  const getAuthorization = vi.fn(async () => {
+    if (revoked) throw new Error("Authorization revoked");
+    const { payload } = await jwtVerify(current, publicKey, { currentDate: new Date(now * 1000) });
+    if (payload.sub !== "actor") throw new Error("Foreign actor refused");
+    return current;
+  });
+  const readTokens: string[] = [];
+  f.verifyToken = async (bearer) => {
+    await jwtVerify(bearer, publicKey, { currentDate: new Date(now * 1000) });
+    readTokens.push(bearer);
+  };
+  served = era === "legacy" ? await serveLegacy(true) : await serveModern();
+  f.url = served.url;
+  const admission = await admitPluginWorkspace({ projectId: "project", bearer: original,
+    getAuthorization, descriptor: { version: 1, workspaceId: "workspace" } });
+  const dispatch = createModelFormDispatch(["server"]);
+  const manager = new MCPClientManager({}, { lazyConnect: true, extensionRequestHandlers: dispatch.handlers });
+  f.managers.push(manager);
+  const signal = new AbortController().signal;
+  const execute = createModelFormExecutor({
+    c: { req: { raw: { signal } } } as Context, admission, bearer: original,
+    identity: { actorId: "actor", projectId: "project", workspaceId: "workspace", subject: "subject" },
+    hostId: "host", hostRevision: pluginHostBindingDigest(host),
+    serverIds: ["server"], eligibleServerIds: ["server"], dispatch, inlineMrtr: true,
+  });
+  manager.setMrtrInputCollector("server", dispatch.inlineCollectorForServer("server")!, {
+    extensionClaims: ["openai/elicitation"],
+    selectFormSchema: (params) => ownedPluginFormSchema(params, "server"),
+  });
+  await manager.connectToServer("server", { url: f.url, timeout: 10_000,
+    clientCapabilities: installedFormClientCapabilities({}, { legacy: { binding: dispatch.handlers }, mrtr: true }, true) });
+  f.answer.mockImplementationOnce(async () => {
+    now += 360;
+    await expect(jwtVerify(original, publicKey, { currentDate: new Date(now * 1000) })).rejects.toThrow();
+    current = await mint(outcome === "foreign" ? "foreign-actor" : "actor");
+    revoked = outcome === "revoked";
+    return { action: "accept", content: { answer: "renewed" } };
+  });
+  const run = vi.fn(() => manager.executeTool("server", "app", {}));
+  const pending = execute({ serverKey: "server", toolName: "app", toolCallId: "one-original-call", input: {}, signal }, run);
+  if (outcome === "same-owner") {
+    await expect(pending).resolves.toMatchObject({ content: [{ type: "text", text: "form:renewed" }] });
+    expect(readTokens).toContain(current);
+    expect(f.consumed).toHaveBeenCalledOnce();
+  } else {
+    const result = await pending.catch((error: unknown) => error);
+    expect(JSON.stringify(result)).not.toContain("form:renewed");
+    expect(f.consumed).not.toHaveBeenCalled();
+  }
+  expect(run).toHaveBeenCalledOnce();
+  expect(f.answer).toHaveBeenCalledOnce();
+}

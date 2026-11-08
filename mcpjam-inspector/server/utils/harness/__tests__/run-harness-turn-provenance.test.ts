@@ -1,0 +1,315 @@
+/**
+ * A harness turn signs what it streams (MJ-009), as the emulated engine's
+ * turns do, so its replies verify when the conversation continues on
+ * another engine. The module mocks are the ones
+ * `run-harness-turn-empty-output.test.ts` drives a turn with.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ModelMessage } from "@ai-sdk/provider-utils";
+
+const harnessState = vi.hoisted(() => ({
+  streamParts: [] as Array<Record<string, unknown> & { type?: string }>,
+  finalText: "",
+  session: {
+    sessionId: "session-1",
+    stop: vi.fn(async () => ({})),
+    destroy: vi.fn(async () => {}),
+  },
+}));
+
+vi.mock("@ai-sdk/harness/agent", () => ({
+  HarnessAgent: class {
+    createSession = vi.fn(async () => harnessState.session);
+    stream = vi.fn(async () => ({
+      fullStream: (async function* () {
+        for (const part of harnessState.streamParts) {
+          yield part;
+        }
+      })(),
+      text: Promise.resolve(harnessState.finalText),
+    }));
+  },
+  // WS3: no trailing tool-approval-response parts in these prompts.
+  collectHarnessAgentToolApprovalContinuations: vi.fn(() => []),
+}));
+
+vi.mock("../registry.js", () => ({
+  // Broker-only credential delivery (COMP-23): the turn builds dummy auth
+  // pointed at the broker proxy; there is no per-adapter resolveAuth anymore.
+  buildBrokerDummyAuth: vi.fn(() => ({
+    anthropic: {
+      apiKey: "",
+      authToken: "mcpjam-broker-dummy",
+      baseUrl: "https://broker.example",
+    },
+  })),
+  getHarnessAdapter: vi.fn(() => ({
+    id: "claude-code",
+    displayName: "Claude Code",
+    defaultPermissionMode: "allow-all",
+    supportsSkills: false,
+    mcpDelivery: "mcpjam",
+    supportsModel: vi.fn(() => true),
+    createHarness: vi.fn(() => ({ harnessId: "claude-code" })),
+    parseToolName: vi.fn((toolName: string) => ({ toolName })),
+    listBuiltinTools: () => [{ key: "Bash" }],
+  })),
+}));
+
+vi.mock("../resolve-sandbox.js", () => ({
+  resolveHarnessSandbox: vi.fn(async () => ({
+    computerId: "computer-1",
+    sandboxId: "sandbox-1",
+  })),
+}));
+
+vi.mock("../e2b-sandbox-provider.js", () => ({
+  createE2BHarnessSandboxProvider: vi.fn(() => ({
+    sandboxId: "sandbox-1",
+  })),
+}));
+
+vi.mock("../runtime-skills.js", () => ({
+  frontmatterSafeSkills: vi.fn((skills) => skills),
+  fetchRuntimeSkills: vi.fn(async () => ({ ok: true, skills: [] })),
+  skillsFingerprint: vi.fn(() => "empty-skills"),
+}));
+
+vi.mock("../reconcile-skill-dirs.js", () => ({
+  reconcileSkillDirs: vi.fn(async () => {}),
+}));
+
+vi.mock("../harness-session-state.js", async (importOriginal) => {
+  const actual =
+    await importOriginal<typeof import("../harness-session-state.js")>();
+  return {
+    ...actual,
+    claimHarnessSessionState: vi.fn(async () => ({
+      ok: true,
+      leaseId: "lease-1",
+      stateVersion: 1,
+      state: null,
+      fingerprintChanged: false,
+    })),
+    commitHarnessSessionState: vi.fn(async () => true),
+    heartbeatHarnessSessionState: vi.fn(async () => "ok"),
+    releaseHarnessSessionState: vi.fn(async () => {}),
+  };
+});
+
+vi.mock("../harness-model-broker.js", () => ({
+  reserveHarnessBox: vi.fn(async () => ({ ok: true })),
+  releaseHarnessBoxReservation: vi.fn(async () => ({ ok: true })),
+  revokeHarnessModelBroker: vi.fn(async () => {}),
+  startHarnessModelBroker: vi.fn(async () => ({
+    ok: true,
+    proxyBaseUrl: "https://broker.example",
+  })),
+}));
+
+vi.mock("../mcp-config.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../mcp-config.js")>();
+  return {
+    ...actual,
+    buildHarnessMcpJson: vi.fn(() => ({ mcpServers: {} })),
+    harnessServerInputFromConfig: vi.fn(),
+    harnessServerKeyToName: vi.fn((key: string) => key),
+  };
+});
+
+import { readUIMessageStream, type UIMessage, type UIMessageChunk } from "ai";
+import { runHarnessTurn } from "../run-harness-turn";
+import {
+  historyProvenanceContextFor,
+  verifyAssistantText,
+  verifyClientHistory,
+} from "../../history-provenance";
+
+function baseOptions() {
+  const messages: ModelMessage[] = [
+    {
+      role: "user",
+      content: [{ type: "text", text: "create a file called notes.txt" }],
+    } as unknown as ModelMessage,
+  ];
+  return {
+    messages,
+    modelId: "anthropic/claude-sonnet-4-6",
+    provider: "anthropic",
+    systemPrompt: "You are Claude Code.",
+    authHeader: "Bearer test",
+    projectId: "project-1",
+    mcpClientManager: { getServerConfig: vi.fn() },
+    selectedServers: [],
+    requireToolApproval: false,
+    sourceType: "direct",
+    harness: "claude-code",
+  };
+}
+
+async function streamedChunks(response: Response): Promise<any[]> {
+  const text = await response.text();
+  return text
+    .split("\n")
+    .filter((line) => line.startsWith("data: ") && line !== "data: [DONE]")
+    .map((line) => JSON.parse(line.slice("data: ".length)));
+}
+
+async function browserMessageFrom(chunks: any[]): Promise<UIMessage> {
+  const stream = new ReadableStream<UIMessageChunk>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(chunk);
+      controller.close();
+    },
+  });
+  let last: UIMessage | undefined;
+  for await (const message of readUIMessageStream({ stream })) last = message;
+  if (!last) throw new Error("no message");
+  return JSON.parse(JSON.stringify(last));
+}
+
+describe("runHarnessTurn history provenance (MJ-009)", () => {
+  beforeEach(() => {
+    vi.stubEnv("MCPJAM_HARNESS_BROKER_DELIVERY", "true");
+    harnessState.streamParts = [
+      { type: "text-delta", delta: "Created " },
+      { type: "text-delta", delta: "notes.txt." },
+      { type: "finish", finishReason: "stop" },
+    ];
+    harnessState.finalText = "Created notes.txt.";
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it.each([
+    ["bash", "native"],
+    ["mcp__docs__Bash", "mcp"],
+    ["unrecognized", "unknown"],
+  ])("attributes a result-only %s event after approval", async (toolName, origin) => {
+    harnessState.streamParts = [
+      { type: "tool-result", toolCallId: "paused-call", toolName, output: "done" },
+      { type: "text-delta", delta: "Done." },
+      { type: "finish", finishReason: "stop" },
+    ];
+    harnessState.finalText = "Done.";
+    const result = await runHarnessTurn(baseOptions() as never, "none");
+    expect(result.turnTrace?.spans).toEqual(expect.arrayContaining([
+      expect.objectContaining({ category: "tool", toolCallId: "paused-call", toolOrigin: origin }),
+    ]));
+  });
+
+  it("retains the saved MCP server on an unqualified result-only resume", async () => {
+    const onToolResult = vi.fn();
+    harnessState.streamParts = [
+      { type: "tool-result", toolCallId: "paused-call", toolName: "read_wiki_structure", output: "done" },
+      { type: "finish", finishReason: "stop" },
+    ];
+    const result = await runHarnessTurn({
+      ...baseOptions(),
+      onToolResult,
+      messages: [
+        { role: "user", content: "Read the wiki" },
+        { role: "assistant", content: [{
+          type: "tool-call", toolCallId: "paused-call", toolName: "read_wiki_structure", input: {},
+          providerOptions: { mcpjam: { serverId: "deepwiki" } },
+        }] },
+      ],
+    } as never, "none");
+    expect(onToolResult).toHaveBeenCalledWith(expect.objectContaining({ serverId: "deepwiki" }));
+    expect(result.turnTrace?.spans).toEqual(expect.arrayContaining([
+      expect.objectContaining({ toolCallId: "paused-call", serverId: "deepwiki", toolOrigin: "mcp" }),
+    ]));
+    expect(result.messageHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "tool", content: expect.arrayContaining([
+        expect.objectContaining({ toolCallId: "paused-call", providerOptions: { mcpjam: { serverId: "deepwiki" } } }),
+      ]) }),
+    ]));
+  });
+
+  it.each([
+    {
+      name: "MCP failure",
+      output: { content: [{ type: "text", text: "server refused" }], isError: true },
+      failed: true,
+    },
+    {
+      name: "MCP success",
+      output: { content: [{ type: "text", text: "done" }], isError: false },
+      failed: false,
+    },
+    {
+      name: "generic JSON with an isError property",
+      output: { isError: true, meaning: "application data" },
+      failed: false,
+    },
+    {
+      name: "generic JSON with non-MCP content",
+      output: { content: ["application data"], isError: true },
+      failed: false,
+    },
+  ])("classifies a flagless $name in callbacks, spans, and history", async ({ output, failed }) => {
+    const onToolResult = vi.fn();
+    harnessState.streamParts = [
+      { type: "tool-call", toolCallId: "mcp-result", toolName: "read_settings", input: {} },
+      { type: "tool-result", toolCallId: "mcp-result", toolName: "read_settings", output },
+      { type: "finish", finishReason: "stop" },
+    ];
+    const result = await runHarnessTurn({ ...baseOptions(), onToolResult } as never, "none");
+    expect(onToolResult).toHaveBeenCalledWith(expect.objectContaining({
+      toolCallId: "mcp-result",
+      isError: failed,
+    }));
+    expect(result.turnTrace?.spans).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        toolCallId: "mcp-result",
+        category: "tool",
+        status: failed ? "error" : "ok",
+      }),
+    ]));
+    expect(result.messageHistory).toEqual(expect.arrayContaining([
+      expect.objectContaining({ role: "tool", content: expect.arrayContaining([
+        expect.objectContaining({
+          toolCallId: "mcp-result",
+          output: expect.objectContaining({ type: failed ? "error-text" : "json" }),
+        }),
+      ]) }),
+    ]));
+  });
+
+  it("signs the text it streams in hosted mode", async () => {
+    vi.stubEnv("VITE_MCPJAM_HOSTED_MODE", "true");
+    vi.stubEnv("INSPECTOR_SERVICE_TOKEN", "service-token-with-enough-length");
+
+    const result = await runHarnessTurn(
+      { ...baseOptions(), chatSessionId: "chat-1" } as any,
+      "ui",
+    );
+    const chunks = await streamedChunks(result.response!);
+
+    const ctx = historyProvenanceContextFor("project-1", "chat-1")!;
+    const end = chunks.find((chunk) => chunk.type === "text-end");
+    expect(
+      verifyAssistantText(
+        ctx,
+        "Created notes.txt.",
+        end.providerMetadata.mcpjam.textSig,
+      ),
+    ).toBe(true);
+    const message = await browserMessageFrom(chunks);
+    expect(verifyClientHistory([message], ctx).unverifiedTextParts).toBe(0);
+  });
+
+  it("signs nothing in local mode", async () => {
+    const result = await runHarnessTurn(baseOptions() as any, "ui");
+    const chunks = await streamedChunks(result.response!);
+    const text = chunks.filter((chunk) =>
+      String(chunk.type).startsWith("text"),
+    );
+    expect(text.length).toBeGreaterThan(0);
+    for (const chunk of text) {
+      expect(chunk.providerMetadata?.mcpjam?.textSig).toBeUndefined();
+    }
+  });
+});

@@ -1,0 +1,688 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import type {
+  EvalIteration,
+  EvalSuiteRun,
+  EvalSuiteRunListItem,
+} from "@/components/evals/types";
+import { CaseRunTimeline } from "../case-workspace/case-run-timeline";
+import { beginCaseLaunch, useCaseLaunches } from "../case-workspace/pending-case-launches";
+beforeEach(() => useCaseLaunches.setState({ launches: [] }));
+const iteration = (
+  id: string,
+  model: string,
+  result: string,
+  elapsed: number,
+) =>
+  ({
+    _id: id,
+    createdAt: 1000,
+    startedAt: 1000,
+    updatedAt: 1000 + elapsed,
+    result,
+    status: result === "pending" ? "running" : "completed",
+    testCaseSnapshot: { model },
+    actualToolCalls: [],
+  }) as unknown as EvalIteration;
+const chooseFilter = async (filter: "Client" | "Model", option: string) => {
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("combobox", { name: filter, exact: true }));
+  await user.click(screen.getByRole("option", { name: option, exact: true }));
+};
+describe("CaseRunTimeline", () => {
+  it("sorts newest first independently of status, with stable time ties", () => {
+    const trials = [
+      { ...iteration("old", "model", "pending", 0), createdAt: 1, iterationNumber: 1 },
+      { ...iteration("new-b", "model", "passed", 1000), suiteRunId: "new", createdAt: 3, iterationNumber: 2 },
+      { ...iteration("middle", "model", "failed", 1000), createdAt: 2, iterationNumber: 1 },
+      { ...iteration("new-a", "model", "passed", 1000), suiteRunId: "new", createdAt: 3, iterationNumber: 1 },
+    ];
+    const props = { caseTitle: "Case", selectedIterationId: null, onSelect: vi.fn() };
+    const { rerender } = render(<CaseRunTimeline {...props} iterations={trials}>Evidence</CaseRunTimeline>);
+    const labels = () => screen.getAllByTestId("case-run-row").map((row) => row.textContent);
+    expect(labels().map((text) => text?.match(/Passed|Failed|Running/)?.[0])).toEqual(["Passed", "Passed", "Failed", "Running"]);
+    expect(within(screen.getAllByTestId("case-run-row")[0]).getByText("#1")).toBeVisible();
+    const times = screen.getAllByTestId("case-run-time").map((cell) => cell.querySelector("time")?.dateTime);
+    rerender(<CaseRunTimeline {...props} iterations={trials.map((row) => ({ ...row, status: "pending" }))}>Evidence</CaseRunTimeline>);
+    expect(screen.getAllByTestId("case-run-time").map((cell) => cell.querySelector("time")?.dateTime)).toEqual(times);
+  });
+
+  it("shows temporary pending rows without metrics or details, then actual backend status", async () => {
+    const scope = { projectId: "p", suiteId: "s", caseId: "c" };
+    beginCaseLaunch(scope, [{ client: "Claude", hostId: "claude", model: "model" }], 2);
+    const props = { caseTitle: "Case", scope, selectedIterationId: null, onSelect: vi.fn(), hostNamesById: new Map([["claude", "Claude"]]) };
+    const { rerender } = render(<CaseRunTimeline {...props} iterations={[]}>Evidence</CaseRunTimeline>);
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    screen.getAllByTestId("case-run-row").forEach((row) => {
+      expect(row).toBeDisabled();
+      expect(row).toHaveTextContent("Pending");
+      expect(within(row).getByTestId("case-run-number")).toHaveTextContent("—");
+    });
+    expect(screen.getByText("0/0")).toBeVisible();
+    await chooseFilter("Client", "Claude");
+    await chooseFilter("Model", "model");
+    const id = useCaseLaunches.getState().launches[0].id;
+    const runs = [{ _id: "run", runGroupId: id, namedHostId: "claude", configSnapshot: {}, effectiveModelId: "model" }] as EvalSuiteRunListItem[];
+    const trial = { ...iteration("real", "model", "pending", 0), testCaseId: scope.caseId, suiteRunId: "run", iterationNumber: 1, status: "pending" as const };
+    rerender(<CaseRunTimeline {...props} iterations={[trial]} suiteRuns={runs}>Evidence</CaseRunTimeline>);
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getAllByText("Pending")).toHaveLength(2);
+    rerender(<CaseRunTimeline {...props} iterations={[{ ...trial, status: "running" }]} suiteRuns={runs}>Evidence</CaseRunTimeline>);
+    expect(screen.getByText("Running")).toBeVisible();
+    expect(screen.getByText("Pending")).toBeVisible();
+    act(() => useCaseLaunches.setState({ launches: [] }));
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(1);
+    expect(screen.getByTestId("case-run-row")).toBeEnabled();
+  });
+  it("labels recording separately from a run and stops it when closed", async () => {
+    const onStopRecording = vi.fn();
+    render(
+      <CaseRunTimeline
+        caseTitle="Case"
+        iterations={[]}
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+        live
+        recording
+        onStopRecording={onStopRecording}
+      >
+        Live app
+      </CaseRunTimeline>,
+    );
+    expect(
+      await screen.findByRole("dialog", { name: "Record interactions" }),
+    ).toBeVisible();
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent(
+      "Recording",
+    );
+    expect(screen.getByText("Live app")).toBeVisible();
+    await userEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onStopRecording).toHaveBeenCalledTimes(1);
+  });
+
+  it("switches client and model targets and updates their averages", async () => {
+    const trials = [
+      {
+        ...iteration("a", "snapshot-model", "passed", 1000),
+        suiteRunId: "cursor",
+      },
+      {
+        ...iteration("b", "snapshot-model", "failed", 3000),
+        suiteRunId: "chatgpt",
+      },
+    ];
+    render(
+      <CaseRunTimeline
+        caseTitle="Case"
+        iterations={trials}
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+        hostNamesById={
+          new Map([
+            ["cursor", "Cursor"],
+            ["chatgpt", "ChatGPT"],
+          ])
+        }
+        suiteRuns={
+          [
+            {
+              _id: "cursor",
+              namedHostId: "cursor",
+              effectiveModelId: "actual-a",
+            },
+            {
+              _id: "chatgpt",
+              namedHostId: "chatgpt",
+              effectiveModelId: "actual-b",
+            },
+          ] as EvalSuiteRun[]
+        }
+      >
+        Evidence
+      </CaseRunTimeline>,
+    );
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByText("1/2")).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Client", exact: true })).toHaveTextContent("Client");
+    expect(screen.getByRole("combobox", { name: "Model", exact: true })).toHaveTextContent("Model");
+    expect(screen.getByTestId("case-run-averages")).toHaveClass(
+      "bg-background",
+      "text-foreground",
+    );
+    expect(
+      screen.getByTestId("case-run-table"),
+    ).toHaveClass("bg-background", "text-foreground");
+    expect(screen.getByTestId("case-run-table")).toHaveClass("overflow-x-auto");
+    expect(screen.getByTestId("case-run-table").firstElementChild).toHaveClass("w-full");
+    expect(screen.getByText("Iteration").parentElement).toHaveClass("bg-muted");
+    await chooseFilter("Client", "ChatGPT");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(1);
+    expect(screen.getByText("0/1")).toBeVisible();
+    await chooseFilter("Client", "All clients");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByText("1/2")).toBeVisible();
+  });
+  it("combines client and model filters and clears each independently", async () => {
+    const trials = ["Claude", "ChatGPT"].flatMap((client) => ["model-a", "model-b"].map((model) => ({
+      ...iteration(`${client}-${model}`, model, "passed", 1000), suiteRunId: client,
+    })));
+    render(<CaseRunTimeline caseTitle="Case" iterations={trials} selectedIterationId={null} onSelect={vi.fn()}
+      hostNamesById={new Map([["Claude", "Claude"], ["ChatGPT", "ChatGPT"]])}
+      suiteRuns={[{ _id: "Claude", namedHostId: "Claude" }, { _id: "ChatGPT", namedHostId: "ChatGPT" }] as EvalSuiteRun[]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(4);
+    await chooseFilter("Client", "Claude");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    await chooseFilter("Model", "model-b");
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("Claude");
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("model-b");
+    expect(screen.getByText("1/1")).toBeVisible();
+    await chooseFilter("Client", "All clients");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByRole("combobox", { name: "Model", exact: true })).toHaveTextContent("model-b");
+    await chooseFilter("Model", "All models");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(4);
+    await chooseFilter("Client", "Claude");
+    await chooseFilter("Model", "model-a");
+    await chooseFilter("Model", "All models");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByRole("combobox", { name: "Client", exact: true })).toHaveTextContent("Claude");
+  });
+
+  it("filters pending runs by both client and model and shows an empty match", async () => {
+    render(<CaseRunTimeline caseTitle="Case" selectedIterationId={null} onSelect={vi.fn()}
+      defaultHostLabel="Claude" iterations={[iteration("old", "model-a", "passed", 1000)]}
+      pendingRun={{ client: "ChatGPT", model: "model-b" }}>
+      Evidence
+    </CaseRunTimeline>);
+    await chooseFilter("Client", "ChatGPT");
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("Running");
+    await chooseFilter("Model", "model-a");
+    expect(screen.queryByTestId("case-run-row")).toBeNull();
+    expect(screen.getByText("0/0")).toBeVisible();
+    expect(screen.getByText("No runs match these filters.")).toBeVisible();
+    await chooseFilter("Model", "model-b");
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("Running");
+    expect(screen.getByText("0/1")).toBeVisible();
+  });
+
+  it("shows every launch by default when older runs are loaded", () => {
+    render(
+      <CaseRunTimeline
+        caseTitle="Case"
+        iterations={[
+          { ...iteration("old", "model", "passed", 1000), suiteRunId: "old" },
+          { ...iteration("new", "model", "failed", 3000), suiteRunId: "new" },
+        ]}
+        suiteRuns={
+          [
+            {
+              _id: "old",
+              runNumber: 1,
+              runGroupId: "old-launch",
+              effectiveModelId: "model",
+            },
+            {
+              _id: "new",
+              runNumber: 2,
+              runGroupId: "new-launch",
+              effectiveModelId: "model",
+            },
+          ] as EvalSuiteRun[]
+        }
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+      >
+        Evidence
+      </CaseRunTimeline>,
+    );
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByText("1/2")).toBeVisible();
+  });
+  it("keeps new multi-client results visible without selecting a filter", () => {
+    const old = { ...iteration("old", "opus", "passed", 1000), suiteRunId: "old" };
+    const props = { caseTitle: "Case", selectedIterationId: null, onSelect: vi.fn() };
+    const { rerender } = render(<CaseRunTimeline {...props} iterations={[old]}>
+      Evidence
+    </CaseRunTimeline>);
+    const clients = ["Cursor", "Claude", "ChatGPT"];
+    const added = clients.map((client) => ({
+      ...iteration(client, "model", "passed", 2000), suiteRunId: client,
+    }));
+    rerender(<CaseRunTimeline {...props} iterations={[old, ...added]}
+      hostNamesById={new Map(clients.map((client) => [client, client]))}
+      suiteRuns={clients.map((client) => ({ _id: client, namedHostId: client, runGroupId: "new-launch" })) as EvalSuiteRun[]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(4);
+    expect(screen.getByText("4/4")).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Client", exact: true })).toHaveTextContent("Client");
+    expect(screen.getByRole("combobox", { name: "Model", exact: true })).toHaveTextContent("Model");
+    for (const client of clients)
+      expect(screen.getAllByTestId("case-run-row").some((row) => row.textContent?.includes(client))).toBe(true);
+  });
+
+  it("shows a shared run number, separate iterations, and recorded dates for a multi-client launch", async () => {
+    const clients = ["Cursor", "Claude", "ChatGPT"];
+    const createdAt = Date.UTC(2026, 9, 8, 21, 21);
+    const trials = clients.map((client, index) => ({
+      ...iteration(client, "model", "passed", 1000),
+      suiteRunId: client, iterationNumber: 1, createdAt: createdAt + index * 1000,
+    }));
+    render(<CaseRunTimeline caseTitle="Case" iterations={trials} selectedIterationId={null} onSelect={vi.fn()}
+      hostNamesById={new Map(clients.map((client) => [client, client]))}
+      suiteRuns={clients.map((client, index) => ({
+        _id: client, namedHostId: client, runGroupId: "launch", runNumber: 7 + index,
+      })) as EvalSuiteRun[]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(screen.getByText("Run", { exact: true })).toBeVisible();
+    expect(screen.getByText("Date", { exact: true })).toBeVisible();
+    expect(screen.getByText("Time", { exact: true })).toBeVisible();
+    expect(screen.getByText("Date", { exact: true }).nextElementSibling).toBe(
+      screen.getByText("Time", { exact: true }),
+    );
+    for (const [index, row] of screen.getAllByTestId("case-run-row").entries()) {
+      expect(within(row).getByTestId("case-run-number")).toHaveTextContent(/^#7$/);
+      expect(within(row).getByText("#1", { exact: true })).toBeVisible();
+      const date = within(row).getByTestId("case-run-date");
+      const time = within(row).getByTestId("case-run-time");
+      expect(date.nextElementSibling).toBe(time);
+      expect(row.lastElementChild).toBe(time);
+      const timestamp = new Date([...trials].sort((a, b) => b.createdAt - a.createdAt)[index].createdAt);
+      expect(date).toHaveAttribute("title", timestamp.toLocaleString());
+      expect(date).toHaveTextContent(timestamp.toLocaleDateString());
+      expect(time).toHaveTextContent(timestamp.toLocaleTimeString());
+      expect(date).not.toHaveTextContent(timestamp.toLocaleTimeString());
+      expect(time).not.toHaveTextContent(timestamp.toLocaleDateString());
+      expect(date.querySelector("time")).toHaveAttribute("datetime", timestamp.toISOString());
+      expect(time.querySelector("time")).toHaveAttribute("datetime", timestamp.toISOString());
+    }
+    await chooseFilter("Client", "ChatGPT");
+    expect(screen.getByTestId("case-run-number")).toHaveTextContent(/^#7$/);
+  });
+
+  it("names the default client and merges it with the matching environment filter", async () => {
+    const trials = [
+      { ...iteration("default", "haiku", "passed", 1000), suiteRunId: "default" },
+      { ...iteration("environment", "haiku", "failed", 1000), suiteRunId: "environment" },
+    ];
+    render(<CaseRunTimeline caseTitle="Case" iterations={trials} selectedIterationId={null} onSelect={vi.fn()}
+      defaultHostLabel="Claude" hostNamesById={new Map([["claude-client", "Claude"]])}
+      suiteRuns={[
+        { _id: "default", effectiveModelId: "haiku" },
+        { _id: "environment", effectiveModelId: "haiku", namedHostId: "claude-client" },
+      ] as EvalSuiteRun[]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(screen.queryByText(/Suite default/)).toBeNull();
+    await userEvent.setup().click(screen.getByRole("combobox", { name: "Client", exact: true }));
+    expect(screen.getAllByRole("option", { name: "Claude", exact: true })).toHaveLength(1);
+    await userEvent.setup().click(screen.getByRole("option", { name: "Claude", exact: true }));
+    await chooseFilter("Model", "haiku");
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.getByText("1/2")).toBeVisible();
+  });
+
+  it("uses the known default for old rows and pending runs without duplicate filters", async () => {
+    render(<CaseRunTimeline caseTitle="Case" selectedIterationId={null} onSelect={vi.fn()}
+      defaultHostLabel="Claude" pendingRun={{ model: "haiku" }}
+      iterations={[iteration("old", "haiku", "passed", 1000)]}>
+      Evidence
+    </CaseRunTimeline>);
+    await userEvent.setup().click(screen.getByRole("combobox", { name: "Client", exact: true }));
+    expect(screen.getAllByRole("option", { name: "Claude", exact: true })).toHaveLength(1);
+    expect(screen.getAllByTestId("case-run-row")).toHaveLength(2);
+    expect(screen.queryByText(/Suite default/)).toBeNull();
+  });
+
+  it("replaces the backend's placeholder client name with the default client", async () => {
+    render(<CaseRunTimeline caseTitle="Case" selectedIterationId={null} onSelect={vi.fn()}
+      defaultHostLabel="Claude"
+      iterations={[{ ...iteration("default", "haiku", "passed", 1000), suiteRunId: "default" }]}
+      suiteRuns={[{ _id: "default", effectiveModelId: "haiku",
+        client: { source: "suite_default", name: "Client" } }] as EvalSuiteRun[]}>
+      Evidence
+    </CaseRunTimeline>);
+    await userEvent.setup().click(screen.getByRole("combobox", { name: "Client", exact: true }));
+    expect(screen.getByRole("option", { name: "Claude", exact: true })).toBeVisible();
+    expect(screen.queryByRole("option", { name: "Client", exact: true })).toBeNull();
+  });
+
+  it("keeps a recorded client when the current default changes", async () => {
+    const trial = { ...iteration("old", "haiku", "passed", 1000),
+      testCaseSnapshot: { model: "haiku", hostConfigOverride: { hostStyle: "claude" } } } as unknown as EvalIteration;
+    render(<CaseRunTimeline caseTitle="Case" selectedIterationId={null} onSelect={vi.fn()}
+      defaultHostLabel="ChatGPT" iterations={[trial]}>
+      Evidence
+    </CaseRunTimeline>);
+    await userEvent.setup().click(screen.getByRole("combobox", { name: "Client", exact: true }));
+    expect(screen.getAllByRole("option", { name: "Claude", exact: true })).toHaveLength(1);
+    expect(screen.queryByRole("option", { name: "ChatGPT", exact: true })).toBeNull();
+  });
+
+  it("shows dashes for metrics while running and keeps measured zeroes after completion", () => {
+    const props = { caseTitle: "Case", selectedIterationId: null, onSelect: vi.fn() };
+    const running = { ...iteration("live", "model", "pending", 0), tokensUsed: 0 };
+    const { rerender } = render(<CaseRunTimeline {...props} iterations={[running]}>
+      Evidence
+    </CaseRunTimeline>);
+    const metrics = () => [...screen.getByTestId("case-run-row").children]
+      .slice(4, 7).map((cell) => cell.textContent);
+    expect(metrics()).toEqual(["—", "—", "—"]);
+    rerender(<CaseRunTimeline {...props} iterations={[{
+      ...running, tokensUsed: 10, actualToolCalls: [{ toolName: "search" }],
+    } as EvalIteration]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(metrics()).toEqual(["—", "—", "—"]);
+    rerender(<CaseRunTimeline {...props} iterations={[{
+      ...iteration("live", "model", "passed", 1000), tokensUsed: 0,
+    }]}>
+      Evidence
+    </CaseRunTimeline>);
+    expect(metrics()).toEqual(["1.0s", "0", "0"]);
+  });
+
+  it("shows the recorded client and model pair", () => {
+    const trial = {
+      ...iteration("trial-id", "old-model", "passed", 1000),
+      suiteRunId: "run-123456789",
+    };
+    render(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        suiteName="Diagram suite"
+        hostNamesById={new Map([["cursor", "Cursor"]])}
+        iterations={[trial]}
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+        suiteRuns={[
+          {
+            _id: "run-123456789",
+            effectiveModelId: "anthropic/claude-test",
+            namedHostId: "cursor",
+            runNumber: 7,
+          } as EvalSuiteRun,
+        ]}
+      >
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(screen.getByRole("combobox", { name: "Client", exact: true })).toBeVisible();
+    expect(screen.getByRole("combobox", { name: "Model", exact: true })).toBeVisible();
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("Cursor");
+    expect(screen.getByTestId("case-run-row")).toHaveTextContent("claude-test");
+  });
+  it("switches averages and selects iterations", async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    const a = iteration("a", "model-a", "passed", 1000),
+      b = iteration("b", "model-b", "failed", 3000);
+    render(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[a, b]}
+        selectedIterationId="a"
+        onSelect={onSelect}
+      >
+        <p>Run evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(screen.getByText("1/2")).toBeInTheDocument();
+    await chooseFilter("Model", "model-a");
+    expect(screen.getByText("1/1")).toBeInTheDocument();
+    expect(screen.getAllByText("1.0s")).toHaveLength(3);
+    await user.click(screen.getByTestId("case-run-row"));
+    expect(onSelect).toHaveBeenCalledWith(a);
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await chooseFilter("Model", "model-b");
+    expect(screen.getByText("0/1")).toBeInTheDocument();
+    await user.click(screen.getByTestId("case-run-row"));
+    expect(onSelect).toHaveBeenCalledWith(b);
+    expect(
+      screen.getByRole("dialog", { name: "#1 Create a flowchart" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Run evidence")).toBeInTheDocument();
+  });
+  it("keeps run numbering chronological when filtering and handles a new live run", async () => {
+    const user = userEvent.setup();
+    const older = {
+      ...iteration("older", "model-a", "passed", 1000),
+      createdAt: 1000,
+    };
+    const newer = {
+      ...iteration("newer", "model-b", "passed", 1000),
+      createdAt: 2000,
+    };
+    const { rerender } = render(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[newer, older]}
+        selectedIterationId="newer"
+        onSelect={vi.fn()}
+        live
+      >
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(
+      screen.getByRole("heading", { name: "#2 Create a flowchart" }),
+    ).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Close" }));
+    await chooseFilter("Model", "model-b");
+    await user.click(screen.getByTestId("case-run-row"));
+    expect(
+      screen.getByRole("heading", { name: "#2 Create a flowchart" }),
+    ).toBeInTheDocument();
+    rerender(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[newer, older]}
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+        live
+      >
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(
+      screen.getByRole("heading", { name: "#3 Create a flowchart" }),
+    ).toBeInTheDocument();
+  });
+
+  it("uses the persisted run number even when only part of history is loaded", () => {
+    const trial = {
+      ...iteration("trial", "model-a", "passed", 1000),
+      suiteRunId: "suite-run",
+      iterationNumber: 2,
+    };
+    render(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[trial]}
+        suiteRuns={[
+          {
+            _id: "suite-run",
+            runNumber: 42,
+            configSnapshot: {},
+          } as EvalSuiteRunListItem,
+        ]}
+        selectedIterationId="trial"
+        onSelect={vi.fn()}
+        live
+      >
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(
+      screen.getByRole("heading", { name: "#42 Create a flowchart" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows a yellow Running badge in the header and updates it on completion", () => {
+    const props = {
+      caseTitle: "Create a flowchart",
+      iterations: [],
+      selectedIterationId: null,
+      onSelect: vi.fn(),
+      live: true,
+    };
+    const { rerender } = render(
+      <CaseRunTimeline {...props} liveVerdict="Running">
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    const badge = screen.getByTestId("case-run-status");
+    expect(badge.previousElementSibling?.tagName).toBe("H2");
+    expect(badge).toHaveTextContent("Running");
+    expect(badge).toHaveClass("bg-warning/30");
+    expect(badge.parentElement).toContainElement(
+      screen.getByRole("heading", { name: "#1 Create a flowchart" }),
+    );
+    rerender(
+      <CaseRunTimeline {...props} liveVerdict="Passed">
+        <p>Evidence</p>
+      </CaseRunTimeline>,
+    );
+    expect(screen.getByTestId("case-run-status")).toHaveTextContent("Passed");
+    expect(screen.getByTestId("case-run-status")).not.toHaveClass(
+      "bg-warning/30",
+    );
+  });
+
+  it("collapses evidence and handles empty history", async () => {
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[iteration("a", "model-a", "pending", 0)]}
+        selectedIterationId="a"
+        onSelect={vi.fn()}
+      >
+        <p>Run evidence</p>
+      </CaseRunTimeline>,
+    );
+    await user.click(screen.getByTestId("case-run-row"));
+    expect(
+      screen.getByRole("dialog", { name: "#1 Create a flowchart" }),
+    ).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    rerender(
+      <CaseRunTimeline
+        caseTitle="Create a flowchart"
+        iterations={[]}
+        selectedIterationId={null}
+        onSelect={vi.fn()}
+      >
+        <p>Preview</p>
+      </CaseRunTimeline>,
+    );
+    expect(
+      screen.getByText("Run this case to see its results here."),
+    ).toBeInTheDocument();
+  });
+});
+
+it("names a single-case run from its frozen case title", async () => {
+  const trial = { ...iteration("t", "m", "passed", 100), suiteRunId: "run" };
+  render(
+    <CaseRunTimeline
+      caseTitle="Edited title"
+      suiteName="Suite"
+      iterations={[trial]}
+      suiteRuns={[
+        {
+          _id: "run",
+          runNumber: 12,
+          configSnapshot: { tests: [{ title: "Original case" }] },
+        } as EvalSuiteRun,
+      ]}
+      selectedIterationId="t"
+      onSelect={vi.fn()}
+      live
+    >
+      <p>Evidence</p>
+    </CaseRunTimeline>,
+  );
+  expect(
+    screen.getByRole("heading", { name: "#12 Original case" }),
+  ).toBeVisible();
+});
+
+it("opens a deep-linked iteration in the drawer and allows it to stay closed", async () => {
+  const props = {
+    caseTitle: "Case",
+    iterations: [iteration("a", "gpt", "passed", 1000)],
+    selectedIterationId: "a",
+    openIterationId: "a",
+    onSelect: vi.fn(),
+  };
+  const { rerender } = render(
+    <CaseRunTimeline {...props}>Captured evidence</CaseRunTimeline>,
+  );
+  expect(screen.getByRole("dialog")).toHaveTextContent("Captured evidence");
+  await userEvent
+    .setup()
+    .click(screen.getByRole("button", { name: "Close", exact: true }));
+  rerender(<CaseRunTimeline {...props}>Captured evidence</CaseRunTimeline>);
+  expect(screen.queryByRole("dialog")).toBeNull();
+});
+
+it("shows an opening live run as a row and replaces it with its recorded iteration", async () => {
+  const onSelectLive = vi.fn();
+  const props = {
+    caseTitle: "Search",
+    selectedIterationId: null,
+    onSelect: vi.fn(),
+    onSelectLive,
+  };
+  const { rerender } = render(
+    <CaseRunTimeline
+      {...props}
+      iterations={[]}
+      pendingRun={{ model: "nova", client: "SDK" }}
+    >
+      Evidence
+    </CaseRunTimeline>,
+  );
+  expect(screen.queryByText("View live run")).toBeNull();
+  expect(
+    screen.queryByText("Run this case to see its results here."),
+  ).toBeNull();
+  const row = screen.getByTestId("case-run-row");
+  expect(row).toHaveTextContent("Running");
+  expect(within(row).getByTestId("case-run-date")).toHaveTextContent("just now");
+  expect(within(row).getByTestId("case-run-time")).toHaveTextContent("—");
+  expect(within(row).getByTestId("case-run-time").querySelector("time")).toBeNull();
+  expect(row).toHaveTextContent("nova");
+  expect(row).toHaveTextContent("SDK");
+  await userEvent.setup().click(row);
+  expect(onSelectLive).toHaveBeenCalledOnce();
+  await userEvent.setup().click(screen.getByRole("button", { name: "Close" }));
+  rerender(
+    <CaseRunTimeline
+      {...props}
+      iterations={[iteration("live", "nova", "pending", 0)]}
+    >
+      Evidence
+    </CaseRunTimeline>,
+  );
+  expect(screen.getAllByTestId("case-run-row")).toHaveLength(1);
+  expect(screen.getByTestId("case-run-row")).toHaveTextContent("Running");
+  rerender(
+    <CaseRunTimeline
+      {...props}
+      iterations={[iteration("live", "nova", "passed", 1000)]}
+      liveVerdict="Passed"
+    >
+      Evidence
+    </CaseRunTimeline>,
+  );
+  expect(screen.getAllByTestId("case-run-row")).toHaveLength(1);
+  expect(screen.getByTestId("case-run-row")).toHaveTextContent("Passed");
+  expect(screen.queryByText("View live run")).toBeNull();
+});

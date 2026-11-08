@@ -1,0 +1,689 @@
+/**
+ * `parsePluginBundle` — the source-adapter-independent Agent Plugins 1.0
+ * parser.
+ *
+ * Phase order is a security contract, not a convenience: entry paths are
+ * validated against the archive reject-list and limits FIRST, and any
+ * violation throws before a single byte of content is read or any component
+ * (manifest/skill/MCP/app) is normalized.
+ *
+ * Failure boundaries per the spec: manifest violations and archive/limit
+ * violations reject the bundle; one invalid skill or one invalid server
+ * entry is skipped (reported on `skipped` + demoted to warnings); an invalid
+ * `mcp.json` document disables the MCP component type only.
+ */
+
+import { parsePluginAppConfig, type ParsedPluginApp } from "./app-config.js";
+import {
+  computeAggregateHash,
+  computeExecutionDigest,
+  hashCanonicalJson,
+  sha256HexBytes,
+} from "./hashes.js";
+import { LEGACY_MCP_CONFIG_PATH, resolveManifestSource } from "./layout.js";
+import { adaptLegacyMcpConfig } from "./legacy-mcp.js";
+import {
+  applyOnboardingSkill,
+  MCPJAM_EXTENSION_NAMESPACE,
+  normalizePluginManifest,
+  type NormalizedPluginManifest,
+} from "./manifest.js";
+import {
+  normalizePluginMcpConfig,
+  type ParsedPluginServer,
+  type PluginSkippedComponent,
+} from "./mcp-config.js";
+import {
+  isPathInside,
+  validateBundleEntries,
+  type NormalizedBundleEntry,
+} from "./paths.js";
+import {
+  parsePluginSkill,
+  SKILL_FILE_NAME,
+  SKILLS_DIR,
+  type ParsedPluginSkill,
+} from "./skill.js";
+import {
+  DEFAULT_PLUGIN_BUNDLE_LIMITS,
+  type ParsedPluginAsset,
+  type ParsedPluginBundle,
+  type ParsePluginBundleOptions,
+  type PluginAssetKind,
+  type PluginBundleLimits,
+  type PluginFileSource,
+  type PluginSetupRequirement,
+} from "./types.js";
+import { PluginBundleError, PluginIssueCollector } from "./validation.js";
+
+export const MCP_CONFIG_PATH = "mcp.json";
+export const APP_CONFIG_SUFFIX = ".app.json";
+export const ASSETS_DIR = "assets";
+
+const ASSET_CONTENT_TYPES: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  svg: "image/svg+xml",
+  webp: "image/webp",
+  ico: "image/x-icon",
+  bmp: "image/bmp",
+  pdf: "application/pdf",
+  md: "text/markdown",
+  txt: "text/plain",
+  json: "application/json",
+  yaml: "application/x-yaml",
+  yml: "application/x-yaml",
+};
+
+interface LoadedFile extends NormalizedBundleEntry {
+  bytes: Uint8Array;
+  contentHash: string;
+}
+
+function fileExtension(path: string): string {
+  const name = path.slice(path.lastIndexOf("/") + 1);
+  const dot = name.lastIndexOf(".");
+  return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase();
+}
+
+function contentTypeForPath(path: string): string {
+  return ASSET_CONTENT_TYPES[fileExtension(path)] ?? "application/octet-stream";
+}
+
+/** Magic-byte sniff for the image formats we accept as presentation assets. */
+function sniffImageFormat(
+  bytes: Uint8Array
+): "png" | "jpeg" | "gif" | "webp" | "svg" | null {
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return "png";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8) {
+    return "jpeg";
+  }
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x47 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x38
+  ) {
+    return "gif";
+  }
+  if (
+    bytes.length >= 12 &&
+    bytes[0] === 0x52 &&
+    bytes[1] === 0x49 &&
+    bytes[2] === 0x46 &&
+    bytes[3] === 0x46 &&
+    bytes[8] === 0x57 &&
+    bytes[9] === 0x45 &&
+    bytes[10] === 0x42 &&
+    bytes[11] === 0x50
+  ) {
+    return "webp";
+  }
+  try {
+    const head = new TextDecoder("utf-8", { fatal: true }).decode(
+      bytes.slice(0, 512)
+    );
+    if (head.includes("<svg")) return "svg";
+  } catch {
+    // Not text — fall through.
+  }
+  return null;
+}
+
+const IMAGE_EXTENSION_FORMAT: Record<string, string> = {
+  png: "png",
+  jpg: "jpeg",
+  jpeg: "jpeg",
+  gif: "gif",
+  webp: "webp",
+  svg: "svg",
+};
+
+function decodeUtf8(
+  file: LoadedFile,
+  issues: PluginIssueCollector
+): string | null {
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
+  } catch {
+    issues.error("FILE_INVALID_UTF8", "file is not valid UTF-8 text", {
+      path: file.path,
+    });
+    return null;
+  }
+}
+
+function parseJsonFile(
+  file: LoadedFile,
+  issues: PluginIssueCollector,
+  invalidJsonCode:
+    | "MANIFEST_INVALID_JSON"
+    | "MCP_INVALID_CONFIG"
+    | "APP_INVALID_CONFIG"
+): unknown | null {
+  const text = decodeUtf8(file, issues);
+  if (text === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    issues.error(invalidJsonCode, "file is not valid JSON", {
+      path: file.path,
+    });
+    return null;
+  }
+  if (parsed === null) {
+    issues.error(invalidJsonCode, "file must contain a JSON object", {
+      path: file.path,
+    });
+    return null;
+  }
+  return parsed;
+}
+
+/**
+ * Parse and validate an Agent Plugins bundle from an abstract file source.
+ *
+ * Throws `PluginBundleError` on bundle-level violations (archive safety,
+ * limits, manifest); component-level problems are isolated into `skipped`
+ * with their issues demoted to warnings on the result.
+ */
+/** Whether `logo` came from MCPJam's own (strict) namespace. */
+function manifestDeclaresMcpjamLogo(
+  manifest: NormalizedPluginManifest
+): boolean {
+  const namespace = manifest.extensions[MCPJAM_EXTENSION_NAMESPACE];
+  return (
+    namespace !== null &&
+    typeof namespace === "object" &&
+    !Array.isArray(namespace) &&
+    typeof (namespace as Record<string, unknown>).logo === "string"
+  );
+}
+
+export async function parsePluginBundle(
+  source: PluginFileSource,
+  options?: ParsePluginBundleOptions
+): Promise<ParsedPluginBundle> {
+  const limits: PluginBundleLimits = {
+    ...DEFAULT_PLUGIN_BUNDLE_LIMITS,
+    ...options?.limits,
+  };
+  const issues = new PluginIssueCollector();
+
+  // Phase 1 — archive/path safety. Must fail before any content read.
+  const entries = await source.list();
+  const validated = validateBundleEntries(entries, limits, issues);
+  issues.throwIfErrors();
+  if (validated.length === 0) {
+    issues.error("BUNDLE_EMPTY", "bundle contains no files");
+    issues.throwIfErrors();
+  }
+
+  // Phase 2 — load content and compute deterministic hashes.
+  const files: LoadedFile[] = [];
+  const byPath = new Map<string, LoadedFile>();
+  for (const entry of validated) {
+    let bytes: Uint8Array;
+    try {
+      bytes = await source.readBytes(entry.sourcePath, limits.maxFileBytes);
+    } catch (error) {
+      issues.error(
+        "FILE_UNREADABLE",
+        `file could not be read: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+        { path: entry.path }
+      );
+      continue;
+    }
+    if (bytes.byteLength > limits.maxFileBytes) {
+      issues.error(
+        "FILE_TOO_LARGE",
+        `file exceeds the per-file limit of ${limits.maxFileBytes} bytes`,
+        { path: entry.path }
+      );
+      continue;
+    }
+    if (bytes.byteLength !== entry.size) {
+      issues.error(
+        "FILE_SIZE_MISMATCH",
+        `declared size ${entry.size} does not match actual size ${bytes.byteLength}`,
+        { path: entry.path }
+      );
+      continue;
+    }
+    const loaded: LoadedFile = {
+      ...entry,
+      bytes,
+      contentHash: await sha256HexBytes(bytes),
+    };
+    files.push(loaded);
+    byPath.set(loaded.path, loaded);
+  }
+  issues.throwIfErrors();
+
+  const bundleHash = await computeAggregateHash(
+    files.map((file) => ({ path: file.path, contentHash: file.contentHash }))
+  );
+  const executableFiles = files
+    .filter((file) => file.executable)
+    .map((file) => file.path);
+
+  // Phase 3 — manifest: `plugin.json` at the bundle root (fixed location;
+  // nested plugin.json files are ordinary files, not manifests).
+  const filePaths: ReadonlySet<string> = new Set(byPath.keys());
+  const resolved = resolveManifestSource({
+    profile: options?.profile ?? "strict",
+    filePaths,
+    readJson: (path, collector) => {
+      const file = byPath.get(path);
+      return file === undefined
+        ? null
+        : parseJsonFile(file, collector, "MANIFEST_INVALID_JSON");
+    },
+    issues,
+  });
+  if (resolved === null) throw new PluginBundleError(issues.issues());
+  const { interpretation } = resolved;
+  const manifestFile = byPath.get(interpretation.manifestPath);
+  const { manifest, onboardingSkill } =
+    resolved.record === null || manifestFile === undefined
+      ? { manifest: null as NormalizedPluginManifest | null }
+      : normalizePluginManifest(resolved.record, { filePaths, issues });
+  if (manifest === null || manifestFile === undefined) {
+    throw new PluginBundleError(issues.issues());
+  }
+  const manifestHash = manifestFile.contentHash;
+  issues.throwIfErrors();
+
+  const skipped: PluginSkippedComponent[] = [];
+
+  // Phase 4 — skills (`skills/<dir>/SKILL.md`, per the Agent Skills spec).
+  // One bad skill is skipped, never the bundle.
+  const skillDirNames: string[] = [];
+  for (const file of files) {
+    if (!file.path.startsWith(`${SKILLS_DIR}/`)) continue;
+    const segments = file.path.slice(SKILLS_DIR.length + 1).split("/");
+    if (
+      segments.length === 2 &&
+      segments[1] === SKILL_FILE_NAME &&
+      !skillDirNames.includes(segments[0])
+    ) {
+      skillDirNames.push(segments[0]);
+    }
+  }
+  skillDirNames.sort();
+  if (skillDirNames.length > limits.maxSkills) {
+    issues.error(
+      "SKILL_TOO_MANY",
+      `bundle declares ${skillDirNames.length} skills; the limit is ${limits.maxSkills}`
+    );
+    issues.throwIfErrors();
+  }
+
+  const skipSkill = (
+    directoryName: string,
+    scoped: PluginIssueCollector
+  ): void => {
+    const reason = scoped.firstErrorMessage() ?? "invalid skill";
+    issues.absorbDemoted(scoped);
+    issues.warn(
+      "COMPONENT_SKIPPED",
+      `skill "${directoryName}" was skipped: ${reason}`,
+      { componentKey: `skill:${directoryName}` }
+    );
+    skipped.push({ kind: "skill", key: directoryName, reason });
+  };
+
+  const skills: ParsedPluginSkill[] = [];
+  const seenSkillNames = new Map<string, string>();
+  for (const directoryName of skillDirNames) {
+    const directory = `${SKILLS_DIR}/${directoryName}`;
+    const skillFilePath = `${directory}/${SKILL_FILE_NAME}`;
+    const skillFile = byPath.get(skillFilePath);
+    if (skillFile === undefined) continue; // unreachable; discovery found it
+
+    const scoped = new PluginIssueCollector();
+    const skillText = decodeUtf8(skillFile, scoped);
+    if (skillText === null) {
+      skipSkill(directoryName, scoped);
+      continue;
+    }
+
+    const directoryFiles = files.filter((file) =>
+      isPathInside(directory, file.path)
+    );
+    const skill = await parsePluginSkill({
+      pluginName: manifest.name,
+      directory,
+      directoryName,
+      skillFilePath,
+      skillText,
+      skillContentHash: skillFile.contentHash,
+      files: directoryFiles.map((file) => ({
+        path: file.path,
+        size: file.size,
+        contentHash: file.contentHash,
+      })),
+      issues: scoped,
+    });
+    if (skill === null || scoped.hasErrors()) {
+      skipSkill(directoryName, scoped);
+      continue;
+    }
+    issues.absorbDemoted(scoped);
+
+    const duplicateOf = seenSkillNames.get(skill.name);
+    if (duplicateOf !== undefined) {
+      const dupScoped = new PluginIssueCollector();
+      dupScoped.error(
+        "SKILL_DUPLICATE_NAME",
+        `skill name "${skill.name}" is declared by both "${duplicateOf}" and "${skill.directory}"`,
+        { path: skill.skillFilePath, componentKey: skill.componentKey }
+      );
+      skipSkill(directoryName, dupScoped);
+      continue;
+    }
+    seenSkillNames.set(skill.name, skill.directory);
+    skills.push(skill);
+  }
+
+  applyOnboardingSkill(manifest, onboardingSkill, skills, issues);
+
+  // Phase 5 — MCP servers: the root `mcp.json` (fixed location) when a root
+  // plugin.json is the manifest; otherwise whatever the legacy manifest
+  // names, rewritten into a strict document before the same normalizer runs.
+  const mcpServers: ParsedPluginServer[] = [];
+  const legacyMcp = resolved.legacyMcp;
+  const mcpFile =
+    interpretation.layout === "agent-plugins"
+      ? byPath.get(MCP_CONFIG_PATH)
+      : legacyMcp?.kind === "file"
+        ? byPath.get(legacyMcp.path)
+        : undefined;
+  if (resolved.skipped !== undefined) skipped.push(resolved.skipped);
+  for (const file of files) {
+    const namedLikeMcpConfig =
+      (`/${file.path}`.endsWith(`/${MCP_CONFIG_PATH}`) &&
+        !isPathInside(SKILLS_DIR, file.path)) ||
+      // A legacy manifest's own `mcpServers` takes the place of `.mcp.json`.
+      (interpretation.layout !== "agent-plugins" &&
+        file.path === LEGACY_MCP_CONFIG_PATH);
+    if (file !== mcpFile && namedLikeMcpConfig) {
+      issues.warn(
+        "MCP_CONFIG_IGNORED",
+        `"${file.path}" is not this bundle's MCP configuration; ignored`,
+        { path: file.path }
+      );
+    }
+  }
+  const mcpPath = mcpFile?.path ?? legacyMcp?.path;
+  if (mcpPath !== undefined) {
+    const docScoped = new PluginIssueCollector();
+    let mcpRaw =
+      mcpFile !== undefined
+        ? parseJsonFile(mcpFile, docScoped, "MCP_INVALID_CONFIG")
+        : legacyMcp?.kind === "inline"
+          ? legacyMcp.document
+          : null;
+    if (mcpRaw !== null && legacyMcp !== undefined) {
+      const adapted = adaptLegacyMcpConfig(mcpRaw, {
+        sourcePath: mcpPath,
+        issues,
+        maxServers: limits.maxMcpServers,
+      });
+      if (adapted.ok) skipped.push(...adapted.skipped);
+      else docScoped.error(adapted.code, adapted.reason, { path: mcpPath });
+      mcpRaw = adapted.ok ? adapted.document : null;
+    }
+    if (mcpRaw === null) {
+      // Unreadable/invalid JSON disables the MCP component type only.
+      const reason = docScoped.firstErrorMessage() ?? "invalid mcp.json";
+      issues.absorbDemoted(docScoped);
+      issues.warn(
+        "COMPONENT_SKIPPED",
+        `MCP servers are disabled for this bundle: ${reason}`,
+        { path: mcpPath }
+      );
+      skipped.push({ kind: "mcp-config", key: mcpPath, reason });
+    } else {
+      const normalized = normalizePluginMcpConfig(mcpRaw, {
+        sourcePath: mcpPath,
+        manifestSchemaVersion: manifest.schemaVersion,
+        issues,
+        // Declared-entry cap, enforced before entry isolation: a flood of
+        // malformed entries must not bypass the limit. Bundle-fatal via the
+        // final throwIfErrors.
+        maxServers: limits.maxMcpServers,
+        entryExtensions: interpretation.profile === "openai-compatible",
+      });
+      skipped.push(...normalized.skipped);
+      for (const server of normalized.servers) {
+        mcpServers.push({
+          ...server,
+          configHash: await hashCanonicalJson(server.config),
+        });
+      }
+    }
+  }
+
+  // Phase 6 — app mappings (`*.app.json`). App metadata is extension data,
+  // so one unreadable file skips its apps, never the bundle.
+  const apps: ParsedPluginApp[] = [];
+  const serverKeys = mcpServers.map((server) => server.key);
+  for (const file of files) {
+    if (!file.path.endsWith(APP_CONFIG_SUFFIX)) continue;
+    if (isPathInside(SKILLS_DIR, file.path)) continue; // skill supporting file
+    const scoped = new PluginIssueCollector();
+    const appRaw = parseJsonFile(file, scoped, "APP_INVALID_CONFIG");
+    const parsedApps =
+      appRaw === null
+        ? null
+        : parsePluginAppConfig({
+            sourcePath: file.path,
+            raw: appRaw,
+            serverKeys,
+            contentHash: file.contentHash,
+            issues: scoped,
+            maxApps: limits.maxMcpServers,
+          });
+    const reason = scoped.firstErrorMessage();
+    issues.absorbDemoted(scoped);
+    if (parsedApps === null || reason !== undefined) {
+      issues.warn(
+        "COMPONENT_SKIPPED",
+        `apps in "${file.path}" were skipped: ${reason ?? "invalid app configuration"}`,
+        { path: file.path }
+      );
+      skipped.push({
+        kind: "app",
+        key: file.path,
+        reason: reason ?? "invalid app configuration",
+      });
+      continue;
+    }
+    apps.push(...parsedApps);
+  }
+
+  // Phase 7 — presentation assets.
+  const assets: ParsedPluginAsset[] = [];
+  const assetPaths = new Set<string>();
+  /**
+   * `declaredBy` names the manifest field that points at the file. MCPJam's
+   * own `com.mcpjam` icon/logo fields are strict (a bad image is fatal, as
+   * before); OpenAI's interface icons are lenient — a bad one is reported and
+   * dropped from the manifest, so the plugin still imports. Returns whether
+   * the file is (now or already) a usable asset.
+   */
+  const addAsset = (
+    file: LoadedFile,
+    kind: PluginAssetKind,
+    declaredBy?: string,
+    strict = true
+  ): boolean => {
+    if (assetPaths.has(file.path)) return true;
+    const extension = fileExtension(file.path);
+    const expectedFormat = IMAGE_EXTENSION_FORMAT[extension];
+    if (declaredBy !== undefined && expectedFormat === undefined) {
+      const message = `manifest "${declaredBy}" must reference an image file`;
+      if (strict) {
+        issues.error("ASSET_UNSUPPORTED_TYPE", message, { path: file.path });
+      } else {
+        issues.warn("ASSET_UNSUPPORTED_TYPE", `${message}; ignored`, {
+          path: file.path,
+        });
+      }
+      return false;
+    }
+    if (expectedFormat !== undefined) {
+      const sniffed = sniffImageFormat(file.bytes);
+      if (sniffed !== expectedFormat) {
+        const message = `file extension ".${extension}" does not match its content`;
+        if (declaredBy !== undefined) {
+          if (strict) {
+            issues.error("ASSET_CONTENT_MISMATCH", message, {
+              path: file.path,
+            });
+          } else {
+            issues.warn(
+              "ASSET_CONTENT_MISMATCH",
+              `manifest "${declaredBy}": ${message}; ignored`,
+              { path: file.path }
+            );
+          }
+          return false;
+        }
+        issues.warn("ASSET_CONTENT_MISMATCH", message, { path: file.path });
+      }
+    }
+    assetPaths.add(file.path);
+    assets.push({
+      path: file.path,
+      kind,
+      size: file.size,
+      contentHash: file.contentHash,
+      contentType: contentTypeForPath(file.path),
+    });
+    return true;
+  };
+
+  if (manifest.icon !== undefined) {
+    const iconFile = byPath.get(manifest.icon);
+    if (iconFile !== undefined) addAsset(iconFile, "icon", "icon");
+  }
+  // `logo` is strict only when the com.mcpjam namespace set it (OpenAI's
+  // `interface.logo` is otherwise its only source).
+  const mcpjamLogo = manifestDeclaresMcpjamLogo(manifest);
+  if (manifest.logo !== undefined) {
+    const logoFile = byPath.get(manifest.logo);
+    if (
+      logoFile !== undefined &&
+      !addAsset(logoFile, "logo", "logo", mcpjamLogo)
+    )
+      delete manifest.logo;
+  }
+  // OpenAI's dark directory icon and composer icon. Asset kinds stay within
+  // the stored set (`logo` / `icon`); consumers find each by its path.
+  for (const [key, kind] of [
+    ["logoDark", "logo"],
+    ["composerIcon", "icon"],
+  ] as const) {
+    const path = manifest[key];
+    if (path === undefined) continue;
+    const file = byPath.get(path);
+    if (file !== undefined && !addAsset(file, kind, `interface.${key}`, false))
+      delete manifest[key];
+  }
+  for (const file of files) {
+    if (!isPathInside(ASSETS_DIR, file.path)) continue;
+    const kind: PluginAssetKind = file.path.toLowerCase().includes("screenshot")
+      ? "screenshot"
+      : "other";
+    addAsset(file, kind);
+  }
+
+  // Phase 8 — setup requirements (names only; never credential values).
+  // Requirements are emitted only for values the bundle could NOT provide:
+  // stored literals and runtime templates need no setup.
+  const setupRequirements: PluginSetupRequirement[] = [];
+  for (const server of mcpServers) {
+    if (server.config.transport === "stdio") {
+      for (const env of server.config.envRequirements) {
+        if (env.valueTemplate !== undefined || env.value !== undefined) {
+          continue; // runtime- or bundle-provided
+        }
+        setupRequirements.push({
+          kind: "env",
+          componentKey: server.componentKey,
+          serverKey: server.key,
+          name: env.name,
+          required: env.required,
+        });
+      }
+      continue;
+    }
+    for (const header of server.config.headerRequirements) {
+      if (header.value !== undefined) continue; // bundle-provided
+      setupRequirements.push({
+        kind: "header",
+        componentKey: server.componentKey,
+        serverKey: server.key,
+        name: header.name,
+        secret: header.secret,
+        ...(header.scheme !== undefined ? { scheme: header.scheme } : {}),
+      });
+    }
+    const { auth, oauth } = server.config;
+    const declaresOAuth = auth?.type === "oauth" || auth?.type === "mixed";
+    // A declared method decides. MCPJam's own `oauth` hint asks for a
+    // sign-in only for a server that declares none, so `none` and `api_key`
+    // never surface one.
+    if (declaresOAuth || (auth === undefined && oauth !== undefined)) {
+      setupRequirements.push({
+        kind: "oauth",
+        componentKey: server.componentKey,
+        serverKey: server.key,
+        ...(oauth?.timing !== undefined ? { timing: oauth.timing } : {}),
+        ...(declaresOAuth ? { required: auth.type === "oauth" } : {}),
+      });
+    }
+  }
+
+  issues.throwIfErrors();
+
+  return {
+    manifest,
+    interpretation,
+    schemaVersion: manifest.schemaVersion,
+    bundleHash,
+    executableFiles,
+    executionDigest: await computeExecutionDigest({
+      bundleHash,
+      executableFiles,
+      profile: interpretation.profile,
+      revision: interpretation.revision,
+    }),
+    manifestHash,
+    skills,
+    mcpServers,
+    apps,
+    assets,
+    skipped,
+    setupRequirements,
+    warnings: issues.warnings(),
+  };
+}
+
+export type { NormalizedPluginManifest };

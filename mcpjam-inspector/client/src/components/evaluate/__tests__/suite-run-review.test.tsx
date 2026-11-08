@@ -1,0 +1,378 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { render, screen, act } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { SuiteRunReview, selectReviewTargets } from "../suite-run-review";
+import type { EvalSuite, EvalCase } from "../../evals/types";
+import { toast } from "sonner";
+import { useCaseLaunches } from "../case-workspace/pending-case-launches";
+vi.mock("sonner", () => ({ toast: { loading: vi.fn(), error: vi.fn() } }));
+const suite = {
+  _id: "suite",
+  name: "Checkout",
+  environment: { servers: [] },
+  environmentIds: ["env-sonnet", "env-opus"],
+  minIterations: 5,
+  verdictPolicyVersion: 2,
+  verdictPolicyDefaults: { repetitions: 5, passThreshold: 0.8 },
+} as EvalSuite;
+const cases = [
+  { _id: "one", runs: 1, models: [] },
+  { _id: "two", runs: 1, models: [] },
+] as unknown as EvalCase[];
+const environments = [
+  { environmentId: "env-sonnet", hostId: "claude", modelId: "sonnet" },
+  { environmentId: "env-opus", hostId: "claude", modelId: "opus" },
+];
+const names = new Map([["claude", "Claude"]]);
+
+describe("suite run review", () => {
+  beforeEach(() => {
+    localStorage.clear();
+    useCaseLaunches.setState({ launches: [] });
+    vi.clearAllMocks();
+  });
+
+  it.each([
+    [undefined, undefined, 5],
+    [2, undefined, 2],
+    [2, 7, 7],
+  ])(
+    "seeds repetitions %s with minimum %s as %s",
+    (repetitions, minimum, expected) => {
+      render(
+        <SuiteRunReview
+          suite={{
+            ...suite,
+            minIterations: minimum,
+            verdictPolicyDefaults:
+              repetitions === undefined
+                ? undefined
+                : { repetitions, passThreshold: 0.8 },
+          }}
+          cases={cases}
+          environments={environments}
+          hostNamesById={names}
+          onStart={vi.fn()}
+          onClose={vi.fn()}
+        />,
+      );
+      expect(screen.getByLabelText("Iterations per case")).toHaveValue(
+        expected,
+      );
+    },
+  );
+
+  it.each(["Find my account", ""])("keeps case scope and saved suite count with title %s", async (caseTitle) => {
+    const user = userEvent.setup();
+    localStorage.setItem("mcpjam:suite-run-iterations:suite", "9");
+    const onStart = vi.fn();
+    render(<SuiteRunReview suite={suite}
+      cases={[cases[0]]} caseTitle={caseTitle} initialIterations={2}
+      environments={environments} hostNamesById={names} onStart={onStart} onClose={vi.fn()} />);
+    expect(screen.getByRole("dialog", { name: "Setup Run" })).toBeVisible();
+    expect(screen.getByText(caseTitle || "Untitled test case")).toBeVisible();
+    expect(screen.getByText("Each client/model combination runs this test case.")).toBeVisible();
+    expect(screen.queryByText(/runs the whole suite/)).toBeNull();
+    expect(screen.getByRole("spinbutton")).toHaveValue(2);
+    await user.click(screen.getByRole("button", { name: "Run test case" }));
+    expect(onStart).toHaveBeenCalledWith(expect.objectContaining({ _id: suite._id }), { iterationOverride: 2, throwOnFailure: true, caseLaunchId: expect.any(String) });
+    expect(localStorage.getItem("mcpjam:suite-run-iterations:suite")).toBe("9");
+  });
+
+  it.each([
+    [1, undefined, 1],
+    [2, 9, 2],
+    [undefined, 2, 2],
+    [0, undefined, 1],
+    [11, undefined, 10],
+  ])(
+    "bounds the case count %s with remembered %s at %s independently of the suite minimum",
+    (initial, remembered, expected) => {
+      if (remembered !== undefined)
+        localStorage.setItem(
+          "mcpjam:suite-run-iterations:suite",
+          String(remembered),
+        );
+      render(
+        <SuiteRunReview
+          suite={suite}
+          cases={[cases[0]]}
+          caseTitle="Find my account"
+          initialIterations={initial}
+          environments={environments}
+          hostNamesById={names}
+          onStart={vi.fn()}
+          onClose={vi.fn()}
+        />,
+      );
+      expect(screen.getByRole("spinbutton")).toHaveValue(expected);
+    },
+  );
+
+  it.each(["Eval iteration limit reached.", "Cloud sandboxes are unavailable."])(
+    "blocks the case sheet for %s", async (disabledReason) => {
+      const onStart = vi.fn();
+      const onClose = vi.fn();
+      render(<SuiteRunReview suite={suite} cases={[cases[0]]} caseTitle=""
+        environments={environments} hostNamesById={names} disabledReason={disabledReason}
+        onStart={onStart} onClose={onClose} />);
+      expect(screen.getByRole("alert")).toHaveTextContent(disabledReason);
+      const button = screen.getByRole("button", { name: "Run test case" });
+      expect(button).toBeDisabled();
+      await userEvent.setup().click(button);
+      expect(onStart).not.toHaveBeenCalled();
+      expect(onClose).not.toHaveBeenCalled();
+    },
+  );
+
+  it("blocks the case sheet when every model it launches is out of credits", async () => {
+    const onStart = vi.fn();
+    const reason = "Out of MCPJam credits · resets in 3h";
+    render(<SuiteRunReview suite={suite} cases={[cases[0]]} caseTitle=""
+      environments={environments} hostNamesById={names}
+      preflight={{ disconnected: [], removed: [], refused: [], disabledProviders: [],
+        outOfCreditsReason: reason, serverName: (ref) => ref }}
+      onStart={onStart} onClose={vi.fn()} />);
+    expect(screen.getByRole("alert")).toHaveTextContent(reason);
+    const button = screen.getByRole("button", { name: "Run test case" });
+    expect(button).toBeDisabled();
+    await userEvent.setup().click(button);
+    expect(onStart).not.toHaveBeenCalled();
+  });
+
+  it("reports a case launch refusal after closing setup", async () => {
+    const onClose = vi.fn();
+    render(<SuiteRunReview suite={suite} cases={[cases[0]]} caseTitle=""
+      environments={environments} hostNamesById={names}
+      onStart={vi.fn().mockRejectedValue(new Error("Eval iteration limit reached."))}
+      onClose={onClose} />);
+    await userEvent.setup().click(screen.getByRole("button", { name: "Run test case" }));
+    expect(toast.error).toHaveBeenCalledWith("Eval iteration limit reached.", { id: expect.any(String) });
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(useCaseLaunches.getState().launches).toEqual([]);
+  });
+
+  it("closes case setup and shows pending rows before startup completes", async () => {
+    let finish!: () => void;
+    const onStart = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    const onClose = vi.fn();
+    render(<SuiteRunReview suite={suite} cases={[cases[0]]} caseTitle="Case" initialIterations={2}
+      environments={environments} hostNamesById={names} onStart={onStart} onClose={onClose} />);
+    await userEvent.click(screen.getByRole("button", { name: "Run test case" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onClose.mock.invocationCallOrder[0]).toBeLessThan(onStart.mock.invocationCallOrder[0]);
+    expect(useCaseLaunches.getState().launches[0].rows).toHaveLength(4);
+    expect(toast.loading).toHaveBeenCalledOnce();
+    await act(async () => finish());
+  });
+
+  it("requires a target and never mutates suite defaults", () => {
+    expect(() => selectReviewTargets(suite, [])).toThrow("Select at least one");
+    expect(() => selectReviewTargets(suite, ["stale"])).toThrow(
+      "no longer attached",
+    );
+    expect(selectReviewTargets(suite, ["env-opus"]).environmentIds).toEqual([
+      "env-opus",
+    ]);
+    expect(suite.environmentIds).toEqual(["env-sonnet", "env-opus"]);
+  });
+  it("launches selected targets with a validated one-off iteration count", async () => {
+    const user = userEvent.setup();
+    const start = vi.fn();
+    const close = vi.fn();
+    render(
+      <SuiteRunReview
+        suite={suite}
+        cases={cases}
+        environments={environments}
+        hostNamesById={names}
+        onStart={start}
+        onClose={close}
+      />,
+    );
+    // Seeded from the suite floor (minIterations 5), not the flat default.
+    expect(screen.getByRole("spinbutton")).toHaveValue(5);
+    expect(screen.getByLabelText("Iterations per case")).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Fewer iterations" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "More iterations" }),
+    ).toBeVisible();
+    expect(screen.queryByText("1–10 repetitions")).toBeNull();
+    expect(
+      screen.queryByText("Repeat every case to check consistency."),
+    ).toBeNull();
+    expect(screen.queryByText("80%")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("checkbox", { name: "Claude · sonnet" }));
+    await user.clear(screen.getByRole("spinbutton"));
+    await user.type(screen.getByRole("spinbutton"), "11");
+    expect(screen.getByRole("button", { name: "Start run" })).toBeDisabled();
+    await user.clear(screen.getByRole("spinbutton"));
+    await user.type(screen.getByRole("spinbutton"), "4");
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(start).toHaveBeenCalledWith(
+      expect.objectContaining({ environmentIds: ["env-opus"] }),
+      { iterationOverride: 4, throwOnFailure: true },
+    );
+    expect(close).toHaveBeenCalledOnce();
+  });
+  it("reopens with the iteration count of the last started run", async () => {
+    const user = userEvent.setup();
+    const props = {
+      suite: { ...suite, minIterations: undefined },
+      cases,
+      environments,
+      hostNamesById: names,
+      onStart: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const { unmount } = render(<SuiteRunReview {...props} />);
+    for (let i = 0; i < 4; i++) {
+      await user.click(
+        screen.getByRole("button", { name: "Fewer iterations" }),
+      );
+    }
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    unmount();
+    render(<SuiteRunReview {...props} />);
+    expect(screen.getByLabelText("Iterations per case")).toHaveValue(1);
+  });
+  it("keeps a remembered count above the suite minimum and scoped to its suite", () => {
+    localStorage.setItem("mcpjam:suite-run-iterations:suite", "2");
+    localStorage.setItem("mcpjam:suite-run-iterations:other", "3");
+    const props = {
+      cases,
+      environments,
+      hostNamesById: names,
+      onStart: vi.fn(),
+      onClose: vi.fn(),
+    };
+    const { unmount } = render(
+      <SuiteRunReview {...props} suite={{ ...suite, minIterations: 4 }} />,
+    );
+    expect(screen.getByLabelText("Iterations per case")).toHaveValue(4);
+    unmount();
+    render(
+      <SuiteRunReview
+        {...props}
+        suite={{ ...suite, _id: "third", minIterations: undefined }}
+      />,
+    );
+    expect(screen.getByLabelText("Iterations per case")).toHaveValue(5);
+  });
+  it("does not remember a count when the run fails to start", async () => {
+    const user = userEvent.setup();
+    render(
+      <SuiteRunReview
+        suite={{ ...suite, minIterations: undefined }}
+        cases={cases}
+        environments={environments}
+        hostNamesById={names}
+        onStart={vi.fn().mockRejectedValue(new Error("No credits"))}
+        onClose={vi.fn()}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Fewer iterations" }));
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(await screen.findByText("No credits")).toBeVisible();
+    expect(
+      localStorage.getItem("mcpjam:suite-run-iterations:suite"),
+    ).toBeNull();
+  });
+  it("does not show its own in-progress launch as a blocker", async () => {
+    let finish!: () => void;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const onClose = vi.fn();
+    const props = {
+      suite,
+      cases,
+      environments,
+      hostNamesById: names,
+      onStart,
+      onClose,
+    };
+    const { rerender } = render(<SuiteRunReview {...props} />);
+    await userEvent
+      .setup()
+      .click(screen.getByRole("button", { name: "Start run" }));
+    rerender(
+      <SuiteRunReview
+        {...props}
+        disabledReason="A suite or replay is already in progress."
+      />,
+    );
+    expect(
+      screen.queryByText("A suite or replay is already in progress."),
+    ).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Starting run…" }),
+    ).toBeDisabled();
+    await act(async () => finish());
+    expect(onClose).toHaveBeenCalledOnce();
+  });
+
+  it("holds launch while pending and preserves selections after failure", async () => {
+    const user = userEvent.setup();
+    let reject!: (error: Error) => void;
+    const start = vi.fn(
+      () =>
+        new Promise<void>((_, fail) => {
+          reject = fail;
+        }),
+    );
+    const close = vi.fn();
+    render(
+      <SuiteRunReview
+        suite={suite}
+        cases={cases}
+        environments={environments}
+        hostNamesById={names}
+        onStart={start}
+        onClose={close}
+      />,
+    );
+    await user.click(screen.getByRole("button", { name: "Start run" }));
+    expect(
+      screen.getByRole("button", { name: "Starting run…" }),
+    ).toBeDisabled();
+    reject(new Error("Connection unavailable"));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Connection unavailable",
+    );
+    expect(close).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("checkbox", { name: "Claude · opus" }),
+    ).toBeChecked();
+  });
+
+  it("opens suite settings from the grading policy action", async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    const onEditSettings = vi.fn();
+    render(
+      <SuiteRunReview
+        suite={suite}
+        cases={cases}
+        environments={environments}
+        hostNamesById={names}
+        onStart={vi.fn()}
+        onClose={onClose}
+        onEditSettings={onEditSettings}
+      />,
+    );
+    expect(
+      screen.queryByRole("link", { name: "Configure suite evaluators" }),
+    ).toBeNull();
+    await user.click(
+      screen.getByRole("button", { name: "Configure suite evaluators" }),
+    );
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(onEditSettings).toHaveBeenCalledOnce();
+  });
+});

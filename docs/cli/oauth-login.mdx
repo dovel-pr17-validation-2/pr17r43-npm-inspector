@@ -1,0 +1,175 @@
+---
+title: "OAuth Login & Debugging"
+description: "Authenticate with MCP servers and debug OAuth flows"
+icon: "key"
+---
+
+The `oauth` command group handles authentication against MCP servers that require OAuth. Use `oauth login` to obtain tokens interactively, and the proxy/metadata commands to debug discovery and endpoint behavior.
+
+## Quick start
+
+```bash
+# Interactive login — opens a browser for consent
+mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 \
+  --registration dcr
+```
+
+On success, the command prints credentials such as an access token, refresh token, client ID, and sometimes client secret. You can pass access tokens to other commands via `--oauth-access-token` or `--access-token`.
+
+<Note>
+  `oauth login` validates the server's Protected Resource Metadata (PRM) at the discovery step. If the PRM document is missing its required `resource` field, or if the advertised resource is on a different origin than the server URL, the login fails before any authorization request is made. Fix the PRM document on your server to resolve this. The OAuth Debugger accepts these values with a warning so you can still observe the flow.
+</Note>
+
+## Commands
+
+### `oauth login`
+
+Runs a full OAuth flow: discovery, registration, authorization, token exchange. Supports all three registration strategies and auth modes.
+
+```bash
+# DCR + interactive (most common for local dev)
+mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 \
+  --registration dcr
+
+# CIMD + interactive (2025-11-25 and 2026-07-28)
+mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 \
+  --registration cimd
+
+# Preregistered + client_credentials (M2M, no browser)
+mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 \
+  --registration preregistered \
+  --auth-mode client_credentials \
+  --client-id "$CLIENT_ID" \
+  --client-secret "$CLIENT_SECRET"
+```
+
+<Warning>
+  Prefer environment variables for `--client-secret`. Passing it inline leaks
+  to shell history and process listings.
+</Warning>
+
+The `--credentials-out <path>` flag saves OAuth credentials to a file with `0600` permissions. Depending on the flow, the file may include an access token, refresh token, client ID, and client secret. Secret fields are redacted from stdout output. Use the saved file with `--credentials-file` on other commands.
+
+```bash
+mcpjam oauth login --url https://your-server.com/mcp \
+  --credentials-out creds.json
+
+# Then reuse across commands
+mcpjam tools list --url https://your-server.com/mcp --credentials-file creds.json
+mcpjam server doctor --url https://your-server.com/mcp --credentials-file creds.json
+```
+
+The `--debug-out <path>` flag captures a structured debug artifact with full HTTP traces — useful for filing bug reports or handing off to another engineer.
+
+```bash
+mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 \
+  --registration dcr \
+  --debug-out oauth-debug.json
+```
+
+### `oauth metadata`
+
+Fetch and display OAuth metadata from a URL. Useful for verifying your server's discovery endpoints are correct.
+
+```bash
+mcpjam oauth metadata --url https://your-server.com/.well-known/oauth-protected-resource
+mcpjam oauth metadata --url https://auth.example.com/.well-known/oauth-authorization-server
+```
+
+### `oauth proxy`
+
+Send an arbitrary HTTP request through the SSRF-hardened OAuth proxy. Useful for testing individual OAuth endpoints (registration, token, etc.) without building raw HTTP requests.
+
+Private targets — loopback, your LAN, or a hostname that resolves to one — are reachable by default, since the CLI runs on your machine. Add `--https-only` to apply the hosted app's stricter policy instead. Neither mode will dial a link-local or cloud-metadata address, and neither sends a plaintext request to a public host.
+
+```bash
+# Test a DCR registration
+mcpjam oauth proxy \
+  --url https://auth.example.com/register \
+  --method POST \
+  --header "Content-Type: application/json" \
+  --body '{"redirect_uris":["http://localhost:8080/callback"],"client_name":"test"}'
+
+# Fetch an endpoint
+mcpjam oauth proxy --url https://auth.example.com/v1/oauth2/token --method GET
+```
+
+### `oauth debug-proxy`
+
+Same as `oauth proxy` but routes through the debug proxy path. Use when testing endpoints that behave differently for debug vs. production requests.
+
+## Login flags
+
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--url <url>` | Yes | | MCP server URL |
+| `--protocol-version <v>` | Yes | | `2025-03-26`, `2025-06-18`, `2025-11-25`, or `2026-07-28` |
+| `--registration <s>` | Yes | | `cimd`, `dcr`, or `preregistered` |
+| `--auth-mode <m>` | No | `interactive` | `headless`, `interactive`, or `client_credentials` |
+| `--client-id <id>` | No | | OAuth client ID (required for `preregistered`) |
+| `--client-secret <s>` | No | | OAuth client secret |
+| `--client-metadata-url <url>` | No | | CIMD metadata document URL |
+| `--redirect-url <url>` | No | Auto-generated | OAuth redirect URL |
+| `--scopes <scopes>` | No | | Space-separated scope string |
+| `--header <header>` | No | | HTTP header `Key: Value` (repeatable) |
+| `--step-timeout <ms>` | No | `30000` | Per-step timeout |
+| `--verify-tools` | No | | After login, connect and list tools |
+| `--verify-call-tool <name>` | No | | After listing, also call a named tool |
+| `--credentials-out <path>` | No | | Write OAuth credentials to file (mode 0600); stdout output has secret fields redacted |
+| `--debug-out <path>` | No | | Write debug artifact to file |
+
+<Note>
+  For interactive login, a custom `--redirect-url` must still be an
+  `http://localhost` or `http://127.0.0.1` loopback URL. Custom callback paths
+  are supported.
+</Note>
+
+## Using tokens from login
+
+### Credentials file (interactive & agent workflows)
+
+For interactive or agent workflows where you login once and run multiple commands, save credentials to a file:
+
+```bash
+# Login and save credentials
+mcpjam oauth login --url https://your-server.com/mcp --credentials-out creds.json
+
+# Reuse across commands
+mcpjam tools list --url https://your-server.com/mcp --credentials-file creds.json
+mcpjam server doctor --url https://your-server.com/mcp --credentials-file creds.json
+mcpjam protocol conformance --url https://your-server.com/mcp --credentials-file creds.json
+```
+
+The credentials file includes the server URL and any reusable OAuth credentials returned by the login flow. The CLI validates that the file's server URL matches the target and checks token expiry before use.
+
+Connected commands such as `tools list`, `resources list`, `prompts list`, and `server doctor` can use refresh-token credentials from the file when the saved access token is expired. `protocol conformance` and `server probe` only read a non-expired access token from the file; if the access token is expired, run `oauth login --credentials-out` again or pass a fresh token directly.
+
+<Note>
+  `--credentials-file` cannot be combined with `--access-token`, `--oauth-access-token`, `--refresh-token`, `--client-id`, or `--client-secret`. The CLI rejects conflicting auth sources upfront.
+</Note>
+
+### Direct token passing (CI/CD & M2M)
+
+When you already have a token from an environment variable, a secret store, or a `client_credentials` flow, pass it directly:
+
+```bash
+# From an environment variable or secret store
+mcpjam tools list --url https://your-server.com/mcp --access-token "$TOKEN"
+mcpjam server doctor --url https://your-server.com/mcp --oauth-access-token "$TOKEN"
+
+# M2M: preregistered client_credentials — token comes back on stdout
+TOKEN=$(mcpjam oauth login --url https://your-server.com/mcp \
+  --protocol-version 2025-11-25 --registration preregistered \
+  --auth-mode client_credentials \
+  --client-id "$CLIENT_ID" --client-secret "$CLIENT_SECRET" \
+  --format json | jq -r '.credentials.accessToken')
+
+mcpjam tools list --url https://your-server.com/mcp --access-token "$TOKEN"
+```
+
+You can also use `--refresh-token` with `--client-id` (and optionally `--client-secret`) for commands that support automatic token refresh.

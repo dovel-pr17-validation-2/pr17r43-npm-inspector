@@ -1,0 +1,119 @@
+/**
+ * "Evaluators", organized by the stage each one measures.
+ *
+ * THE PROBLEM THIS SOLVES. The settings sheet used to list Tool calls, Default
+ * checks and LLM as Judge as three unrelated rows, in the order the fields
+ * happen to be stored. A person could read the whole page and still not know
+ * which parts of their server the suite actually checks — the page described
+ * the storage, not the measurement.
+ *
+ * This section describes the measurement. The same fields, the same controls,
+ * now one table in user-value-chain order: connection, discovery, selection,
+ * tool call, response, user value. Each group names the question it answers
+ * and lists what will grade it.
+ *
+ * WHAT IT IS NOT. It shows no results. A chain is one trial's journey and a
+ * funnel is a population statistic; this is neither. Every chip here says what
+ * a grader IS (a gate, a warn, or a report), never what a run DID.
+ *
+ * The table is shared with a case's checks page (`CaseChecksPage`), which
+ * mounts the same `SuiteScorerTable` in case scope. Do not add a second list
+ * of the stages above it: one numbered 01–06 layout is the point.
+ */
+
+import type { UserValueStage } from "@mcpjam/sdk/contract";
+import type { EvalMatchOptions } from "@/shared/eval-matching";
+import type { Predicate } from "@mcpjam/sdk/predicates";
+import type { ModelDefinition } from "@/shared/types";
+import type { SuiteCapabilities } from "@/hooks/use-suite-capabilities";
+import { SuiteScorerTable } from "./suite-scorer-table";
+import type { GroundednessRunEvidence } from "./suite-judge-card";
+import type { EvalJudgeConfig, EvalJudgeRubric } from "./types";
+
+/**
+ * The section's own hint, hoisted so the settings sheet and its tests name the
+ * same sentence.
+ */
+export const PASS_OR_FAIL_HINT =
+  "Evaluators grade the evidence available for each iteration.";
+
+export const JUDGE_HINT =
+  "A judge scores iteration evidence from 0–1. Set goal completion to Required to let it fail a run.";
+
+export function SuitePassOrFailSection({
+  matchOptions,
+  onMatchOptionsChange,
+  predicates,
+  onPredicatesChange,
+  judgeConfig,
+  onJudgeConfigChange,
+  availableModels,
+  requireOrgKeys,
+  onManageOrgProviders,
+  onAddProvider,
+  scenarioMigrationNotice,
+  rubricEditor,
+  stageFacts,
+  capabilities,
+  groundednessEvidence,
+  judgeRubric,
+}: {
+  matchOptions: EvalMatchOptions | undefined;
+  onMatchOptionsChange: (next: EvalMatchOptions | undefined) => void;
+  predicates: Predicate[];
+  onPredicatesChange: (
+    next: Predicate[] | ((previous: Predicate[]) => Predicate[]),
+  ) => void;
+  judgeConfig: EvalJudgeConfig | undefined;
+  onJudgeConfigChange: (next: EvalJudgeConfig | undefined) => void;
+  availableModels: ModelDefinition[];
+  /** The organization requires its own provider keys for AI features. */
+  requireOrgKeys?: boolean;
+  /**
+   * Opens the organization's AI providers, for a viewer who may manage them
+   * while the organization requires its own keys (see `useAvailableModels`).
+   */
+  onManageOrgProviders?: () => void;
+  /**
+   * The same from a model search with no match, under any key policy, or
+   * `null` when the organization offers this viewer none.
+   */
+  onAddProvider: (() => void) | null;
+  /** The "migrate scenario assertions per case" warning, when the suite has any. */
+  scenarioMigrationNotice?: React.ReactNode;
+  /** S6 mounts the judge rubric editor under the user-value group. */
+  rubricEditor?: React.ReactNode;
+  /**
+   * Read-only config facts per stage, for the stages the runner measures.
+   *
+   * A ReactNode rather than data: the facts need live host/server queries, and
+   * this component is pure config-state rendering. The owner mounts them.
+   */
+  stageFacts?: Partial<Record<UserValueStage, React.ReactNode>>;
+  capabilities?: SuiteCapabilities | null;
+  groundednessEvidence?: GroundednessRunEvidence;
+  /** The suite's rubric; the rubric-checks card lists its criteria. */
+  judgeRubric?: EvalJudgeRubric;
+}) {
+  return (
+    <SuiteScorerTable
+      scope={{ kind: "suite", predicates, onPredicatesChange }}
+      matchOptions={matchOptions}
+      onMatchOptionsChange={onMatchOptionsChange}
+      judgeConfig={judgeConfig}
+      onJudgeConfigChange={onJudgeConfigChange}
+      availableModels={availableModels}
+      requireOrgKeys={requireOrgKeys}
+      onManageOrgProviders={onManageOrgProviders}
+      onAddProvider={onAddProvider}
+      scenarioMigrationNotice={scenarioMigrationNotice}
+      rubricEditor={rubricEditor}
+      stageFacts={stageFacts}
+      capabilities={capabilities}
+      passOrFailHint={PASS_OR_FAIL_HINT}
+      judgeHint={JUDGE_HINT}
+      groundednessEvidence={groundednessEvidence}
+      judgeRubric={judgeRubric}
+    />
+  );
+}

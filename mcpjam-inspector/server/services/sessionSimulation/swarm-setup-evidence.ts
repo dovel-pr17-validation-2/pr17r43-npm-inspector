@@ -1,0 +1,114 @@
+import {
+  entitiesFromResult,
+  GROUNDING_LIMITS,
+  parseJsonReport,
+  record,
+  exactIdentity,
+  type SetupRecord,
+  type SetupEntity,
+} from "../../../shared/swarm-grounding";
+export function parseSetupReport(text: string) {
+  const obj = record(parseJsonReport(text));
+  if (
+    !obj ||
+    typeof obj.ready !== "boolean" ||
+    !Array.isArray(obj.created) ||
+    !Array.isArray(obj.missing)
+  )
+    return undefined;
+  if (
+    obj.created.length > 25 ||
+    obj.missing.length > 25 ||
+    obj.created.some((c) => !record(c)) ||
+    obj.missing.some((m) => !record(m))
+  )
+    return undefined;
+  return {
+    ready: obj.ready,
+    created: obj.created as Record<string, unknown>[],
+    missing: obj.missing as Record<string, unknown>[],
+  };
+}
+export function deriveCreatedEntities(args: {
+  modelReport: ReturnType<typeof parseSetupReport>;
+  setup: SetupRecord;
+  toolResults: Map<number, unknown>;
+}) {
+  const all: SetupEntity[] = [];
+  const seen = new Set<string>();
+  for (const [callIndex, output] of args.toolResults) {
+    const call = args.setup.toolCalls[callIndex];
+    if (!call?.ok || !call.isWrite || !call.dispatched) continue;
+    for (const { objectPath, ...entity } of entitiesFromResult(output)) {
+      const key = JSON.stringify([
+        call.serverId,
+        call.toolName,
+        entity.id ?? entity.name,
+      ]);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      all.push({
+        ...entity,
+        serverId: call.serverId,
+        tool: call.toolName,
+        evidence: { callIndex, objectPath },
+        ...(entity.name && !entity.name.startsWith(args.setup.prefix)
+          ? { unprefixed: true }
+          : {}),
+      });
+    }
+  }
+  let unsupportedClaims = 0;
+  for (const claim of args.modelReport?.created ?? []) {
+    const matches = all.filter(
+      (e) =>
+        (!claim.tool || claim.tool === e.tool) &&
+        (claim.id !== undefined
+          ? claim.id === e.id &&
+            (claim.name === undefined || claim.name === e.name)
+          : claim.name === e.name && !!e.name),
+    );
+    if (matches.length !== 1) unsupportedClaims++;
+  }
+  return {
+    createdEntities: all.slice(0, GROUNDING_LIMITS.entities),
+    observedCreatedEntityCount: all.length,
+    ...(all.length > GROUNDING_LIMITS.entities
+      ? { createdEntitiesTruncated: true }
+      : {}),
+    unsupportedClaims,
+    missing: (args.modelReport?.missing ?? []).map((m) => ({
+      kind: exactIdentity(m.kind) ?? "entity",
+      why: exactIdentity(m.why) ?? "Prerequisite unavailable",
+    })),
+  };
+}
+export function judgeReadiness(
+  setup: SetupRecord,
+  report: ReturnType<typeof parseSetupReport>,
+): Pick<SetupRecord, "readiness" | "reason"> {
+  if (setup.status === "skipped" && setup.reason === "no_eligible_write_tools")
+    return { readiness: "not_assessed", reason: setup.reason };
+  if (setup.createdEntitiesTruncated)
+    return { readiness: "unavailable", reason: "entity_record_limit" };
+  // Calls past the record limit aren't kept, so a failed or refused write
+  // among them can't be ruled out.
+  if (setup.toolCallsTruncated)
+    return { readiness: "unavailable", reason: "call_record_limit" };
+  if (setup.toolCalls.some((c) => c.isWrite && !c.ok))
+    return { readiness: "unavailable", reason: "write_errored" };
+  // Only what setup did can stop the target. The persona is seeded from write
+  // results, never from the model's report, so an unreadable, "missing" or
+  // overclaiming report is kept as the reason without blocking.
+  const reason = !report
+    ? "invalid_model_report"
+    : !report.ready || report.missing.length
+    ? "model_reported_missing"
+    : setup.unsupportedClaims
+    ? "unsupported_claim"
+    : undefined;
+  return {
+    readiness: setup.writeCallsDispatched > 0 ? "ready" : "not_needed",
+    ...(reason ? { reason } : {}),
+  };
+}

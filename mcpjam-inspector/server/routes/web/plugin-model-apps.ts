@@ -1,0 +1,393 @@
+import { pluginOperationRequest, pluginOperationAuthorization } from "../../../shared/plugin-operation-authorization.js";
+import { sandboxSourceReceipt } from "../../services/sandbox-view-source.js";
+import { preparePluginOperation, bindPluginOperation, cancelPluginOperation, receiptOnlyPorts } from "../../services/plugin-host/operation-authorization.js";
+import { assertPluginInstanceBindingCurrent } from "../../services/plugin-host/request-runtime.js";
+import { Hono, type Context } from "hono";
+import { PLUGIN_APP_UI_MAX_BYTES } from "../../../shared/plugin-app-ui-limits.js";
+import { z } from "zod";
+import { pluginModelContextParamsSchema } from "../../../shared/plugin-model-context.js";
+import { getToolVisibility } from "@mcpjam/sdk/widget-runtime";
+import type { PluginInstanceIdentity } from "../../services/plugin-host/instances.js";
+import type { PluginWorkspaceAdmission } from "../../services/plugin-host/admission.js";
+import { modelApps } from "../../services/plugin-host/model-apps.js";
+import { createPluginRequestRuntime } from "../../services/plugin-host/request-runtime.js";
+import { invokePluginRequest } from "../../services/plugin-host/request-invocation.js";
+import { PluginInvocationError } from "../../services/plugin-host/invocation.js";
+import { pluginResourceUri } from "../../services/plugin-host/bindings.js";
+import { widgetResourceContent } from "../../utils/widget-resource-content.js";
+import {
+  canSkipListingLookup,
+  findListingMetaForUri,
+} from "../../utils/ui-resource-meta.js";
+import { viewOriginLabelForConfig } from "../../utils/view-origin-label.js";
+import { openOwnedLocalFile } from "../../services/plugin-host/open-local-file.js";
+const scope = z.strictObject({
+  projectId: z.string().min(1).max(256),
+  pluginWorkspace: z.unknown(),
+});
+const handle = scope.extend({
+  instanceToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+});
+const call = handle.extend({
+  authorization: pluginOperationAuthorization.optional(),
+  invocationId: z.string().uuid(),
+  params: z.strictObject({
+    name: z.string().min(1).max(256),
+    arguments: z.record(z.string(), z.unknown()),
+  }),
+  approval: z
+    .strictObject({ id: z.string().max(4096), approved: z.boolean() })
+    .optional(),
+  resume: z.strictObject({
+    continuationId: z.string().min(1).max(256),
+    round: z.number().int().positive(),
+    responsesBlobId: z.string().min(1).max(512),
+  }).optional(),
+});
+const denied = () => new PluginInvocationError("MODEL_APP_UNAVAILABLE");
+export function pluginModelAppRoutes(ports: {
+  route: (c: Context, action: () => Promise<Response>) => Promise<Response>;
+  admitted: (
+    c: Context,
+    body: z.infer<typeof scope>,
+  ) => Promise<{
+    actor: PluginInstanceIdentity;
+    bearer: string;
+    admission: PluginWorkspaceAdmission;
+  }>;
+  cleanup: (
+    c: Context,
+    body: z.infer<typeof scope>,
+  ) => Promise<PluginInstanceIdentity>;
+}) {
+  const router = new Hono();
+  router.post("/open", (c) =>
+    ports.route(c, async () => {
+      const body = handle.parse(await c.req.json());
+      const { actor, bearer, admission } = await ports.admitted(c, body);
+      const record = modelApps.get(body.instanceToken, actor);
+      const runtime = createPluginRequestRuntime(
+        c,
+        admission,
+        bearer,
+        { hostId: record.owner.hostId, serverId: record.owner.owner.serverId },
+        record.owner,
+        { ownedForms: false },
+      );
+      const signal = AbortSignal.any([c.req.raw.signal, record.abort.signal]);
+      try {
+        const source = await runtime.resolve(record.toolName, signal);
+        if (
+          source.revision !== record.revision ||
+          pluginResourceUri(source.tool._meta) !== record.resourceUri
+        )
+          throw denied();
+        const resource = await source.manager.readResource(
+          record.owner.owner.serverId,
+          { uri: record.resourceUri },
+          { signal },
+        );
+        const content = resource.contents.find(
+          (item: { uri: string }) => item.uri === record.resourceUri,
+        );
+        const listingMeta = canSkipListingLookup(content?._meta)
+          ? undefined
+          : await findListingMetaForUri(
+              source.manager,
+              record.owner.owner.serverId,
+              record.resourceUri,
+            );
+        const widgetContent = widgetResourceContent(content, listingMeta);
+        if (
+          !widgetContent.mimeTypeValid ||
+          Buffer.byteLength(widgetContent.html, "utf8") > PLUGIN_APP_UI_MAX_BYTES
+        )
+          throw denied();
+        const fresh = await runtime.resolve(record.toolName, signal);
+        if (fresh.revision !== record.revision) throw denied();
+        await admission.revalidate({ signal });
+        modelApps.get(body.instanceToken, actor);
+        signal.throwIfAborted();
+        return c.json({
+          instanceToken: body.instanceToken,
+          instanceId: record.owner.owner.instanceId,
+          generation: 1,
+          operationId: record.owner.owner.instanceId,
+          resourceUri: record.resourceUri,
+          toolTitle: source.tool.title ?? source.tool.name,
+          toolMetadata: source.tool._meta,
+          appToolsEnabled: fresh.appToolsEnabled,
+          resourcesEnabled: fresh.resourcesEnabled,
+          localFilesAvailable: !!fresh.localFileTargetContract &&
+            fresh.extensions?.capabilities.localFiles !== false && fresh.extensions?.capabilities.fileViewers !== false,
+          contextEnabled: fresh.contextEnabled,
+          messageEnabled: fresh.messageEnabled,
+          contextSnapshot: record.context.snapshot(
+            record.owner.owner.instanceId,
+            record.owner.owner.generation,
+          ),
+          widgetContent: {
+            ...widgetContent,
+            sourceReceipt: await sandboxSourceReceipt(
+              c,
+              {
+                serverId: record.owner.owner.serverId,
+                resourceUri: record.resourceUri,
+                toolCallId: record.owner.owner.instanceId,
+              },
+              widgetContent.html,
+              widgetContent.csp,
+              body.projectId,
+            ),
+            permissive: false,
+            injectedOpenAiCompat: false,
+            viewOriginLabel: viewOriginLabelForConfig(
+              source.manager.getServerConfig(record.owner.owner.serverId),
+            ),
+          },
+        });
+      } finally {
+        await runtime.release();
+      }
+    }),
+  );
+  // Model Apps use their original immutable source, never a replacement instance.
+  for (const action of ["update", "read", "remove-all"] as const) {
+    router.post(action === "update" ? "/context" : `/context/${action}`, (c) =>
+      ports.route(c, async () => {
+        const raw = await c.req.json();
+        const schema =
+          action === "update"
+            ? handle.extend({
+                operationId: z.string().uuid(),
+                sequence: z.number().int().positive(),
+                params: pluginModelContextParamsSchema,
+                attach: z.literal("user").optional(),
+              })
+            : action === "remove-all"
+              ? handle.extend({
+                  operationId: z.string().uuid(),
+                  basis: z
+                    .number()
+                    .int()
+                    .nonnegative()
+                    .max(Number.MAX_SAFE_INTEGER),
+                })
+              : handle;
+        const body = schema.parse(raw);
+        const { actor, bearer, admission } = await ports.admitted(c, body);
+        const record = modelApps.get(body.instanceToken, actor);
+        const runtime = createPluginRequestRuntime(
+          c,
+          admission,
+          bearer,
+          {
+            hostId: record.owner.hostId,
+            serverId: record.owner.owner.serverId,
+          },
+          record.owner,
+          { ownedForms: false },
+        );
+        const signal = AbortSignal.any([c.req.raw.signal, record.abort.signal]);
+        try {
+          const fresh = await runtime.resolve(record.toolName, signal);
+          if (
+            !fresh.contextEnabled ||
+            fresh.revision !== record.revision ||
+            pluginResourceUri(fresh.tool._meta) !== record.resourceUri
+          )
+            throw denied();
+          await admission.revalidate({ signal });
+          modelApps.get(body.instanceToken, actor);
+          signal.throwIfAborted();
+          const id = record.owner.owner.instanceId;
+          const generation = record.owner.owner.generation;
+          // All admission awaits finish before this synchronous, bounded mutation.
+          if (action === "read")
+            return c.json(record.context.snapshot(id, generation));
+          if (action === "remove-all")
+            return c.json(
+              modelApps.removeContext(body.instanceToken, actor, {
+                operationId: raw.operationId,
+                basis: raw.basis,
+              }),
+            );
+          const result = modelApps.updateContext(
+            body.instanceToken,
+            actor,
+            {
+              operationId: raw.operationId,
+              sequence: raw.sequence,
+              params: raw.params,
+              ...(raw.attach === "user" ? { attach: "user" as const } : {}),
+            },
+            fresh.modelContextPolicy,
+          );
+          return c.json({
+            ...result,
+            snapshot: record.context.snapshot(id, generation),
+          });
+        } finally {
+          await runtime.release();
+        }
+      }),
+    );
+  }
+  router.post("/resources", (c) =>
+    ports.route(c, async () => {
+      const body = handle.extend({
+        operation: z.discriminatedUnion("method", [
+          z.strictObject({ method: z.literal("resources/read"), uri: z.string().min(1), _meta: z.record(z.string(), z.unknown()).optional() }),
+          z.strictObject({ method: z.enum(["resources/list", "resources/templates/list"]), cursor: z.string().optional() }),
+        ]),
+      }).parse(await c.req.json());
+      const { actor, bearer, admission } = await ports.admitted(c, body);
+      const record = modelApps.get(body.instanceToken, actor);
+      const runtime = createPluginRequestRuntime(c, admission, bearer,
+        { hostId: record.owner.hostId, serverId: record.owner.owner.serverId }, record.owner, { ownedForms: false });
+      const signal = AbortSignal.any([c.req.raw.signal, record.abort.signal]);
+      try {
+        const source = await runtime.resolve(record.toolName, signal);
+        if (source.revision !== record.revision || !source.resourcesEnabled) throw denied();
+        await admission.revalidate({ signal });
+        modelApps.get(body.instanceToken, actor);
+        signal.throwIfAborted();
+        const serverId = record.owner.owner.serverId;
+        const operation = body.operation;
+        const result = operation.method === "resources/read"
+          ? await source.manager.readResource(serverId, { uri: operation.uri, ...(operation._meta ? { _meta: operation._meta } : {}) }, { signal })
+          : operation.method === "resources/list"
+            ? await source.manager.listResources(serverId, operation.cursor !== undefined ? { cursor: operation.cursor } : undefined, { signal, cacheMode: "bypass" })
+            : await source.manager.listResourceTemplates(serverId, operation.cursor !== undefined ? { cursor: operation.cursor } : undefined, { signal, cacheMode: "bypass" });
+        const fresh = await runtime.resolve(record.toolName, signal);
+        if (fresh.revision !== record.revision || !fresh.resourcesEnabled) throw denied();
+        await admission.revalidate({ signal });
+        modelApps.get(body.instanceToken, actor);
+        signal.throwIfAborted();
+        return c.json(result);
+      } finally {
+        await runtime.release();
+      }
+    }),
+  );
+  router.post("/files/open", (c) =>
+    ports.route(c, async () => {
+      const body = handle.extend({ path: z.string().min(1).max(4096) }).parse(await c.req.json());
+      const { actor, bearer, admission } = await ports.admitted(c, body);
+      const record = modelApps.get(body.instanceToken, actor);
+      const runtime = createPluginRequestRuntime(c, admission, bearer,
+        { hostId: record.owner.hostId, serverId: record.owner.owner.serverId },
+        record.owner, { ownedForms: false });
+      const signal = AbortSignal.any([c.req.raw.signal, record.abort.signal]);
+      const verify = async () => {
+        const source = await runtime.resolve(record.toolName, signal);
+        await admission.revalidate({ signal });
+        if (source.revision !== record.revision || pluginResourceUri(source.tool._meta) !== record.resourceUri)
+          throw denied();
+        modelApps.get(body.instanceToken, actor);
+        signal.throwIfAborted();
+      };
+      try {
+        await verify();
+        return c.json(await openOwnedLocalFile({
+          current: await runtime.catalog(signal), actorId: actor.actorId,
+          projectId: actor.projectId, serverId: record.owner.owner.serverId,
+          bearer, path: body.path, signal, verify,
+        }));
+      } finally { await runtime.release(); }
+    }),
+  );
+  router.post("/call", (c) =>
+    ports.route(c, async () => {
+      const body = call.parse(await c.req.json());
+      const { actor, bearer, admission } = await ports.admitted(c, body);
+      const record = modelApps.get(body.instanceToken, actor);
+      const authorization = await bindPluginOperation(c, record.owner,
+        { invocationId: body.invocationId, params: body.params, origin: "app" }, body.authorization,
+        AbortSignal.any([c.req.raw.signal, record.abort.signal]));
+      try {
+      const runtime = createPluginRequestRuntime(
+        c,
+        admission,
+        bearer,
+        { hostId: record.owner.hostId, serverId: record.owner.owner.serverId },
+        record.owner,
+      );
+      return await invokePluginRequest(c, {
+    receiptOnly: authorization.receiptOnly,
+        actor,
+        owner: record.owner.owner,
+        admission,
+        runtime,
+        origin: "app",
+        invocationId: body.invocationId,
+        params: body.params,
+        approval: body.approval,
+        resume: body.resume,
+        assertLive: () => {
+          modelApps.get(body.instanceToken, actor);
+        },
+        resolve: async (name, signal, read) => {
+          // Source and requested tool must come from the same freshly authorized
+          // catalog. Resolving them separately doubles every admission fence.
+          const tools = await runtime.resolveTools(
+            [record.toolName, name],
+            signal,
+            read,
+          );
+          const source = tools.get(record.toolName)!;
+          if (
+            source.revision !== record.revision ||
+            pluginResourceUri(source.tool._meta) !== record.resourceUri
+          )
+            throw denied();
+          return tools.get(name)!;
+        },
+        assertOrigin: (resolved) => {
+          if (
+            !resolved.appToolsEnabled ||
+            !getToolVisibility(resolved.tool._meta).includes("app")
+          )
+            throw denied();
+        },
+        invoke: (invocationPorts, params) =>
+          record.invoker.invoke(
+            receiptOnlyPorts(invocationPorts, authorization.receiptOnly),
+            "app",
+            body.invocationId,
+            params,
+            AbortSignal.any([c.req.raw.signal, record.abort.signal]),
+          ),
+      });
+      } finally { authorization.dispose(); }
+    }),
+  );
+  router.post("/renew", (c) =>
+    ports.route(c, async () => {
+      const body = handle.extend({ operation: pluginOperationRequest.optional(), cancelAuthorization: pluginOperationAuthorization.optional() }).parse(await c.req.json());
+      const { actor, admission, bearer } = await ports.admitted(c, body);
+      const record = modelApps.get(body.instanceToken, actor);
+      let operationAuthorization;
+      if (body.operation || body.cancelAuthorization) {
+        await assertPluginInstanceBindingCurrent({ admission, bearer, instance: record.owner, signal: c.req.raw.signal });
+        if (body.cancelAuthorization) await cancelPluginOperation(c, body.cancelAuthorization, record.owner);
+        if (body.operation) {
+          if (body.operation.kind !== "call" || !body.operation.params) throw denied();
+          operationAuthorization = await preparePluginOperation(c, record.owner,
+            { invocationId: body.operation.invocationId, params: body.operation.params, origin: "app" },
+            body.operation.requestId, record.abort.signal);
+        }
+      }
+      return c.json({ status: "renewed", expiresAt: modelApps.renew(body.instanceToken, actor),
+        ...(operationAuthorization ? { operationAuthorization } : {}) });
+    }),
+  );
+  router.post("/close", (c) =>
+    ports.route(c, async () => {
+      const body = handle.parse(await c.req.json());
+      modelApps.close(body.instanceToken, await ports.cleanup(c, body));
+      return c.json({ closed: true });
+    }),
+  );
+  return router;
+}

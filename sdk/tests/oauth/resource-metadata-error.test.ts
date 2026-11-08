@@ -1,0 +1,379 @@
+import {
+  discoverOAuthMetadata,
+  discoverOAuthProtectedResourceMetadata,
+} from "../../src/oauth/browser-auth.js";
+import {
+  describeResourceMetadataRequestFailure,
+  isResourceMetadataNotImplemented,
+  RESOURCE_METADATA_NO_RESPONSE,
+  RESOURCE_METADATA_NOT_IMPLEMENTED,
+} from "../../src/oauth/state-machines/shared/resource-metadata-error.js";
+
+describe("describeResourceMetadataRequestFailure", () => {
+  it("wraps an Error with its message", () => {
+    expect(
+      describeResourceMetadataRequestFailure(new Error("boom"))
+    ).toBe("Failed to request resource metadata: boom");
+  });
+
+  it("stringifies whatever else was thrown", () => {
+    expect(describeResourceMetadataRequestFailure("boom")).toBe(
+      "Failed to request resource metadata: boom"
+    );
+  });
+});
+
+describe("isResourceMetadataNotImplemented", () => {
+  // The bare form is what `discoverOAuthProtectedResourceMetadata` throws; the
+  // wrapped form is what the era machines put into flow state, and the wrapped
+  // form is the one the inspector sees.
+  it("matches the bare message", () => {
+    expect(isResourceMetadataNotImplemented(RESOURCE_METADATA_NOT_IMPLEMENTED)).toBe(
+      true
+    );
+  });
+
+  it("matches the message as the machines compose it", () => {
+    expect(
+      isResourceMetadataNotImplemented(
+        describeResourceMetadataRequestFailure(
+          new Error(RESOURCE_METADATA_NOT_IMPLEMENTED)
+        )
+      )
+    ).toBe(true);
+  });
+
+  // Narrow on purpose: these can be MCPJam's own fault — the hosted fetch path
+  // breaking surfaces through the same step — so they must stay reportable.
+  it.each([
+    "Failed to request resource metadata: HTTP 500 trying to load well-known OAuth protected resource metadata.",
+    "Failed to request resource metadata: Failed to fetch",
+    "Failed to request resource metadata: Unexpected token '<'",
+    `Failed to request resource metadata: ${RESOURCE_METADATA_NO_RESPONSE}`,
+  ])("does not match another reason for the same step: %s", (message) => {
+    expect(isResourceMetadataNotImplemented(message)).toBe(false);
+  });
+
+  it("does not match a message that merely contains it", () => {
+    // Exact match, not substring — a server echoing our text back inside a
+    // larger error is not the same finding.
+    expect(
+      isResourceMetadataNotImplemented(
+        `upstream said: ${RESOURCE_METADATA_NOT_IMPLEMENTED}`
+      )
+    ).toBe(false);
+  });
+
+  it("does not match an unrelated step failure", () => {
+    expect(isResourceMetadataNotImplemented("token exchange failed: 401")).toBe(
+      false
+    );
+  });
+});
+
+describe("discoverOAuthProtectedResourceMetadata failure messages", () => {
+  const SERVER_URL = "https://mcp.example.com/mcp";
+
+  it("throws the not-implemented sentinel for a 404", async () => {
+    const fetchFn = vi.fn(async () => new Response("", { status: 404 }));
+
+    await expect(
+      discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+    ).rejects.toThrow(RESOURCE_METADATA_NOT_IMPLEMENTED);
+  });
+
+  // A transport failure is not evidence the server lacks the document — the
+  // debugger's requests go through our own proxy, so it may be MCPJam that is
+  // down. It must not share the sentinel the inspector suppresses.
+  it("throws a distinct error when every attempt fails at the transport", async () => {
+    const fetchFn = vi.fn(async () => {
+      throw new TypeError("Failed to fetch");
+    });
+
+    const error = await discoverOAuthProtectedResourceMetadata(
+      SERVER_URL,
+      undefined,
+      fetchFn
+    ).catch((caught: unknown) => caught);
+
+    expect(fetchFn).toHaveBeenCalled();
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe(RESOURCE_METADATA_NO_RESPONSE);
+    expect(
+      isResourceMetadataNotImplemented(
+        describeResourceMetadataRequestFailure(error)
+      )
+    ).toBe(false);
+  });
+
+  // Discovery tries the path-specific URL first and falls back to the root.
+  // A transport failure on the first attempt followed by a root 404 must not
+  // read as "not implemented": the server may publish PRM only at the path we
+  // never reached.
+  it("does not call it not-implemented when an earlier attempt got no response", async () => {
+    const fetchFn = vi.fn(async (url: string | URL) => {
+      if (String(url).endsWith("/.well-known/oauth-protected-resource/mcp")) {
+        throw new TypeError("Failed to fetch");
+      }
+      return new Response("", { status: 404 });
+    });
+
+    await expect(
+      discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+    ).rejects.toThrow(RESOURCE_METADATA_NO_RESPONSE);
+    expect(fetchFn).toHaveBeenCalledWith(
+      new URL("https://mcp.example.com/.well-known/oauth-protected-resource"),
+      expect.anything()
+    );
+  });
+
+  // CQT-16: a catch-all server answers the well-known path with its HTML
+  // landing page and a 200.
+  it("names the content type when a 200 body is not JSON", async () => {
+    const fetchFn = vi.fn(
+      async () =>
+        new Response("<!doctype html><html></html>", {
+          status: 200,
+          headers: { "content-type": "text/html; charset=utf-8" },
+        })
+    );
+
+    await expect(
+      discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+    ).rejects.toThrow(
+      "Protected resource metadata is not valid JSON (got text/html)."
+    );
+  });
+
+  it("still calls it not-implemented when every attempt was a real 404", async () => {
+    const fetchFn = vi.fn(async () => new Response("", { status: 404 }));
+
+    await expect(
+      discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+    ).rejects.toThrow(RESOURCE_METADATA_NOT_IMPLEMENTED);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+
+  describe("redirects", () => {
+    const metadata = {
+      resource: SERVER_URL,
+      authorization_servers: ["https://auth.example.com"],
+    };
+    const redirect = (location: string, status = 302) =>
+      new Response("", { status, headers: { location } });
+
+    // The hosted debugger proxy answers redirects manually, one hop per call,
+    // so discovery has to follow them itself (MCPJ-9).
+    it.each([301, 302, 303, 307, 308])(
+      "follows a %s to the document",
+      async (status) => {
+        const fetchFn = vi.fn(async (url: string | URL) =>
+          String(url).startsWith("https://docs.example.com/")
+            ? Response.json(metadata)
+            : redirect("https://docs.example.com/prm.json", status)
+        );
+
+        await expect(
+          discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+        ).resolves.toEqual(metadata);
+        expect(fetchFn).toHaveBeenLastCalledWith(
+          new URL("https://docs.example.com/prm.json"),
+          expect.objectContaining({
+            headers: expect.objectContaining({ Accept: "application/json" }),
+          })
+        );
+      }
+    );
+
+    it("resolves a relative Location against the redirecting URL", async () => {
+      const fetchFn = vi.fn(async (url: string | URL) =>
+        String(url).endsWith("/v2/prm")
+          ? Response.json(metadata)
+          : redirect("/v2/prm")
+      );
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+      ).resolves.toEqual(metadata);
+      expect(fetchFn).toHaveBeenLastCalledWith(
+        new URL("https://mcp.example.com/v2/prm"),
+        expect.anything()
+      );
+    });
+
+    // A path-relative value resolves differently against the issuer and against
+    // the hop that answered, so this one pins which base is used.
+    it("resolves a path-relative Location against the current hop", async () => {
+      const fetchFn = vi.fn(async (url: string | URL) =>
+        String(url).endsWith("/prm.json")
+          ? Response.json(metadata)
+          : redirect("prm.json")
+      );
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+      ).resolves.toEqual(metadata);
+      expect(fetchFn).toHaveBeenLastCalledWith(
+        new URL(
+          "https://mcp.example.com/.well-known/oauth-protected-resource/prm.json"
+        ),
+        expect.anything()
+      );
+    });
+
+    it("falls back to the root when a redirect ends in a 404", async () => {
+      const fetchFn = vi.fn(async (url: string | URL) => {
+        const href = String(url);
+        if (href.endsWith("/.well-known/oauth-protected-resource/mcp")) {
+          return redirect("https://docs.example.com/missing");
+        }
+        if (href.startsWith("https://docs.example.com/")) {
+          return new Response("", { status: 404 });
+        }
+        return Response.json(metadata);
+      });
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+      ).resolves.toEqual(metadata);
+      expect(fetchFn).toHaveBeenLastCalledWith(
+        new URL("https://mcp.example.com/.well-known/oauth-protected-resource"),
+        expect.anything()
+      );
+    });
+
+    it("follows the redirect of an explicit resource_metadata URL", async () => {
+      const fetchFn = vi.fn(async (url: string | URL) =>
+        String(url) === "https://mcp.example.com/prm"
+          ? redirect("https://mcp.example.com/prm/")
+          : Response.json(metadata)
+      );
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(
+          SERVER_URL,
+          { resourceMetadataUrl: "https://mcp.example.com/prm" },
+          fetchFn
+        )
+      ).resolves.toEqual(metadata);
+      expect(fetchFn).toHaveBeenCalledTimes(2);
+    });
+
+    it("never follows an HTTPS document down to HTTP", async () => {
+      const fetchFn = vi.fn(async () => redirect("http://mcp.example.com/prm"));
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(
+          SERVER_URL,
+          { resourceMetadataUrl: "https://mcp.example.com/prm" },
+          fetchFn
+        )
+      ).rejects.toThrow(
+        "HTTP 302: Refused redirect to http://mcp.example.com/prm: metadata discovery never downgrades HTTPS to HTTP"
+      );
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([
+      [
+        "javascript:alert(1)",
+        "HTTP 302: Refused redirect to javascript: URL: metadata discovery only follows HTTP(S)",
+      ],
+      [
+        "data:application/json,{}",
+        "HTTP 302: Refused redirect to data: URL: metadata discovery only follows HTTP(S)",
+      ],
+      [
+        "http://[",
+        "HTTP 302: Refused redirect to http://[: not a valid URL",
+      ],
+    ])("refuses a Location of %s and says why", async (location, message) => {
+      const fetchFn = vi.fn(async () => redirect(location));
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(
+          SERVER_URL,
+          { resourceMetadataUrl: "https://mcp.example.com/prm" },
+          fetchFn
+        )
+      ).rejects.toThrow(message);
+      expect(fetchFn).toHaveBeenCalledTimes(1);
+    });
+
+    it("stops after a bounded number of hops", async () => {
+      let hop = 0;
+      const fetchFn = vi.fn(async () =>
+        redirect(`https://mcp.example.com/loop/${++hop}`)
+      );
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(
+          SERVER_URL,
+          { resourceMetadataUrl: "https://mcp.example.com/prm" },
+          fetchFn
+        )
+      ).rejects.toThrow(
+        "HTTP 302: Stopped after 5 redirects; last Location was https://mcp.example.com/loop/6"
+      );
+      expect(fetchFn).toHaveBeenCalledTimes(6);
+    });
+
+    it("keeps a redirect without a Location as the failure it is", async () => {
+      const fetchFn = vi.fn(async () => new Response("", { status: 302 }));
+
+      await expect(
+        discoverOAuthProtectedResourceMetadata(
+          SERVER_URL,
+          { resourceMetadataUrl: "https://mcp.example.com/prm" },
+          fetchFn
+        )
+      ).rejects.toThrow(
+        "HTTP 302 trying to load well-known OAuth protected resource metadata."
+      );
+    });
+  });
+
+  it("uses the fallback document when the root serves it", async () => {
+    const metadata = {
+      resource: SERVER_URL,
+      authorization_servers: ["https://auth.example.com"],
+    };
+    const fetchFn = vi.fn(async (url: string | URL) => {
+      if (String(url).endsWith("/mcp")) {
+        throw new TypeError("Failed to fetch");
+      }
+      return Response.json(metadata);
+    });
+
+    await expect(
+      discoverOAuthProtectedResourceMetadata(SERVER_URL, undefined, fetchFn)
+    ).resolves.toEqual(metadata);
+  });
+});
+
+describe("discoverOAuthMetadata redirects", () => {
+  it("follows a redirect to the authorization server metadata", async () => {
+    const metadata = {
+      issuer: "https://auth.example.com",
+      authorization_endpoint: "https://auth.example.com/authorize",
+      token_endpoint: "https://auth.example.com/token",
+      response_types_supported: ["code"],
+    };
+    const fetchFn = vi.fn(async (url: string | URL) =>
+      String(url).startsWith("https://login.example.com/")
+        ? Response.json(metadata)
+        : new Response("", {
+            status: 301,
+            headers: {
+              location:
+                "https://login.example.com/.well-known/oauth-authorization-server",
+            },
+          })
+    );
+
+    await expect(
+      discoverOAuthMetadata("https://auth.example.com", undefined, fetchFn)
+    ).resolves.toEqual(metadata);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+  });
+});

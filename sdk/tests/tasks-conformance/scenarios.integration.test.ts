@@ -1,0 +1,699 @@
+/**
+ * The scenario depth added by the conformance-gap program, driven end to end
+ * against the extension fixture over a real socket.
+ *
+ * Each check is asserted in BOTH directions — a conformant fixture passes, and
+ * a fixture breaking exactly one rule fails and names it — for the same reason
+ * `runner-fixture.integration.test.ts` gives: a check that has only ever been
+ * seen pass is a check nobody has proven can fail.
+ */
+
+import { afterEach, describe, expect, it } from "vitest";
+import { MCPTasksConformanceTest } from "../../src/tasks-conformance/index.js";
+import type {
+  MCPTasksCheckId,
+  MCPTasksCheckResult,
+  MCPTasksConformanceResult,
+} from "../../src/tasks-conformance/index.js";
+import {
+  DEFAULT_INPUT_REQUEST_KEY,
+  EXTENSION_PROTOCOL_VERSION,
+  TASK_TOOL_NAME,
+  defaultTaskPhases,
+  failedTaskPhases,
+  serveExtensionTasksFixture,
+  taskTool,
+  type ExtensionTasksFixtureOptions,
+  type ServedExtensionTasksFixture,
+  type TaskPhase,
+} from "../support/extension-tasks-fixture.js";
+
+const opened: ServedExtensionTasksFixture[] = [];
+
+afterEach(async () => {
+  for (const fixture of opened.splice(0)) {
+    await fixture.close().catch(() => {});
+  }
+});
+
+/** Completes on the second poll without ever asking for input. */
+function quickPhases(): TaskPhase[] {
+  return [
+    { status: "working", ttlMs: 60_000, pollIntervalMs: 5 },
+    {
+      status: "completed",
+      ttlMs: 30_000,
+      result: { content: [{ type: "text", text: "done" }], isError: false },
+    },
+  ];
+}
+
+async function serve(
+  phases: TaskPhase[],
+  options: ExtensionTasksFixtureOptions = {},
+): Promise<ServedExtensionTasksFixture> {
+  const fixture = await serveExtensionTasksFixture({
+    tools: { [TASK_TOOL_NAME]: taskTool(phases) },
+    ...options,
+  });
+  opened.push(fixture);
+  return fixture;
+}
+
+async function run(
+  fixture: ServedExtensionTasksFixture,
+  checkIds: MCPTasksCheckId[],
+  overrides: Record<string, unknown> = {},
+): Promise<MCPTasksConformanceResult> {
+  return await new MCPTasksConformanceTest({
+    url: fixture.url,
+    mcpProtocolVersion: EXTENSION_PROTOCOL_VERSION,
+    timeout: 10_000,
+    toolName: TASK_TOOL_NAME,
+    pollTimeoutMs: 5_000,
+    checkIds,
+    ...overrides,
+  } as never).run();
+}
+
+function check(
+  result: MCPTasksConformanceResult,
+  id: MCPTasksCheckId,
+): MCPTasksCheckResult {
+  const found = result.checks.find((entry) => entry.id === id);
+  if (!found) throw new Error(`check ${id} was not produced`);
+  return found;
+}
+
+describe("tasks-invalid-task-id-rejected", () => {
+  const ID: MCPTasksCheckId = "tasks-invalid-task-id-rejected";
+
+  it("passes a server that answers -32602 for an id it never issued", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("fails a server that fabricates a task for an unknown id", async () => {
+    const fixture = await serve(quickPhases(), {
+      misbehave: { answerUnknownTaskId: true },
+    });
+    const entry = check(await run(fixture, [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("answered instead of rejected");
+  });
+
+  it("only ADVISES when the mutating methods use another code", async () => {
+    // tasks.md:795 makes -32602 a MUST for `tasks/get` and a SHOULD for
+    // `tasks/update` and `tasks/cancel`, so the same wrong answer must not
+    // fail on the two where the spec only recommends it.
+    const fixture = await serve(quickPhases(), {
+      unknownTaskCodeForMutations: -32603,
+    });
+    const result = await run(fixture, [ID]);
+    const entry = check(result, ID);
+    expect(entry.status).toBe("passed");
+    expect(entry.warnings).toBeUndefined();
+    const advice = result.readiness?.find(
+      (warning) => warning.id === "tasks-readiness-unknown-task-id-mutations"
+    );
+    expect(advice).toMatchObject({
+      specStrength: "SHOULD",
+      informational: true,
+    });
+    expect(advice?.message).toContain("tasks/update");
+    expect(advice?.title).toBe("Unknown Task Id On Update And Cancel");
+  });
+
+  it("leaves out advice the caller did not pick", async () => {
+    const fixture = await serve(quickPhases(), {
+      unknownTaskCodeForMutations: -32603,
+    });
+    const result = await run(fixture, [ID], { readinessIds: [] });
+    expect(check(result, ID).status).toBe("passed");
+    expect(result.readiness).toBeUndefined();
+  });
+
+  it("runs even when no task could be created", async () => {
+    // It probes a FABRICATED id, so it establishes a real requirement on a run
+    // that could not provoke a task at all — where every other lifecycle check
+    // can only report a gap.
+    const fixture = await serve(quickPhases());
+    const entry = check(await run(fixture, [ID], { toolName: undefined }), ID);
+    expect(entry.status).toBe("passed");
+  });
+});
+
+describe("tasks-status-payload-shape", () => {
+  const ID: MCPTasksCheckId = "tasks-status-payload-shape";
+
+  it("passes a completed task that carries its result", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("fails a completed task with no result field", async () => {
+    const phases = quickPhases();
+    phases[1] = { ...phases[1]!, omit: ["result"] };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("`result`");
+  });
+
+  it("grades a frame the DECODED task never even reported", async () => {
+    // Two properties at once, and the second is the stronger one.
+    //
+    // (1) Every observed payload is graded, not just the state the task ended
+    //     in — `inspectedPayloads` is 3 here.
+    // (2) The violating frame is one the client never surfaced AT ALL: without
+    //     `inputRequests` the decoder cannot resolve the `input_required`
+    //     variant, so the update-ack check beside this one reports the task
+    //     "never reported input_required". A check reading the decoded task
+    //     would therefore see nothing wrong; the wire is the only witness.
+    const result = await run(
+      await serve([
+        { status: "working", ttlMs: 60_000, pollIntervalMs: 5 },
+        { status: "input_required", polls: 1, omit: ["inputRequests"] },
+        {
+          status: "completed",
+          ttlMs: 30_000,
+          result: { content: [{ type: "text", text: "done" }], isError: false },
+        },
+      ]),
+      [ID, "tasks-update-ack-shape"],
+      {
+        inputResponses: {
+          [DEFAULT_INPUT_REQUEST_KEY]: {
+            result: { action: "accept", content: { name: "Ada" } },
+          },
+        },
+      },
+    );
+
+    const entry = check(result, ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("input_required");
+    expect(entry.error?.message).toContain("`inputRequests`");
+    expect(Number(entry.details?.inspectedPayloads)).toBeGreaterThan(1);
+
+    // The decoded view never saw the state the raw frame was rejected for.
+    expect(
+      check(result, "tasks-update-ack-shape").error?.message,
+    ).toContain("never reported input_required");
+  });
+
+  it("reports a repeated bad snapshot once, not once per poll", async () => {
+    // The fixture re-sends its `input_required` snapshot on every poll while
+    // the gate is open. One finding, not N copies of it.
+    const phases = defaultTaskPhases();
+    const gateIndex = phases.findIndex(
+      (phase) => phase.status === "input_required",
+    );
+    phases[gateIndex] = { ...phases[gateIndex]!, omit: ["inputRequests"] };
+
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    const occurrences = (
+      entry.error?.message.match(/`inputRequests`/g) ?? []
+    ).length;
+    expect(occurrences).toBe(1);
+    expect(Number(entry.details?.inspectedPayloads)).toBeGreaterThan(1);
+  });
+
+  it("fails a failed task with no error field, which the client itself rejects", async () => {
+    // The reason this check reads RAW frames. The SDK's payload schema refuses
+    // a `failed` task carrying no `error`, so the decoded task never reaches a
+    // check at all — reading it would score this server green on exactly the
+    // state the check exists to catch.
+    const phases = failedTaskPhases();
+    phases[phases.length - 1] = {
+      ...phases[phases.length - 1]!,
+      omit: ["error"],
+    };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("`error`");
+  });
+
+  it("advises, as a SHOULD, when a failed task carries no statusMessage", async () => {
+    // tasks.md:835 — the response "SHOULD include a `statusMessage`".
+    const phases = failedTaskPhases();
+    phases[phases.length - 1] = {
+      ...phases[phases.length - 1]!,
+      statusMessage: undefined,
+    };
+    const result = await run(await serve(phases), [ID]);
+    const entry = check(result, ID);
+    expect(entry.status).toBe("passed");
+    expect(entry.warnings).toBeUndefined();
+    expect(result.readiness).toEqual([
+      expect.objectContaining({
+        id: "tasks-readiness-failed-status-message",
+        specStrength: "SHOULD",
+        informational: true,
+      }),
+    ]);
+    expect(result.uncheckedAdvice).toBeUndefined();
+  });
+
+  it("says the failed-task advice was not checked when the task did not fail", async () => {
+    const result = await run(await serve(quickPhases()), [ID]);
+    expect(result.readiness).toBeUndefined();
+    expect(result.uncheckedAdvice).toEqual([
+      {
+        id: "tasks-readiness-failed-status-message",
+        title: "Failed Task Status Message",
+        reason:
+          "Not checked: the task didn't fail, so there was no failure reason to look at.",
+      },
+    ]);
+  });
+
+  it("reports neither when a failed task carries a statusMessage", async () => {
+    const result = await run(await serve(failedTaskPhases()), [ID]);
+    expect(result.readiness).toBeUndefined();
+    expect(result.uncheckedAdvice).toBeUndefined();
+  });
+
+  it("leaves out the not-checked line when the advice was not picked", async () => {
+    const result = await run(await serve(quickPhases()), [ID], {
+      readinessIds: ["tasks-readiness-unknown-task-id-mutations"],
+    });
+    expect(result.uncheckedAdvice).toBeUndefined();
+  });
+});
+
+describe("tasks-cancel-ack-shape", () => {
+  const ID: MCPTasksCheckId = "tasks-cancel-ack-shape";
+
+  it("passes an empty acknowledgement", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("does not require the task to become cancelled", async () => {
+    // The spec is explicit that cancellation is eventually consistent and the
+    // status "MAY remain working … and MAY ultimately reach a terminal status
+    // other than cancelled". A check demanding `cancelled` would fail servers
+    // for behavior the extension permits, so this pins that it does not.
+    const fixture = await serve(quickPhases());
+    const result = await run(fixture, [ID]);
+    expect(check(result, ID).status).toBe("passed");
+    // The fixture saw the cancel and the task still ended non-`cancelled`,
+    // which is exactly the state the spec permits and the check must accept.
+    const task = fixture.tasks()[0];
+    expect(task?.cancelRequested).toBe(true);
+  });
+});
+
+describe("tasks-ttl-integer-shape", () => {
+  const ID: MCPTasksCheckId = "tasks-ttl-integer-shape";
+
+  it("passes integer milliseconds", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("fails a fractional ttlMs", async () => {
+    const phases = quickPhases();
+    phases[1] = { ...phases[1]!, ttlMs: 1500.5 };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("not an integer");
+  });
+
+  it("fails a fractional pollIntervalMs on a mid-run poll even when the final task is clean", async () => {
+    const phases: TaskPhase[] = [
+      { status: "working", ttlMs: 60_000, pollIntervalMs: 5 },
+      { status: "working", pollIntervalMs: 2.5 },
+      {
+        status: "completed",
+        pollIntervalMs: 5,
+        result: { content: [{ type: "text", text: "done" }], isError: false },
+      },
+    ];
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain(
+      "tasks/get working: pollIntervalMs is 2.5, which is not an integer",
+    );
+  });
+
+  it("still judges the raw payloads when no tasks/get answer could be decoded", async () => {
+    const phases = quickPhases();
+    phases[0] = { ...phases[0]!, ttlMs: 1500.5 };
+    const entry = check(
+      await run(
+        await serve(phases, { misbehave: { getResultType: "bogus" } }),
+        [ID],
+      ),
+      ID,
+    );
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain(
+      "tools/call: ttlMs is 1500.5, which is not an integer",
+    );
+  });
+
+  it("still judges the creation payload when the client cannot decode it as a task", async () => {
+    const phases = quickPhases();
+    phases[0] = { ...phases[0]!, ttlMs: 1500.5 };
+    const entry = check(
+      await run(
+        await serve(phases, { misbehave: { omitCreateResultType: true } }),
+        [ID],
+      ),
+      ID,
+    );
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain(
+      "tools/call: ttlMs is 1500.5, which is not an integer",
+    );
+  });
+
+  it("does not treat an ordinary tool result that carries a taskId as a task", async () => {
+    const fixture = await serve(quickPhases(), {
+      tools: {
+        [TASK_TOOL_NAME]: {
+          mode: "sync",
+          result: {
+            content: [{ type: "text", text: "plain" }],
+            taskId: "not-a-task",
+            ttlMs: 1500.5,
+          },
+        },
+      },
+    });
+    const entry = check(await run(fixture, [ID]), ID);
+    expect(entry.status).toBe("skipped");
+  });
+
+  it("grades a discriminated creation result even when it carries extra content", async () => {
+    const phases = quickPhases();
+    phases[0] = {
+      ...phases[0]!,
+      ttlMs: 1500.5,
+      extra: { content: [{ type: "text", text: "extra" }] },
+    };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain(
+      "tools/call: ttlMs is 1500.5, which is not an integer",
+    );
+  });
+
+  it("fails a whole number beyond the schema's safe-integer range", async () => {
+    const phases = quickPhases();
+    phases[1] = { ...phases[1]!, ttlMs: Number.MAX_SAFE_INTEGER + 1 };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain(
+      "outside the schema's integer range",
+    );
+  });
+
+  it("passes a negative ttlMs, which the extension never forbids", async () => {
+    const phases = quickPhases();
+    phases[1] = { ...phases[1]!, ttlMs: -1 };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect([entry.status, entry.warnings]).toEqual(["passed", undefined]);
+  });
+
+  it("leaves an unlimited (null) TTL alone", async () => {
+    const phases = quickPhases();
+    phases[1] = { ...phases[1]!, ttlMs: null };
+    const entry = check(await run(await serve(phases), [ID]), ID);
+    expect([entry.status, entry.warnings]).toEqual(["passed", undefined]);
+  });
+});
+
+describe("tasks-update-ack-shape", () => {
+  const ID: MCPTasksCheckId = "tasks-update-ack-shape";
+  const RESPONSES = {
+    [DEFAULT_INPUT_REQUEST_KEY]: {
+      result: { action: "accept", content: { name: "Ada" } },
+    },
+  };
+
+  it("passes an empty acknowledgement", async () => {
+    const fixture = await serve(defaultTaskPhases());
+    const result = await run(fixture, [ID], { inputResponses: RESPONSES });
+    const entry = check(result, ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+    // The wire is the witness: a `tasks/update` really left the process.
+    expect(
+      fixture.received.filter((request) => request.method === "tasks/update"),
+    ).not.toHaveLength(0);
+  });
+
+  it("does not require the task to finish after the update", async () => {
+    // The extension lets an answered task go back to `working` or ask for more
+    // input, and sets no deadline. A task still running when polling gives up
+    // is behavior the spec permits, so the acknowledgement alone decides.
+    const phases = defaultTaskPhases().filter(
+      (phase) => phase.status !== "completed",
+    );
+    const entry = check(
+      await run(await serve(phases), [ID], {
+        inputResponses: RESPONSES,
+        pollTimeoutMs: 300,
+      }),
+      ID,
+    );
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("fails an acknowledgement that carries task state", async () => {
+    const entry = check(
+      await run(
+        await serve(defaultTaskPhases(), {
+          misbehave: { updateAckExtras: { status: "working" } },
+        }),
+        [ID],
+        { inputResponses: RESPONSES },
+      ),
+      ID,
+    );
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("empty result");
+    expect(entry.error?.message).toContain("status");
+  });
+
+  it("fails a success response whose result is not an object", async () => {
+    // The client rejects this locally, but it is the server's answer, not a
+    // rejection, so it is graded rather than read as could not run.
+    const entry = check(
+      await run(
+        await serve(defaultTaskPhases(), {
+          misbehave: { updateAckOverride: "ok" },
+        }),
+        [ID],
+        { inputResponses: RESPONSES },
+      ),
+      ID,
+    );
+    expect(entry.status).toBe("failed");
+    expect(entry.error?.message).toContain("did not return a result object");
+  });
+
+  it("is not applicable, naming what it needs, when no responses are configured", async () => {
+    // Answers are opt-in operator setup, not something the server owes.
+    const fixture = await serve(defaultTaskPhases());
+    const entry = check(await run(fixture, [ID]), ID);
+    expect([entry.status, entry.skipReason]).toEqual([
+      "skipped",
+      "not-applicable",
+    ]);
+    expect(entry.error?.message).toContain("inputResponses");
+    expect(entry.error?.message).toContain(DEFAULT_INPUT_REQUEST_KEY);
+  });
+
+  it("does not burn the poll timeout on an unanswerable task", async () => {
+    // Before this, an input-gated task polled to `pollTimeoutMs` to arrive at
+    // the state it was already in, and every dependent check reported its gap
+    // seconds later than it had to.
+    //
+    // Counted in REQUESTS, not wall-clock: the fixture parks on
+    // `input_required` with `pollIntervalMs: 20`, so burning a 5s timeout is
+    // ~250 `tasks/get` calls while stopping early is a handful. A count bound
+    // states that gap exactly and cannot go red because CI was slow.
+    const fixture = await serve(defaultTaskPhases());
+    await run(fixture, [ID], { pollTimeoutMs: 5_000 });
+    const polls = fixture.received.filter(
+      (request) => request.method === "tasks/get",
+    );
+    expect(polls.length).toBeLessThanOrEqual(12);
+  });
+
+  it("is not applicable when the task never asks for input", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.skipReason]).toEqual([
+      "skipped",
+      "not-applicable",
+    ]);
+  });
+
+  it("could not run when tasks/update is rejected", async () => {
+    // The MUST is conditioned on success and the answers are the operator's,
+    // so a rejection leaves nothing to grade rather than proving a defect.
+    const fixture = await serve(defaultTaskPhases(), {
+      rejectUpdateWithInvalidParams: true,
+    });
+    const entry = check(
+      await run(fixture, [ID], { inputResponses: RESPONSES }),
+      ID,
+    );
+    expect([entry.status, entry.skipReason]).toEqual([
+      "skipped",
+      "could-not-run",
+    ]);
+    expect(entry.error?.message).toContain("rejected");
+  });
+});
+
+describe("tasks-undeclared-capability-names-requirements", () => {
+  const ID: MCPTasksCheckId = "tasks-undeclared-capability-names-requirements";
+
+  it("passes when the -32021 names the missing capability", async () => {
+    const entry = check(await run(await serve(quickPhases()), [ID]), ID);
+    expect([entry.status, entry.error?.message]).toEqual(["passed", undefined]);
+  });
+
+  it("is a separate obligation from the rejection itself", async () => {
+    // A server can reject correctly and still say nothing about WHAT is
+    // missing, which leaves the client unable to act on the error. Both checks
+    // read one shared probe round, so this costs no extra traffic.
+    const result = await run(await serve(quickPhases()), [
+      "tasks-undeclared-capability-rejected",
+      ID,
+    ]);
+    expect(
+      result.checks.map((entry) => [entry.id, entry.status]).sort(),
+    ).toEqual([
+      ["tasks-undeclared-capability-names-requirements", "passed"],
+      ["tasks-undeclared-capability-rejected", "passed"],
+    ]);
+  });
+});
+
+describe("the mcp-tasks profile", () => {
+  it("fails the verdict on a promoted check", async () => {
+    // These checks landed pending, so a fixture that broke one was not called
+    // non-conformant. Since v2026-11-01.2 the profile scores every tasks
+    // check, so the same break now fails the run.
+    const fixture = await serve(quickPhases(), {
+      misbehave: { answerUnknownTaskId: true },
+    });
+    const result = await run(fixture, [
+      "tasks-invalid-task-id-rejected",
+      "tasks-wire-resolvable",
+    ]);
+    expect(check(result, "tasks-invalid-task-id-rejected").status).toBe(
+      "failed",
+    );
+    expect(result.outcome).toBe("failed");
+    expect(result.profile).toMatchObject({
+      profileId: "mcp-tasks",
+      pendingCheckIds: [],
+    });
+  });
+});
+
+describe("per-check task subjects", () => {
+  it("uses different tools and arguments without mixing task observations", async () => {
+    const fixture = await serve(quickPhases(), {
+      tools: {
+        success: taskTool(quickPhases()),
+        failure: taskTool(failedTaskPhases()),
+      },
+    });
+    const result = await run(
+      fixture,
+      ["tasks-inline-result", "tasks-status-payload-shape"],
+      {
+        toolName: "success",
+        toolArguments: { duration: 1 },
+        checkOverrides: {
+          "tasks-status-payload-shape": {
+            toolName: "failure",
+            toolArguments: { reason: "test" },
+          },
+        },
+      }
+    );
+    expect(result.checks.every((check) => check.status === "passed")).toBe(
+      true
+    );
+    const completed = check(result, "tasks-inline-result");
+    const failed = check(result, "tasks-status-payload-shape");
+    expect(completed.details?.toolName).toBe("success");
+    expect(failed.details?.toolName).toBe("failure");
+    expect(failed.details?.observedStatuses).toContain("failed");
+    expect(completed.details?.taskId).not.toBe(failed.details?.taskId);
+    expect(
+      fixture.received
+        .filter((r) => r.method === "tools/call")
+        .map((r) => r.params?.arguments)
+    ).toEqual([{ duration: 1 }, { reason: "test" }]);
+    expect(result.discovery.probedTool).toBeUndefined();
+  });
+  it("reuses a task for compatible reads and cancels a separate task before polling it", async () => {
+    const fixture = await serve(quickPhases());
+    const result = await run(fixture, [
+      "tasks-inline-result",
+      "tasks-ttl-shape",
+      "tasks-cancel-ack-shape",
+    ]);
+    const read = check(result, "tasks-inline-result").details?.taskId;
+    const cancel = check(result, "tasks-cancel-ack-shape").details?.taskId;
+    expect(check(result, "tasks-ttl-shape").details?.taskId).toBe(read);
+    expect(cancel).not.toBe(read);
+    expect(fixture.tasks()).toHaveLength(2);
+    expect(
+      fixture.received
+        .filter((r) => r.params?.taskId === cancel)
+        .map((r) => r.method)
+    ).toEqual(["tasks/cancel"]);
+  });
+  it("makes no tool calls for task-free checks, even with a suite default", async () => {
+    const fixture = await serve(quickPhases());
+    await run(fixture, [
+      "tasks-wire-resolvable",
+      "tasks-declaration-hygiene",
+      "tasks-invalid-task-id-rejected",
+    ]);
+    expect(
+      fixture.received.filter((r) => r.method === "tools/call")
+    ).toHaveLength(0);
+  });
+  it("sends update answers only to its own task and keeps the observed task independent", async () => {
+    const fixture = await serve(quickPhases(), {
+      tools: {
+        success: taskTool(quickPhases()),
+        input: taskTool(defaultTaskPhases()),
+      },
+    });
+    const result = await run(
+      fixture,
+      ["tasks-inline-result", "tasks-update-ack-shape"],
+      {
+        toolName: "success",
+        inputResponses: {
+          [DEFAULT_INPUT_REQUEST_KEY]: {
+            result: { action: "accept", content: { name: "Ada" } },
+          },
+        },
+        checkOverrides: { "tasks-update-ack-shape": { toolName: "input" } },
+      }
+    );
+    expect(result.checks.every((check) => check.status === "passed")).toBe(
+      true
+    );
+    const id = check(result, "tasks-update-ack-shape").details?.taskId;
+    expect(
+      fixture.received
+        .filter((r) => r.method === "tasks/update")
+        .map((r) => r.params?.taskId)
+    ).toEqual([id]);
+    expect(check(result, "tasks-inline-result").details?.taskId).not.toBe(id);
+  });
+});

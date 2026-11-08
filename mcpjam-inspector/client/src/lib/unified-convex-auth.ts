@@ -1,0 +1,499 @@
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import { useAuth as useWorkOSAuth } from "@workos-inc/authkit-react";
+import { isLoopbackOAuthUrl } from "@mcpjam/sdk/browser";
+import { isLoginRequiredError } from "@/lib/auth/login-required-error";
+import { HOSTED_MODE } from "@/lib/config";
+import { pauseQueriesBeforeAuthClear } from "@/lib/auth/pause-queries-before-auth-clear";
+import { reportCaught } from "@/lib/error-reporting";
+import { useSessionRefreshStore } from "@/stores/session-refresh-store";
+import {
+  forceRefreshGuestSessionOrThrow,
+  getCachedGuestSession,
+  getOrCreateGuestSessionOrThrow,
+  markGuestActivated,
+  getGuestSessionRefusal,
+  subscribeGuestSessionChanges,
+} from "@/lib/guest-session";
+import { shouldSkipGuestSession } from "@/lib/vanity-landing-hosts";
+import {
+  guestSessionFailureCode,
+  sanitizeGuestSessionFailureDetails,
+} from "@/shared/guest-session-failure";
+import { useGuestSessionRecovery } from "./use-guest-session-recovery";
+
+/** Stable token getters for Convex's public custom-auth provider. */
+export type AuthTokenRequest = {
+  forceRefreshToken?: boolean;
+  signal?: AbortSignal;
+  onAttempt?: (mode: "guest" | "workos") => void;
+};
+
+const GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS = [500, 1500, 3000] as const;
+
+// Same ladder for token refresh. ~5s worst case, which fits inside the 60s
+// `authRefreshTokenLeewaySeconds` configured in main.tsx — so a retried
+// success still lands while the old token is valid.
+const AUTH_TOKEN_REFRESH_RETRY_DELAYS_MS =
+  GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS;
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Fetch an auth token, retrying transient failures on the same ladder the
+ * guest bootstrap uses.
+ *
+ * Convex treats a single `null` from its token fetcher as terminal: it calls
+ * `clearAuth()` and `setAndReportAuthFailed()`, dropping to the `noAuth`
+ * state with NO retry and NO rescheduled refetch (see
+ * `convex/browser/sync/authentication_manager.js`). Every live query then
+ * re-runs identity-less and throws "Authentication required" in a burst,
+ * and the tab stays de-authed until reload while the UI still looks signed
+ * in. So one wifi blip or laptop wake during a scheduled refresh used to
+ * kill the session permanently — the retry has to live HERE, because there
+ * is no layer above us that will try again.
+ *
+ * `isTerminalError` marks failures where retrying is provably useless (a
+ * WorkOS session that is genuinely dead); those return `null` immediately
+ * and are not reported, since they are an expected sign-out rather than a
+ * fault. Exhaustion IS reported — refresh failures were previously invisible
+ * (console.error only), which is why the root cause went unmeasured.
+ */
+async function fetchTokenWithRetry(
+  fetchOnce: () => Promise<string | null>,
+  opts: {
+    source: string;
+    request?: AuthTokenRequest;
+    mode?: "guest" | "workos";
+    isTerminalError?: (error: unknown) => boolean;
+    /**
+     * A null token that will stay null for the rest of the window (the
+     * server refused to create a guest). Stops the retry ladder without
+     * reporting and without the "session expired" banner — the refusal has
+     * its own banner.
+     */
+    isTerminalNull?: () => boolean;
+  },
+): Promise<string | null> {
+  let lastError: unknown;
+
+  for (
+    let attempt = 0;
+    attempt <= AUTH_TOKEN_REFRESH_RETRY_DELAYS_MS.length;
+    attempt += 1
+  ) {
+    if (opts.request?.signal?.aborted) return null;
+    opts.request?.onAttempt?.(opts.mode ?? "guest");
+    try {
+      const token = await fetchOnce();
+      if (opts.request?.signal?.aborted) return null;
+      if (token) {
+        // Whatever went wrong before is over — take any banner down.
+        useSessionRefreshStore.getState().clear();
+        return token;
+      }
+      if (opts.isTerminalNull?.()) return pauseQueriesBeforeAuthClear();
+      lastError = undefined;
+    } catch (error) {
+      if (opts.request?.signal?.aborted) return null;
+      if (opts.isTerminalError?.(error)) {
+        useSessionRefreshStore.getState().notifyFailure("signed_out");
+        return pauseQueriesBeforeAuthClear();
+      }
+      lastError = error;
+    }
+
+    if (attempt === AUTH_TOKEN_REFRESH_RETRY_DELAYS_MS.length) break;
+    await delay(AUTH_TOKEN_REFRESH_RETRY_DELAYS_MS[attempt]);
+  }
+
+  if (opts.request?.signal?.aborted) return null;
+
+  // Upstream error messages can contain credentials. Keep only allowlisted
+  // status/reason fields and a fixed message; reporting cannot block recovery.
+  try {
+    const failure = guestFailureExtra(lastError);
+    // A guest throw with no status never got an answer. On a self-hosted
+    // install the guest request goes to this tab's own loopback server, so
+    // that is the local inspector process being gone (npx killed, laptop
+    // asleep), not the guest authority failing: still a Sentry event, but a
+    // `routine` one the paging rule skips, in its own issue so the real ones
+    // keep their "new" and "regressed" transitions.
+    const unanswered =
+      opts.mode === "guest" &&
+      lastError !== undefined &&
+      failure.httpStatus === undefined;
+    const localServerUnreachable =
+      unanswered &&
+      !HOSTED_MODE &&
+      typeof window !== "undefined" &&
+      isLoopbackOAuthUrl(window.location.origin);
+    reportCaught(
+      new Error(`${opts.source} ${lastError ? "failed" : "returned no token"}`),
+      {
+        source: opts.source,
+        level: "warning",
+        ...(localServerUnreachable
+          ? {
+              tags: {
+                page_class: "routine",
+                guest_refresh_failure: "local_server_unreachable",
+              },
+              fingerprint: [opts.source, "local_server_unreachable"],
+            }
+          : {}),
+        extra: {
+          attempts: AUTH_TOKEN_REFRESH_RETRY_DELAYS_MS.length + 1,
+          ...failure,
+          ...(unanswered ? { errorName: thrownName(lastError) } : {}),
+        },
+      },
+    );
+  } catch {
+    // Authentication must still reach the blocked state if reporting fails.
+  }
+  // Convex is about to clearAuth() on this null. Surface a banner offering an
+  // in-place retry, rather than letting the page crash into an error boundary
+  // whose "Try again" cannot work while Convex sits in `noAuth`.
+  useSessionRefreshStore.getState().notifyFailure("transient");
+  return pauseQueriesBeforeAuthClear();
+}
+
+// The class of what `fetch` threw. `requestGuestSession` wraps a rejected
+// fetch in its own error with the original as `cause`, so the wrapper's name
+// says nothing; the cause's does. Never the message, which can quote the URL
+// or an upstream body.
+function thrownName(error: unknown): string {
+  const { cause } = (error ?? {}) as { cause?: unknown };
+  const thrown = cause === undefined ? error : cause;
+  return thrown instanceof Error ? thrown.name : typeof thrown;
+}
+
+// What a failed guest-session request knows about its failure: the HTTP status
+// if the server answered, and why the server's own upstream hop failed if it
+// said. Read by shape so this module does not depend on the error class. Each
+// key is absent, not undefined, when unknown.
+function guestFailureExtra(error: unknown): Record<string, string | number> {
+  const { status, upstreamFailure } = (error ?? {}) as {
+    status?: unknown;
+    upstreamFailure?: unknown;
+  };
+  const extra: Record<string, string | number> = {};
+  if (typeof status === "number") extra.httpStatus = status;
+  const failure = sanitizeGuestSessionFailureDetails(upstreamFailure);
+  // The only part of this report the strict Sentry boundary keeps as text: it
+  // becomes the issue title, so each cause groups and alerts on its own.
+  extra.code = guestSessionFailureCode(
+    error === undefined
+      ? undefined
+      : {
+          httpStatus: typeof status === "number" ? status : undefined,
+          details: failure,
+        },
+  );
+  if (failure) {
+    extra.upstreamReason = failure.reason;
+    if (failure.upstreamStatus !== undefined) {
+      extra.upstreamStatus = failure.upstreamStatus;
+    }
+    if (failure.networkCode !== undefined) {
+      extra.networkCode = failure.networkCode;
+    }
+  }
+  return extra;
+}
+
+// Persist the "this browser used Convex as a guest" marker for the currently
+// cached guest. No-op when no guestId is resolved (e.g. a bootstrap seed that
+// carried no guestId — those are never seeded; see seedFromBootstrap).
+function markActiveGuest(): void {
+  const guestId = getCachedGuestSession()?.guestId;
+  if (guestId) markGuestActivated(guestId);
+}
+
+export function useUnifiedConvexAuth() {
+  const workos = useWorkOSAuth();
+  // caniuse.dev renders from the public host catalog and needs no identity,
+  // so it must not spend from the per-IP daily guest budget. Read per render
+  // rather than at module load: it is a Set lookup, and a module-level
+  // constant would freeze the hostname before a test could stub it.
+  const skipGuest = shouldSkipGuestSession();
+  // Refusal expiry must restart guest bootstrap: Convex stops fetching after
+  // a null token, so merely hiding the refusal banner cannot reconnect it.
+  const guestRefusal = useSyncExternalStore(
+    subscribeGuestSessionChanges,
+    getGuestSessionRefusal,
+    () => null,
+  );
+  const guestRecovery = useGuestSessionRecovery(
+    !skipGuest && !workos.isLoading && !workos.user && !guestRefusal,
+  );
+  // Bumped when the user presses Retry on the session-refresh banner. It feeds
+  // both the memo below (new `fetchAccessToken` identity → Convex re-runs
+  // `setAuth`) and the guest bootstrap effect (a fully-lapsed guest has
+  // `isAuthenticated: false`, so
+  // the guest must be re-minted before a re-auth can happen at all).
+  const retryNonce = useSessionRefreshStore((s) => s.retryNonce);
+  const [guestToken, setGuestToken] = useState<string | null>(
+    () => getCachedGuestSession()?.token ?? null,
+  );
+  // `false` under `skipGuest`: the lazy initializer is what makes a cold
+  // visit start in a loading state, and with no bootstrap to clear it the
+  // surface would sit on a spinner forever.
+  const [guestLoading, setGuestLoading] = useState(
+    () => !skipGuest && getCachedGuestSession()?.token == null,
+  );
+
+  // Fetch a guest token whenever there is no signed-in WorkOS user. Reset
+  // when a user does sign in so subsequent renders favor the WorkOS path.
+  useEffect(() => {
+    if (workos.isLoading) {
+      return;
+    }
+    if (skipGuest) {
+      guestRecovery.reset();
+      setGuestToken(null);
+      setGuestLoading(false);
+      return;
+    }
+    if (workos.user) {
+      guestRecovery.reset();
+      setGuestToken(null);
+      setGuestLoading(false);
+      return;
+    }
+    let cancelled = false;
+    const round = new AbortController();
+    const acceptSession = (token: string) => {
+      guestRecovery.reset();
+      round.abort();
+      setGuestToken(token);
+      setGuestLoading(false);
+      useSessionRefreshStore.getState().clear();
+    };
+    // A cloud action may obtain a session after bootstrap gave up. Adopt its
+    // cached token so Convex can authenticate without another mint or reload.
+    const stopWatchingGuest = subscribeGuestSessionChanges(() => {
+      const session = getCachedGuestSession();
+      if (!cancelled && session) acceptSession(session.token);
+    });
+    // Only flip to loading if we have no cached token; if we do, the async
+    // call will resolve immediately and setting true→false would cause the
+    // very flicker the lazy initializer was designed to prevent.
+    if (!getCachedGuestSession()?.token) {
+      setGuestLoading(true);
+    }
+
+    const resolveGuestSession = async () => {
+      let lastError: unknown;
+      for (
+        let attempt = 0;
+        attempt <= GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS.length;
+        attempt += 1
+      ) {
+        if (
+          !getCachedGuestSession() &&
+          !getGuestSessionRefusal() &&
+          !(await guestRecovery.wait(round.signal))
+        )
+          return;
+        if (cancelled || round.signal.aborted) return;
+        let session: Awaited<
+          ReturnType<typeof getOrCreateGuestSessionOrThrow>
+        > = null;
+        try {
+          session = await getOrCreateGuestSessionOrThrow();
+          lastError = undefined;
+        } catch (error) {
+          session = null;
+          lastError = error;
+        }
+
+        if (cancelled || round.signal.aborted) return;
+        if (session) {
+          acceptSession(session.token);
+          return;
+        }
+
+        // A refused creation (per-IP daily cap) is deterministic for the rest
+        // of its window: retrying cannot succeed and is not an error worth
+        // paging on. The banner offers sign-in instead.
+        if (getGuestSessionRefusal()) {
+          useSessionRefreshStore.getState().clear();
+          setGuestToken(null);
+          setGuestLoading(false);
+          return;
+        }
+
+        if (attempt === GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS.length) {
+          setGuestToken(null);
+          setGuestLoading(false);
+          const failure = guestFailureExtra(lastError);
+          const shouldReport = guestRecovery.failed();
+          const status = failure.httpStatus;
+          if (
+            (status === undefined && lastError !== undefined) ||
+            (typeof status === "number" && (status === 408 || status >= 500))
+          ) {
+            useSessionRefreshStore.getState().notifyFailure("transient");
+          } else {
+            useSessionRefreshStore.getState().notifyFailure("manual");
+          }
+          if (!shouldReport) return;
+          try {
+            reportCaught(
+              lastError ??
+                new Error("Guest session bootstrap exhausted without a token"),
+              {
+                source: "guest_session_bootstrap",
+                level: "error",
+                extra: {
+                  attempts: GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS.length + 1,
+                  ...failure,
+                },
+              },
+            );
+          } catch {
+            // Reporting is best effort; a telemetry failure cannot prevent
+            // the visitor from retrying guest authentication.
+            console.debug("Guest session failure could not be reported.");
+          }
+          return;
+        }
+
+        await delay(GUEST_SESSION_BOOTSTRAP_RETRY_DELAYS_MS[attempt]);
+        if (cancelled) return;
+      }
+    };
+
+    void resolveGuestSession();
+
+    return () => {
+      cancelled = true;
+      round.abort();
+      stopWatchingGuest();
+    };
+  }, [
+    skipGuest,
+    workos.isLoading,
+    workos.user,
+    retryNonce,
+    guestRefusal,
+    guestRecovery,
+  ]);
+
+  // Convex keys its auth configuration on these callbacks.
+  // Changing one replaces authentication, even when the token is still valid.
+  // Keep them stable across guest-token and WorkOS profile updates.
+  const getWorkosAccessToken = useCallback(
+    (request?: AuthTokenRequest) =>
+      fetchTokenWithRetry(
+        () =>
+          workos.getAccessToken({
+            forceRefresh: request?.forceRefreshToken ?? false,
+          }),
+        {
+          request,
+          mode: "workos",
+          source: "workos_token_refresh",
+          isTerminalError: isLoginRequiredError,
+        },
+      ),
+    [workos.getAccessToken, workos.user?.id, retryNonce],
+  );
+
+  const getGuestAccessToken = useCallback(
+    async (opts?: AuthTokenRequest): Promise<string | null> => {
+      // Convex asks for a token, gets one, and authenticates the guest —
+      // the true "activated as a guest" signal. Marking HERE (rather than
+      // in the resolve effect) is immune to the effect-cancel race when a
+      // guest signs in mid-resolve, and never fires for an authed user
+      // (whose memo branch returns the WorkOS getAccessToken above).
+      // Keyed by guestId; idempotent.
+      const activate = (token: string | null): string | null => {
+        if (token) markActiveGuest();
+        return token;
+      };
+
+      if (opts?.forceRefreshToken) {
+        const refreshed = await fetchTokenWithRetry(
+          () => forceRefreshGuestSessionOrThrow(),
+          {
+            source: "guest_token_refresh",
+            request: opts,
+            mode: "guest",
+            isTerminalNull: () => getGuestSessionRefusal() !== null,
+          },
+        );
+        if (opts?.signal?.aborted) return null;
+        setGuestToken(refreshed);
+        return activate(refreshed);
+      }
+
+      // Prefer the latest in-memory cache so a fresh token is used even
+      // if React hasn't yet re-rendered with the new state.
+      const cached = getCachedGuestSession()?.token;
+      if (cached) {
+        opts?.onAttempt?.("guest");
+        return activate(cached);
+      }
+
+      // Never fall back to a stale React state copy after the cache expires.
+      const minted = await fetchTokenWithRetry(
+        () => getOrCreateGuestSessionOrThrow().then((s) => s?.token ?? null),
+        {
+          source: "guest_token_refresh",
+          request: opts,
+          mode: "guest",
+          isTerminalNull: () => getGuestSessionRefusal() !== null,
+        },
+      );
+      if (opts?.signal?.aborted) return null;
+      setGuestToken(minted);
+      return activate(minted);
+    },
+    [retryNonce],
+  );
+
+  return useMemo(() => {
+    if (workos.user) {
+      return {
+        isLoading: workos.isLoading,
+        isAuthenticated: true,
+        // authkit-js distinguishes two refresh failures: a network error is
+        // rethrown with its state restored to AUTHENTICATED (retryable), while
+        // a rejected refresh grant wipes the session, latches state to ERROR,
+        // and throws `LoginRequiredError` forever after (retrying can only
+        // re-throw). See `isLoginRequiredError` for why that error can only be
+        // recognized by its message — matching on `name` silently classified
+        // every dead session as transient.
+        fetchAccessToken: getWorkosAccessToken,
+      };
+    }
+
+    return {
+      isLoading: workos.isLoading || guestLoading,
+      isAuthenticated: guestToken !== null,
+      // Deliberately NOT guarded by `skipGuest`, even though it can mint a
+      // guest of its own below: Convex only calls this when the hook reports
+      // authenticated, and under `skipGuest` `guestToken` stays null, so
+      // it is unreachable there.
+      fetchAccessToken: getGuestAccessToken,
+    };
+  }, [
+    workos.isLoading,
+    workos.user,
+    getWorkosAccessToken,
+    getGuestAccessToken,
+    guestToken,
+    guestLoading,
+    retryNonce,
+  ]);
+}

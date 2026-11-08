@@ -1,0 +1,498 @@
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import type { RequestLogContext, SystemLogContext } from "../log-events.js";
+
+// Mock Sentry before importing logger
+vi.mock("@sentry/node", () => ({
+  captureException: vi.fn(),
+  captureMessage: vi.fn(),
+}));
+
+// Mock Axiom
+const mockIngest = vi.fn();
+const mockFlush = vi.fn().mockResolvedValue(undefined);
+vi.mock("@axiomhq/js", () => ({
+  Axiom: vi.fn().mockImplementation(function () {
+    return {
+      ingest: mockIngest,
+      flush: mockFlush,
+    };
+  }),
+}));
+
+const baseRequestContext: RequestLogContext = {
+  event: "http.request.completed",
+  timestamp: "2024-01-01T00:00:00.000Z",
+  environment: "test",
+  release: null,
+  component: "http",
+  requestId: "ab5fb35f-4604-4d5b-8724-fd2e69539cbe",
+  route: "/api/web/*",
+  method: "GET",
+  authType: "unknown",
+};
+
+const baseSystemContext: SystemLogContext = {
+  event: "mcp.connection.closed_with_pending_requests",
+  timestamp: "2024-01-01T00:00:00.000Z",
+  environment: "test",
+  release: null,
+  component: "process",
+  requestId: null,
+  route: null,
+  method: null,
+  authType: "system",
+};
+
+describe("logger", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    mockIngest.mockClear();
+    mockFlush.mockClear();
+  });
+
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  describe("axiom ingestion", () => {
+    it("initializes the Axiom client on first ingest, not at import", async () => {
+      vi.stubEnv("AXIOM_TOKEN", "test-token");
+      vi.stubEnv("AXIOM_CLEAN_DATASET", "test-dataset");
+      vi.stubEnv("NODE_ENV", "production");
+
+      const { Axiom } = await import("@axiomhq/js");
+      const { logger: freshLogger } = await import("../logger.js");
+
+      // Lazy on purpose: server/index.ts statically imports this module, so a
+      // module-load construction would read AXIOM_* / DO_NOT_TRACK before
+      // loadInspectorEnv() has populated them from .env.
+      expect(Axiom).not.toHaveBeenCalled();
+
+      freshLogger.info("first log");
+      expect(Axiom).toHaveBeenCalledWith({ token: "test-token" });
+    });
+
+    it("does not initialize Axiom client when AXIOM_TOKEN is missing", async () => {
+      vi.stubEnv("AXIOM_TOKEN", "");
+      vi.stubEnv("AXIOM_CLEAN_DATASET", "test-dataset");
+
+      const { Axiom } = await import("@axiomhq/js");
+      (Axiom as ReturnType<typeof vi.fn>).mockClear();
+
+      await import("../logger.js");
+
+      expect(Axiom).not.toHaveBeenCalled();
+    });
+
+    it("does not initialize Axiom client when AXIOM_CLEAN_DATASET is missing", async () => {
+      vi.stubEnv("AXIOM_TOKEN", "test-token");
+      vi.stubEnv("AXIOM_CLEAN_DATASET", "");
+
+      const { Axiom } = await import("@axiomhq/js");
+      (Axiom as ReturnType<typeof vi.fn>).mockClear();
+
+      await import("../logger.js");
+
+      expect(Axiom).not.toHaveBeenCalled();
+    });
+
+    describe("when Axiom is configured", () => {
+      let logger: (typeof import("../logger.js"))["logger"];
+
+      beforeEach(async () => {
+        vi.stubEnv("AXIOM_TOKEN", "test-token");
+        vi.stubEnv("AXIOM_CLEAN_DATASET", "test-dataset");
+        vi.stubEnv("NODE_ENV", "production");
+
+        const mod = await import("../logger.js");
+        logger = mod.logger;
+      });
+
+      it("ingests error logs to Axiom with error details", () => {
+        const error = new Error("something broke");
+        logger.error("fail", error, { requestId: "abc" });
+
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({ level: "error", event: "log.unknown", errorClass: "Error", environment: "prod" }),
+        ]);
+      });
+
+      it("ingests error logs with stringified non-Error objects", () => {
+        logger.error("fail", "string-error");
+
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({
+            level: "error",
+            event: "log.unknown",
+            errorClass: "UnknownError",
+          }),
+        ]);
+      });
+
+      it("ingests warn logs to Axiom", () => {
+        logger.warn("watch out", { userId: "123" });
+
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({ level: "warn", event: "log.unknown", environment: "prod" }),
+        ]);
+      });
+
+      it("does not ship to Axiom when DO_NOT_TRACK is set", () => {
+        // Read at INGEST time, not module load: server/index.ts statically
+        // imports the logger, so a module-load read would run before
+        // loadInspectorEnv() and miss a DO_NOT_TRACK coming from .env.
+        vi.stubEnv("DO_NOT_TRACK", "1");
+        mockIngest.mockClear();
+
+        logger.error("fail", new Error("x"));
+        logger.warn("watch out");
+        logger.info("started");
+        logger.debug("dbg");
+
+        expect(mockIngest).not.toHaveBeenCalled();
+      });
+
+      it("does NOT send warnings to Sentry", async () => {
+        // Every logger.warn in the tree used to become a Sentry event. Across
+        // self-hosted installs that is the largest quota-spike vector we have,
+        // and a warning is by definition something we chose not to fail on.
+        const Sentry = await import("@sentry/node");
+        logger.warn("watch out", { userId: "123" });
+
+        expect(Sentry.captureMessage).not.toHaveBeenCalled();
+        expect(Sentry.captureException).not.toHaveBeenCalled();
+      });
+
+      it("still sends errors to Sentry", async () => {
+        const Sentry = await import("@sentry/node");
+        const error = new Error("boom");
+        logger.error("fail", error, { userId: "123" });
+
+        expect(Sentry.captureException).toHaveBeenCalledWith(
+          error,
+          expect.objectContaining({
+            extra: expect.objectContaining({ message: "fail", userId: "123" }),
+          }),
+        );
+      });
+
+      it("skips Sentry for an error an origin capture point already ruled on", async () => {
+        // Routes commonly log an error and then serialize the SAME object into
+        // an envelope. The envelope's origin policy may have deliberately
+        // declined to page (a user's dead MCP server); without this skip,
+        // `logger.error` would re-capture it here and the noise the policy
+        // exists to remove would come straight back through the side door.
+        const Sentry = await import("@sentry/node");
+        const { markOriginCaptureHandled } = await import(
+          "../error-origin-capture.js"
+        );
+        const error = new Error("their server refused the connection");
+        markOriginCaptureHandled(error);
+
+        logger.error("connect failed", error);
+
+        expect(Sentry.captureException).not.toHaveBeenCalled();
+        // Axiom still gets it — the row stays queryable, only the page is gone.
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({
+            level: "error",
+            event: "log.unknown",
+            errorClass: "Error",
+          }),
+        ]);
+      });
+
+      it("tags free-form logs with the same canonical environment as typed events", async () => {
+        // These two used to disagree. `logger.event` resolved the environment
+        // through the allowlist; the free-form path read `ENVIRONMENT` raw. A
+        // deploy setting `ENVIRONMENT=production` therefore split Axiom in
+        // half — typed rows `"prod"`, free-form rows `"production"` — and a
+        // query filtered on either one silently missed the other.
+        vi.stubEnv("ENVIRONMENT", "production");
+        vi.resetModules();
+        const { logger: freshLogger } = await import("../logger.js");
+        mockIngest.mockClear();
+
+        freshLogger.info("started");
+
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({ environment: "prod" }),
+        ]);
+      });
+
+      it("ingests info logs to Axiom", () => {
+        logger.info("started", { port: 3000 });
+
+        expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+          expect.objectContaining({ level: "info", event: "log.unknown", environment: "prod" }),
+        ]);
+      });
+
+      it("skips uncatalogued debug messages and their arbitrary arguments", () => {
+        logger.debug("trace", "arg1", { city: "Lisbon", nights: 3 });
+
+        expect(mockIngest).not.toHaveBeenCalled();
+      });
+
+      it("scrubs free-form context before it reaches Axiom", () => {
+        // The shape of the XAA connect failure log: before, only typed events
+        // were scrubbed, and this row shipped the server's URL and name raw.
+        logger.warn("[XAA connect] provider preparation failed", {
+          serverId: "srv_1",
+          serverName: "Acme Prod CRM",
+          resource: "https://mcp.acme.com/tenants/42/mcp?key=k",
+          stderr: `boom for jane@acme.com ${"x".repeat(600)}`,
+          toolArgs: { invoiceId: "INV-99" },
+        });
+
+        const [, [row]] = mockIngest.mock.calls.at(-1)!;
+        expect(row).toMatchObject({
+          level: "warn",
+        });
+        const serialized = JSON.stringify(row);
+        expect(serialized).not.toContain("Acme");
+        expect(serialized).not.toContain("jane@acme.com");
+        expect(serialized).not.toContain("INV-99");
+        expect(row).not.toHaveProperty("stderr");
+        expect(row).not.toHaveProperty("serverId");
+      });
+
+      it("leaves Sentry content to its final transport", async () => {
+        const Sentry = await import("@sentry/node");
+        logger.error(
+          "connect failed for https://mcp.acme.com/tenants/42",
+          new Error("boom"),
+          { serverName: "Acme Prod CRM", serverUrl: "https://mcp.acme.com/x" },
+        );
+
+        expect(Sentry.captureException).toHaveBeenCalledWith(
+          expect.any(Error),
+          expect.objectContaining({
+            extra: {
+              message: "connect failed for https://mcp.acme.com/tenants/42",
+              serverName: "Acme Prod CRM",
+              serverUrl: "https://mcp.acme.com/x",
+            },
+          }),
+        );
+      });
+
+      it("passes origin content to the final Sentry transport", async () => {
+        const Sentry = await import("@sentry/node");
+        const { captureOriginErrorToSentry } = await import("../logger.js");
+        const error = new Error("upstream refused");
+
+        captureOriginErrorToSentry(error, {
+          tags: { error_origin: "mcpjam" },
+          extra: {
+            source: "routes.web.tools",
+            rawMessage: "refused for bob@acme.com",
+            body: { arguments: { amount: 4200 } },
+          },
+        });
+
+        expect(Sentry.captureException).toHaveBeenCalledWith(
+          error,
+          expect.objectContaining({
+            tags: { error_origin: "mcpjam" },
+            extra: {
+              source: "routes.web.tools",
+              rawMessage: "refused for bob@acme.com",
+              body: { arguments: { amount: 4200 } },
+            },
+          }),
+        );
+      });
+
+      it("flushes Axiom on logger.flush()", async () => {
+        await logger.flush();
+        expect(mockFlush).toHaveBeenCalled();
+      });
+    });
+  });
+
+  describe("logger.event", () => {
+    let logger: (typeof import("../logger.js"))["logger"];
+    let captureException: ReturnType<typeof vi.fn>;
+    let captureMessage: ReturnType<typeof vi.fn>;
+
+    beforeEach(async () => {
+      vi.stubEnv("AXIOM_TOKEN", "test-token");
+      vi.stubEnv("AXIOM_CLEAN_DATASET", "test-dataset");
+      vi.stubEnv("NODE_ENV", "production");
+
+      const mod = await import("../logger.js");
+      logger = mod.logger;
+
+      const sentry = await import("@sentry/node");
+      captureException = vi.mocked(sentry.captureException);
+      captureMessage = vi.mocked(sentry.captureMessage);
+      captureException.mockClear();
+      captureMessage.mockClear();
+    });
+
+    it("ingests a typed event to Axiom with all required fields", () => {
+      logger.event("http.request.completed", baseRequestContext, { statusCode: 200 });
+
+      expect(mockIngest).toHaveBeenCalledWith(
+        "test-dataset",
+        [
+          expect.objectContaining({
+            event: "http.request.completed",
+            environment: "test",
+            requestId: "ab5fb35f-4604-4d5b-8724-fd2e69539cbe",
+            route: "/api/web/*",
+            method: "GET",
+            authType: "unknown",
+            statusCode: 200,
+          }),
+        ],
+      );
+    });
+
+    it("serializes options.error into the Axiom payload", () => {
+      // Regression: emit() used to forward the error object to Sentry only,
+      // so every failure event landed in Axiom with no cause attached.
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 502, errorCode: "server_unreachable" },
+        { error: new Error("read ECONNRESET") },
+      );
+
+      expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+        expect.objectContaining({
+          event: "http.request.failed",
+          statusCode: 502,
+          errorClass: "Error",
+        }),
+      ]);
+    });
+
+    it("stringifies a non-Error options.error for the Axiom payload", () => {
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 500, errorCode: "unhandled_exception" },
+        { error: 42 },
+      );
+
+      expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+        expect.objectContaining({ errorClass: "UnknownError" }),
+      ]);
+    });
+
+    it("survives an options.error whose string coercion throws", () => {
+      // Promise.reject(Object.create(null)) reaches the unhandledRejection
+      // handler; String() on a null-prototype object throws, and a throw
+      // here would turn an absorbed rejection into an uncaught exception.
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 500, errorCode: "unhandled_exception" },
+        { error: Object.create(null) },
+      );
+
+      expect(mockIngest).toHaveBeenCalledWith("test-dataset", [
+        expect.objectContaining({ errorClass: "UnknownError" }),
+      ]);
+    });
+
+    it("caps oversized error messages and stacks", () => {
+      const err = new Error("m".repeat(10_000));
+      err.stack = "s".repeat(20_000);
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 502, errorCode: "server_unreachable" },
+        { error: err },
+      );
+
+      const [, [ingested]] = mockIngest.mock.calls.at(-1)!;
+      expect(ingested).toMatchObject({ errorClass: "Error" });
+      expect(ingested).not.toHaveProperty("error");
+    });
+
+    it("calls Sentry.captureException only when sentry: true is opted in with an Error", () => {
+      const err = new Error("boom");
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 500, errorCode: "unhandled_exception" },
+        { error: err, sentry: true },
+      );
+
+      expect(captureException).toHaveBeenCalledWith(err, expect.any(Object));
+      expect(captureMessage).not.toHaveBeenCalled();
+    });
+
+    it("calls Sentry.captureMessage when sentry: true is opted in without an Error", () => {
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 500, errorCode: "internal_error" },
+        { sentry: true },
+      );
+
+      expect(captureMessage).toHaveBeenCalledWith(
+        "http.request.failed",
+        expect.objectContaining({ level: "error" }),
+      );
+    });
+
+    it("does not call Sentry by default for *.failed events (opt-in only)", () => {
+      const err = new Error("boom");
+      logger.event(
+        "http.request.failed",
+        baseRequestContext,
+        { statusCode: 500, errorCode: "internal_error" },
+        { error: err },
+      );
+
+      expect(captureException).not.toHaveBeenCalled();
+      expect(captureMessage).not.toHaveBeenCalled();
+    });
+
+    it("does not call Sentry for non-failed events when no opt-in is passed", () => {
+      logger.event("http.request.completed", baseRequestContext, {
+        statusCode: 200,
+      });
+
+      expect(captureException).not.toHaveBeenCalled();
+      expect(captureMessage).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("logger.systemEvent", () => {
+    let logger: (typeof import("../logger.js"))["logger"];
+
+    beforeEach(async () => {
+      vi.stubEnv("AXIOM_TOKEN", "test-token");
+      vi.stubEnv("AXIOM_CLEAN_DATASET", "test-dataset");
+      vi.stubEnv("NODE_ENV", "production");
+
+      const mod = await import("../logger.js");
+      logger = mod.logger;
+      mockIngest.mockClear();
+    });
+
+    it("ingests a system event to Axiom with system envelope (requestId/route/method all null)", () => {
+      logger.systemEvent(
+        "mcp.connection.closed_with_pending_requests",
+        baseSystemContext,
+        { errorCode: "connection_closed" },
+      );
+
+      expect(mockIngest).toHaveBeenCalledWith(
+        "test-dataset",
+        [
+          expect.objectContaining({
+            event: "mcp.connection.closed_with_pending_requests",
+            route: "unknown_route",
+            authType: "system",
+          }),
+        ],
+      );
+    });
+  });
+});

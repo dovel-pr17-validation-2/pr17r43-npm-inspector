@@ -1,0 +1,1195 @@
+/**
+ * `createCodexAppServer` — MCPJam's own `HarnessV1` adapter for the interactive
+ * `codex app-server` transport.
+ *
+ * WHY THIS EXISTS. The published `@ai-sdk/harness-codex` drives `codex exec`
+ * through the Codex SDK, which hardcodes `approvalPolicy: 'never'` and
+ * `sandboxMode: 'danger-full-access'`, and whose `doStart` rejects any
+ * permission mode but `allow-all`. That is not a mode we failed to select: exec
+ * is a batch transport with no channel to interrupt and no way to ask. Every
+ * capability gap in MCPJam's Codex host traced back to it — no approvals, two
+ * attributable tools, MCP through a shell shim — so this adapter replaced it
+ * for every Codex turn, hosted and local.
+ *
+ * `codex app-server` is the long-lived JSON-RPC transport the editor
+ * integrations use, and it carries all of it: real approval requests, typed
+ * items for every action, per-turn token usage with a cache breakdown,
+ * interrupt, and native MCP configuration.
+ *
+ * The SHAPE of this adapter deliberately mirrors the published one — the same
+ * bridge asset, the same three-rung resume ladder, the same lifecycle payloads
+ * — because the inspector's session machinery reaches into those shapes (see
+ * `harness-session-state.ts` reading `data.bridge.sandboxId`). Only the
+ * protocol underneath is ours.
+ */
+import {
+  HarnessCapabilityUnsupportedError,
+  harnessV1DiagnosticFromBridgeFrame,
+  type HarnessV1,
+  type HarnessV1ContinueTurnState,
+  type HarnessV1DebugConfig,
+  type HarnessV1NetworkSandboxSession,
+  type HarnessV1PermissionMode,
+  type HarnessV1PortEndpoint,
+  type HarnessV1Prompt,
+  type HarnessV1PromptControl,
+  type HarnessV1ResumeSessionState,
+  type HarnessV1Session,
+  type HarnessV1Skill,
+  type HarnessV1StreamPart,
+} from "@ai-sdk/harness";
+import {
+  classifyDiskLog,
+  createBridgeErrorHandler,
+  createBridgeStartupError,
+  createBridgeToken,
+  drainBridgeProcessStream,
+  forwardBridgeProcessStream,
+  getRestrictedSandboxSession,
+  markBridgeStarting,
+  resolveSandboxDefaultWorkingDirectory,
+  resolveSandboxHomeDir,
+  SandboxChannel,
+  shellQuote,
+  waitForBridgeReady,
+  withBridgeToken,
+  writeSkills as writeHarnessSkills,
+} from "@ai-sdk/harness/utils";
+import { createHash } from "node:crypto";
+import { posix } from "node:path";
+import { WebSocket } from "ws";
+import type { HarnessMcpJson } from "../mcp-config.js";
+import { logger } from "../../logger.js";
+import { CODEX_APPSERVER_BUILTIN_TOOLS } from "./codex-appserver-builtin-tools.js";
+import {
+  CODEX_APPSERVER_BOOTSTRAP_DIR,
+  getCodexAppServerBootstrap,
+} from "./codex-appserver-bootstrap.js";
+import {
+  codexAppServerResumeStateSchema,
+  type CodexAppServerResumeState,
+} from "./codex-appserver-lifecycle-state.js";
+import {
+  outboundMessageSchema,
+  type InboundMessage,
+  type OutboundMessage,
+  type StartMessage,
+} from "./codex-appserver-bridge-protocol.js";
+import {
+  turnConfigurationFingerprintInput,
+  type TurnFingerprintTool,
+} from "./shared/turn-fingerprint.js";
+import {
+  sandboxPolicyFingerprint,
+  type CodexWorkspaceWriteSandboxPolicy,
+} from "./shared/sandbox-policy.js";
+
+export const CODEX_APPSERVER_HARNESS_ID = "codex";
+
+/**
+ * The model a turn runs when neither the turn nor the settings name one —
+ * the published `@ai-sdk/harness-codex` adapter's default, so switching
+ * transports never changes which model an unconfigured host gets.
+ */
+export const DEFAULT_CODEX_APPSERVER_MODEL = "gpt-5.5";
+
+/** Skills live where Codex reads them, the same root the retired exec transport used. */
+const CODEX_SKILLS_SUBDIR = ".agents/skills";
+
+export type CodexAppServerSettings = {
+  warmAgent?: boolean;
+  nativeMcpServers?: HarnessMcpJson["mcpServers"];
+  /** Native model id. Omitted ⇒ Codex's own default. */
+  model?: string;
+  /** Placeholder credential env (`CODEX_API_KEY`, `OPENAI_BASE_URL`). The real
+   *  lease is injected outside the VM by E2B. */
+  auth?: Readonly<Record<string, string>>;
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
+  /** Codex's own web search. Off unless the host asks. */
+  webSearch?: boolean;
+  /** Extra `config.toml` values, layered per thread. */
+  codexConfig?: Record<string, unknown>;
+  startupTimeoutMs?: number;
+  /**
+   * Explicit command-sandbox policy for every turn (`turn/start.sandboxPolicy`).
+   * Set ONLY by the local unattended arm — see `shared/sandbox-policy.ts`. It
+   * is not a permission mode and never widens one; the bridge refuses
+   * `allow-all` under local supervision without it.
+   */
+  sandboxPolicy?: Readonly<CodexWorkspaceWriteSandboxPolicy>;
+  /** Bridge port override. Default: the session's first leased port. */
+  port?: number;
+};
+
+/**
+ * The port the bridge binds: the one the sandbox session LEASED for it.
+ *
+ * Not `0`. A random port works only where every port is reachable; the local
+ * provider resolves endpoints for leased ports only (and refuses any other),
+ * and E2B exposes the port it was created with. Mirrors the published
+ * adapter's `resolveBridgePort`.
+ */
+function resolveBridgePort(
+  sandboxSession: SandboxSession | HarnessV1NetworkSandboxSession,
+  override: number | undefined,
+): number {
+  if (override !== undefined) return override;
+  if (
+    "ports" in sandboxSession &&
+    Array.isArray(sandboxSession.ports) &&
+    sandboxSession.ports.length > 0
+  ) {
+    return sandboxSession.ports[0]!;
+  }
+  throw new HarnessCapabilityUnsupportedError({
+    harnessId: CODEX_APPSERVER_HARNESS_ID,
+    message:
+      "The codex app-server harness needs a TCP port leased by the sandbox " +
+      "session (`ports: [<port>]`).",
+  });
+}
+
+type Channel = SandboxChannel<OutboundMessage, InboundMessage>;
+
+/**
+ * The sandbox session types, structurally.
+ *
+ * The published adapter imports `Experimental_SandboxSession` from
+ * `@ai-sdk/provider-utils`, but the inspector resolves its own copy of that
+ * package, which does not re-export them. Deriving them from the framework's
+ * own signatures keeps this adapter on ONE copy of the type — the one
+ * `HarnessV1` itself is written against — instead of whichever version npm
+ * happens to hoist.
+ */
+type SandboxSession = Parameters<typeof getRestrictedSandboxSession>[0];
+type SandboxProcess = Awaited<ReturnType<SandboxSession["spawn"]>>;
+
+/** Resolve the ws endpoint for a bound bridge port. */
+async function resolveBridgeEndpoint(
+  sandboxSession: SandboxSession | HarnessV1NetworkSandboxSession,
+  port: number,
+): Promise<HarnessV1PortEndpoint> {
+  if ("getPortEndpoint" in sandboxSession) {
+    return sandboxSession.getPortEndpoint({ port, protocol: "ws" });
+  }
+  throw new HarnessCapabilityUnsupportedError({
+    harnessId: CODEX_APPSERVER_HARNESS_ID,
+    message:
+      "The codex app-server harness needs a sandbox session that can expose a port.",
+  });
+}
+
+/** Connect, and resolve only once the socket is actually open — a channel that
+ *  resolves on construction would send its first frame into a dead socket. */
+/** How long a bridge socket may take to finish its handshake. */
+const BRIDGE_SOCKET_OPEN_TIMEOUT_MS = 30_000;
+
+/**
+ * Open the bridge socket, BOUNDED.
+ *
+ * A promise that only settles on `open` or `error` never settles at all against
+ * a port that accepts the TCP connection and then says nothing — which is a
+ * sandbox that is up but wedged, not a hypothetical. That matters most on the
+ * ATTACH rung: it is the first thing `doStart` does when it has coordinates,
+ * and its `catch` (the respawn fallback) cannot run for a promise that never
+ * rejects, so a wedged socket would strand the session instead of respawning
+ * it. Every other sandbox call in `doStart` already takes the caller's signal;
+ * this one now does too.
+ */
+function openWebSocket(
+  { url, headers }: HarnessV1PortEndpoint,
+  opts: { timeoutMs?: number; abortSignal?: AbortSignal } = {},
+): Promise<WebSocket> {
+  const timeoutMs = opts.timeoutMs ?? BRIDGE_SOCKET_OPEN_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const socket = new WebSocket(url, {
+      headers: headers == null ? undefined : { ...headers },
+    });
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.off("open", onOpen);
+      socket.off("error", onError);
+      opts.abortSignal?.removeEventListener("abort", onAbort);
+    };
+    const onOpen = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(socket);
+    };
+    const onError = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(error);
+    };
+    const onAbort = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      socket.terminate();
+      reject(
+        opts.abortSignal?.reason instanceof Error
+          ? opts.abortSignal.reason
+          : new Error(
+              "Aborted while opening the codex app-server bridge socket.",
+            ),
+      );
+    };
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      socket.terminate();
+      reject(
+        new Error(
+          `codex app-server bridge socket did not open within ${timeoutMs}ms.`,
+        ),
+      );
+    }, timeoutMs);
+    timer.unref?.();
+    socket.once("open", onOpen);
+    socket.once("error", onError);
+    // `addEventListener` never fires for a signal that is ALREADY aborted, so
+    // registering alone would let a cancelled start open a socket anyway.
+    if (opts.abortSignal?.aborted) onAbort();
+    else opts.abortSignal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+/** Configuration a running thread cannot absorb; a change forces a new one. */
+function fingerprintTurnConfiguration(input: {
+  instructions: string | undefined;
+  tools: readonly TurnFingerprintTool[];
+  sandboxPolicy?: Readonly<CodexWorkspaceWriteSandboxPolicy> | undefined;
+}): string {
+  // The sandbox policy joins the hash only when there is one, so every
+  // existing hosted lane keeps the fingerprint it already has.
+  const hash = createHash("sha256").update(
+    turnConfigurationFingerprintInput({
+      instructions: input.instructions,
+      tools: input.tools,
+    }),
+  );
+  if (input.sandboxPolicy) {
+    hash.update(`\u0000sandbox:${sandboxPolicyFingerprint(input.sandboxPolicy)}`);
+  }
+  return hash.digest("hex").slice(0, 16);
+}
+
+function extractUserText(prompt: HarnessV1Prompt | undefined): string {
+  if (prompt == null) return "";
+  if (typeof prompt === "string") return prompt;
+  const content = prompt.content;
+  if (typeof content === "string") return content;
+  const parts: string[] = [];
+  for (const part of content) {
+    if (part.type === "text") parts.push(part.text);
+  }
+  return parts.join("\n\n");
+}
+
+export function createCodexAppServer(
+  settings: CodexAppServerSettings = {},
+): HarnessV1<typeof CODEX_APPSERVER_BUILTIN_TOOLS> {
+  return createRetainedBridgeHarness(settings, {
+    id: CODEX_APPSERVER_HARNESS_ID,
+    builtinTools: CODEX_APPSERVER_BUILTIN_TOOLS,
+    bootstrapDir: CODEX_APPSERVER_BOOTSTRAP_DIR,
+    getBootstrap: async () => getCodexAppServerBootstrap(),
+  });
+}
+
+/** Host a runtime that speaks the retained Playground WebSocket protocol. */
+export function createRetainedBridgeHarness<T extends NonNullable<HarnessV1["builtinTools"]>>(
+  settings: CodexAppServerSettings,
+  runtime: {
+    id: string;
+    builtinTools: T;
+    requiresLiveContinuation?: boolean;
+    bootstrapDir: string;
+    getBootstrap: NonNullable<HarnessV1["getBootstrap"]>;
+  },
+): HarnessV1<T> {
+  return {
+    specificationVersion: "harness-v1",
+    harnessId: runtime.id,
+    builtinTools: runtime.builtinTools,
+    /**
+     * TRUE, and this is the whole point of the transport. `HarnessAgent`
+     * refuses to construct with a non-`allow-all` permission mode unless the
+     * harness declares this, so the exec adapter's `false` is what makes an
+     * approval-gated Codex host unrepresentable today.
+     */
+    supportsBuiltinToolApprovals: true,
+    /** Codex offers no way to remove a builtin from the model's tool set. */
+    supportsBuiltinToolFiltering: false,
+    lifecycleStateSchema: codexAppServerResumeStateSchema,
+    getBootstrap: runtime.getBootstrap,
+
+    doStart: async (startOpts) => {
+      if (startOpts.builtinToolFiltering != null) {
+        throw new HarnessCapabilityUnsupportedError({
+          message:
+            `Harness '${runtime.id}' does not support built-in tool filtering controls.`,
+          harnessId: runtime.id,
+        });
+      }
+
+      const sandboxSession = startOpts.sandboxSession;
+      const toolSafeSandboxSession =
+        getRestrictedSandboxSession(sandboxSession);
+      const sandboxId = "id" in sandboxSession ? sandboxSession.id : undefined;
+      /*
+       * WHERE THINGS LIVE — mirroring the published adapter, because the
+       * framework and the local provider both assume this layout:
+       *
+       *  - the bootstrap recipe is applied by the FRAMEWORK under the session's
+       *    DEFAULT working directory, so that is where `bridge.mjs` is;
+       *  - bridge and Codex state go under
+       *    `<defaultWorkingDirectory>/.agent-runs/<sessionId>`, which on a
+       *    cloud box is the box and on a user's machine is session-owned state;
+       *  - only the agent's cwd is `sessionWorkDir` — which locally is the
+       *    user's checkout, and must never receive Codex's state or rollouts.
+       *
+       * Resolving the bootstrap against `sessionWorkDir` pointed the bridge
+       * launch at a directory nothing was ever written to.
+       */
+      const defaultWorkingDirectory =
+        await resolveSandboxDefaultWorkingDirectory({
+          sandboxSession,
+          ...(startOpts.abortSignal
+            ? { abortSignal: startOpts.abortSignal }
+            : {}),
+        });
+      const workDir = startOpts.sessionWorkDir ?? defaultWorkingDirectory;
+      const sandboxHomeDir = await resolveSandboxHomeDir({
+        sandbox: toolSafeSandboxSession,
+      });
+      const bootstrapDir = posix.resolve(
+        defaultWorkingDirectory,
+        runtime.bootstrapDir,
+      );
+      const sessionDataDir = `${defaultWorkingDirectory}/.agent-runs/${startOpts.sessionId}`;
+      const bridgeStateDir = `${sessionDataDir}/bridge`;
+      const timeoutMs = settings.startupTimeoutMs ?? 120_000;
+
+      const lifecycle = startOpts.continueFrom ?? startOpts.resumeFrom;
+      const isContinue = startOpts.continueFrom != null;
+      const isResume = lifecycle != null;
+      const parsed: CodexAppServerResumeState =
+        lifecycle?.data == null
+          ? {}
+          : (codexAppServerResumeStateSchema.safeParse(lifecycle.data).data ??
+            {});
+      const coords = parsed.bridge;
+
+      const report = startOpts.observability?.report;
+      const onDiagnostic = report
+        ? (frame: Parameters<typeof harnessV1DiagnosticFromBridgeFrame>[0]) =>
+            report(
+              harnessV1DiagnosticFromBridgeFrame(frame, {
+                sessionId: startOpts.sessionId,
+                timestamp: Date.now(),
+              }),
+            )
+        : undefined;
+      const onBridgeError = createBridgeErrorHandler({
+        harnessId: runtime.id,
+        sessionId: startOpts.sessionId,
+      });
+
+      /*
+       * Rung 1 — ATTACH. Live coordinates mean a bridge is still running in the
+       * box; reopen a socket to it rather than spawning a second one. A parked
+       * between-turn session just attaches; a suspended in-flight turn asks for
+       * replay from its persisted cursor. If the bridge is gone the open throws
+       * and we fall through to a respawn.
+       */
+      if (coords) {
+        try {
+          const endpoint = withBridgeToken({
+            endpoint: await resolveBridgeEndpoint(sandboxSession, coords.port),
+            token: coords.token,
+          });
+          const attachChannel: Channel = new SandboxChannel({
+            connect: () =>
+              openWebSocket(endpoint, {
+                // The configured bound, not the default: a deployment that
+                // shortens startup expects a stale bridge to be given up on and
+                // respawned just as quickly.
+                timeoutMs,
+                ...(startOpts.abortSignal
+                  ? { abortSignal: startOpts.abortSignal }
+                  : {}),
+              }),
+            outboundSchema: outboundMessageSchema,
+            initialLastSeenEventId: coords.lastSeenEventId,
+            onDiagnostic,
+            onBridgeError,
+          });
+          await attachChannel.open(isContinue ? { resume: true } : undefined);
+          return createRetainedBridgeSession({
+            harnessId: runtime.id,
+            sessionId: startOpts.sessionId,
+            channel: attachChannel,
+            proc: undefined,
+            settings,
+            isResume: true,
+            // An attached bridge already holds its thread in memory and keeps
+            // going; seeding a resume id would make it start a second one.
+            seedResumeThreadOnFirstPrompt: false,
+            rerunContinue: false,
+            bridgePort: coords.port,
+            bridgeToken: coords.token,
+            sandboxId,
+            resumeThreadId: parsed.threadId,
+            turnConfigurationFingerprint: parsed.turnConfigurationFingerprint,
+            sandboxCredentialEnvironment: parsed.sandboxCredentialEnvironment,
+            permissionMode: startOpts.permissionMode,
+            debug: startOpts.observability?.debug,
+            sandbox: toolSafeSandboxSession,
+            sandboxHomeDir, workDir,
+          });
+        } catch {
+          // Unreachable bridge — respawn below.
+        }
+      }
+
+      /*
+       * Rungs 2/3 — REPLAY vs RERUN.
+       *
+       * REPLAY is only sound for `continueFrom`: those coordinates carry the
+       * cursor the on-disk log is replayed FROM. A `resumeFrom` is a
+       * between-turn resume, and replaying the previous turn there would
+       * re-deliver stale events into the next one.
+       */
+      let respawnStrategy: "replay" | "rerun" | undefined = isResume
+        ? "rerun"
+        : undefined;
+      if (coords && isContinue && !runtime.requiresLiveContinuation) {
+        const logRaw = await Promise.resolve(
+          toolSafeSandboxSession.readTextFile({
+            path: `${bridgeStateDir}/event-log.ndjson`,
+            abortSignal: startOpts.abortSignal,
+          }),
+        ).catch(() => null);
+        if ((await classifyDiskLog(logRaw)) === "replay") {
+          respawnStrategy = "replay";
+        }
+      }
+
+      // A CONTINUATION carries decisions for approvals a live Codex process
+      // was waiting on. With that process gone, a rerun re-drives the thread:
+      // Codex proposes actions afresh, and the framework would apply the
+      // stored decision to whichever request reuses its id. Nothing approved
+      // for one action may run another, so refuse rather than rerun.
+      if (isContinue && respawnStrategy !== "replay") {
+        throw new Error(
+          `The ${runtime.id} session holding this approval is no longer running, so ` +
+            "the pending action will not run. Start a new turn; anything " +
+            "proposed then will ask for approval again.",
+        );
+      }
+
+      const port = resolveBridgePort(sandboxSession, settings.port);
+      const token = createBridgeToken();
+      const env: Record<string, string> = {
+        // Fall back to the credential environment captured when this session
+        // was created: a bridge that died is respawned from lifecycle state,
+        // and the caller has no reason to re-supply `auth` on a resume. Without
+        // this the replacement bridge starts with no Codex credential and the
+        // resumed turn cannot authenticate.
+        ...(settings.auth ?? parsed.sandboxCredentialEnvironment ?? {}),
+        BRIDGE_CHANNEL_TOKEN: token,
+        BRIDGE_WS_PORT: String(port),
+        ...(respawnStrategy === "replay"
+          ? { BRIDGE_REPLAY_FROM_DISK: "1" }
+          : {}),
+      };
+
+      if (respawnStrategy === undefined) {
+        await toolSafeSandboxSession.run({
+          command: `mkdir -p ${shellQuote(workDir)} ${shellQuote(
+            bridgeStateDir,
+          )} ${shellQuote(sessionDataDir)}`,
+          abortSignal: startOpts.abortSignal,
+        });
+      }
+
+      await markBridgeStarting({
+        sandbox: toolSafeSandboxSession,
+        bridgeStateDir,
+        bridgeType: runtime.id,
+        abortSignal: startOpts.abortSignal,
+      });
+
+      const proc = await toolSafeSandboxSession.spawn({
+        command:
+          `node ${shellQuote(`${bootstrapDir}/bridge.mjs`)}` +
+          ` --workdir ${shellQuote(workDir)}` +
+          ` --bridge-state-dir ${shellQuote(bridgeStateDir)}` +
+          ` --session-data-dir ${shellQuote(sessionDataDir)}` +
+          ` --bootstrap-dir ${shellQuote(bootstrapDir)}`,
+        env,
+        abortSignal: startOpts.abortSignal,
+      });
+      const stderrTail: string[] = [];
+      const bridgeStderrDone = forwardBridgeProcessStream({
+        stream: proc.stderr,
+        streamName: "stderr",
+        source: runtime.id,
+        collectTail: stderrTail,
+      });
+
+      const { port: boundPort } = await waitForBridgeReady({
+        proc,
+        sandbox: toolSafeSandboxSession,
+        bridgeStateDir,
+        bridgeType: runtime.id,
+        timeoutMs,
+        abortSignal: startOpts.abortSignal,
+        createTimeoutError: ({ proc: p, stdoutTail }) =>
+          createBridgeStartupError({
+            message: `${runtime.id} bridge did not become ready in time.`,
+            proc: p,
+            stdoutTail,
+            stderrTail,
+            stderrDone: bridgeStderrDone,
+          }),
+        createExitError: ({ proc: p, stdoutTail }) =>
+          createBridgeStartupError({
+            message: `${runtime.id} bridge exited before becoming ready.`,
+            proc: p,
+            stdoutTail,
+            stderrTail,
+            stderrDone: bridgeStderrDone,
+          }),
+      });
+      void drainBridgeProcessStream(proc.stdout);
+
+      const endpoint = withBridgeToken({
+        endpoint: await resolveBridgeEndpoint(sandboxSession, boundPort),
+        token,
+      });
+      const channel: Channel = new SandboxChannel({
+        connect: () =>
+          openWebSocket(endpoint, {
+            timeoutMs,
+            ...(startOpts.abortSignal
+              ? { abortSignal: startOpts.abortSignal }
+              : {}),
+          }),
+        outboundSchema: outboundMessageSchema,
+        onDiagnostic,
+        onBridgeError,
+        // In replay mode the respawned bridge reloaded the finished turn from
+        // disk; seed the cursor so it streams only the tail.
+        ...(respawnStrategy === "replay"
+          ? { initialLastSeenEventId: coords?.lastSeenEventId ?? 0 }
+          : {}),
+      });
+      await channel.open(
+        respawnStrategy === "replay" ? { resume: true } : undefined,
+      );
+
+      return createRetainedBridgeSession({
+        harnessId: runtime.id,
+        sessionId: startOpts.sessionId,
+        channel,
+        proc,
+        settings,
+        isResume: respawnStrategy !== undefined,
+        seedResumeThreadOnFirstPrompt: respawnStrategy !== undefined,
+        rerunContinue: respawnStrategy === "rerun",
+        bridgePort: boundPort,
+        bridgeToken: token,
+        sandboxId,
+        resumeThreadId: parsed.threadId,
+        turnConfigurationFingerprint: parsed.turnConfigurationFingerprint,
+        sandboxCredentialEnvironment: settings.auth
+          ? { ...settings.auth }
+          : parsed.sandboxCredentialEnvironment,
+        permissionMode: startOpts.permissionMode,
+        debug: startOpts.observability?.debug,
+        sandbox: toolSafeSandboxSession,
+        sandboxHomeDir, workDir,
+      });
+    },
+  };
+}
+
+function createRetainedBridgeSession(input: {
+  harnessId: string;
+  sessionId: string;
+  channel: Channel;
+  /** Undefined on ATTACH — another process spawned the live bridge. */
+  proc: SandboxProcess | undefined;
+  settings: CodexAppServerSettings;
+  isResume: boolean;
+  seedResumeThreadOnFirstPrompt: boolean;
+  rerunContinue: boolean;
+  bridgePort: number;
+  bridgeToken: string;
+  sandboxId: string | undefined;
+  resumeThreadId: string | undefined;
+  turnConfigurationFingerprint: string | undefined;
+  sandboxCredentialEnvironment: Record<string, string> | undefined;
+  permissionMode: HarnessV1PermissionMode | undefined;
+  debug: HarnessV1DebugConfig | undefined;
+  sandbox: SandboxSession;
+  sandboxHomeDir: string;
+  workDir: string;
+}): HarnessV1Session {
+  const { channel, sessionId } = input;
+  let stopped = false;
+
+  /**
+   * The turn a channel close should settle, if any.
+   *
+   * ONE handler for the session, not one per turn. `SandboxChannel.onClose`
+   * returns no unsubscribe, so a per-turn registration accumulated a closure —
+   * and with it that turn's whole settlement scope — for the lifetime of the
+   * channel. A long session leaked one per prompt, and every stale handler
+   * still ran on close.
+   */
+  let activeTurnOnClose: ((reason: string | undefined) => void) | undefined;
+  channel.onClose((_code?: number, reason?: string) => {
+    activeTurnOnClose?.(reason);
+  });
+  let latestThreadId = input.resumeThreadId;
+  let latestFingerprint = input.turnConfigurationFingerprint;
+  let pendingResumeThreadId = input.seedResumeThreadOnFirstPrompt
+    ? input.resumeThreadId
+    : undefined;
+
+  channel.on("bridge-thread", (message) => {
+    latestThreadId = message.threadId;
+  });
+
+  /**
+   * Wait for the bridge process to exit, then make sure it is gone.
+   *
+   * BOUNDED, because teardown must not be able to hang the turn runner: a
+   * bridge that ignores `stop` gets five seconds and then a kill. An unbounded
+   * wait here would hold the session's lease until it TTL'd out.
+   */
+  const settleProcess = async (): Promise<void> => {
+    const proc = input.proc;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (proc) {
+        await Promise.race([
+          proc.wait(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, 5_000);
+            timer.unref?.();
+          }),
+        ]);
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      try {
+        await proc?.kill();
+      } catch {
+        // Already gone.
+      }
+    }
+  };
+
+  /**
+   * Write the turn's skills and decide whether the thread has to restart.
+   *
+   * Skills are REPLACED before each fresh turn — that is the framework's
+   * contract, and `writeSkills` is idempotent so an unchanged set is a no-op.
+   */
+  const synchronizeTurnConfiguration = async (turnInput: {
+    skills: ReadonlyArray<HarnessV1Skill>;
+    instructions: string | undefined;
+    tools: ReadonlyArray<{ name: string }>;
+    abortSignal?: AbortSignal;
+  }): Promise<{ restartThread: boolean }> => {
+    const skillsResult = await writeHarnessSkills({
+      sandbox: input.sandbox,
+      // Same split as `@ai-sdk/harness-codex`'s own call, so both land on
+      // `$HOME/.agents/skills`.
+      homePath: input.sandboxHomeDir,
+      skillsDir: CODEX_SKILLS_SUBDIR,
+      skills: turnInput.skills,
+      abortSignal: turnInput.abortSignal,
+    });
+    const fingerprint = fingerprintTurnConfiguration({
+      instructions: turnInput.instructions,
+      tools: turnInput.tools,
+      sandboxPolicy: input.settings.warmAgent ? undefined : input.settings.sandboxPolicy,
+    });
+    // Codex reads its MCP server's tool list ONCE, when it starts. A changed
+    // tool set therefore cannot be applied to a live thread — there is no
+    // `tools/list_changed` handling here — so the thread restarts instead of
+    // silently serving a stale catalog.
+    //
+    // Skills likewise: Codex indexes `.agents/skills` when a thread starts, so
+    // a changed skill set on a live thread is invisible to the model. Parity
+    // with the published adapter, which restarts on `skillsResult.changed`.
+    const restartThread =
+      (latestThreadId !== undefined && skillsResult.changed) ||
+      (latestFingerprint !== undefined && latestFingerprint !== fingerprint);
+    latestFingerprint = fingerprint;
+    if (restartThread) pendingResumeThreadId = latestThreadId ?? pendingResumeThreadId;
+    return { restartThread };
+  };
+
+  /** Wire one turn's stream, and settle when it finishes, errors or aborts. */
+  const wireTurn = (turnOpts: {
+    emit: (event: HarnessV1StreamPart) => void;
+    abortSignal?: AbortSignal;
+  }): {
+    control: HarnessV1PromptControl;
+    sendStart(send: () => void): void;
+  } => {
+    let resolveDone: (() => void) | undefined;
+    let rejectDone: ((error: unknown) => void) | undefined;
+    const done = new Promise<void>((resolve, reject) => {
+      resolveDone = resolve;
+      rejectDone = reject;
+    });
+    const unsubscribes: Array<() => void> = [];
+    let settled = false;
+    const settleSuccess = () => {
+      if (settled) return;
+      settled = true;
+      for (const off of unsubscribes) off();
+      resolveDone?.();
+    };
+    const settleError = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      for (const off of unsubscribes) off();
+      rejectDone?.(error);
+    };
+
+    const forward = (event: OutboundMessage) => {
+      try {
+        turnOpts.emit(event as HarnessV1StreamPart);
+      } catch {
+        // A consumer that throws must not take the turn down with it.
+      }
+    };
+    for (const type of [
+      "stream-start",
+      "text-start",
+      "text-delta",
+      "text-end",
+      "reasoning-start",
+      "reasoning-delta",
+      "reasoning-end",
+      "tool-call",
+      "tool-approval-request",
+      "tool-result",
+      "file-change",
+      "compaction",
+      "finish-step",
+      "raw",
+    ] as const) {
+      unsubscribes.push(
+        channel.on(type, forward as (message: OutboundMessage) => void),
+      );
+    }
+    unsubscribes.push(
+      channel.on("finish", (message) => {
+        forward(message);
+        settleSuccess();
+      }),
+    );
+    unsubscribes.push(
+      channel.on("error", (message) => {
+        forward(message);
+        settleError(message.error);
+      }),
+    );
+
+    // A `'suspended'` close is the host's own slice boundary (`doSuspendTurn`):
+    // the turn keeps running in the bridge and its tail is replayed to the next
+    // process, so wind down cleanly rather than failing the turn. Any other
+    // mid-turn close is a real drop.
+    // Claim the session's single close handler for the duration of this turn,
+    // and release it on settlement so nothing is retained afterwards.
+    activeTurnOnClose = (reason) => {
+      if (settled) return;
+      if (reason === "suspended") settleSuccess();
+      else
+        settleError(
+          new Error(`${input.harnessId} bridge closed before the turn finished.`),
+        );
+    };
+    unsubscribes.push(() => {
+      activeTurnOnClose = undefined;
+    });
+
+    const onAbort = () => {
+      if (settled) return;
+      try {
+        channel.send({ type: "abort" } as InboundMessage);
+      } catch {
+        // The socket may already be gone; the abort below still settles.
+      }
+      settleError(
+        turnOpts.abortSignal?.reason ??
+          new DOMException("Aborted", "AbortError"),
+      );
+    };
+    if (turnOpts.abortSignal?.aborted) onAbort();
+    else
+      turnOpts.abortSignal?.addEventListener("abort", onAbort, { once: true });
+
+    return {
+      control: {
+        submitToolResult: async (result) => {
+          channel.send({
+            type: "tool-result",
+            toolCallId: result.toolCallId,
+            output: result.output,
+            isError: result.isError,
+          } as InboundMessage);
+        },
+        submitToolApproval: async (approval) => {
+          channel.send({
+            type: "tool-approval-response",
+            approvalId: approval.approvalId,
+            approved: approval.approved,
+            reason: approval.reason,
+          } as InboundMessage);
+        },
+        done,
+      },
+      sendStart: (send) => {
+        // Deferred by one event-loop turn so the runner finishes wiring the
+        // prompt control before a short turn can settle underneath it.
+        const timer = setTimeout(() => {
+          if (settled) return;
+          try {
+            send();
+          } catch (error) {
+            settleError(error);
+          }
+        }, 0);
+        timer.unref?.();
+      },
+    };
+  };
+
+  const buildStart = (
+    turnInput: {
+      prompt: HarnessV1Prompt;
+      instructions?: string;
+      model?: string;
+      tools: ReadonlyArray<{
+        name: string;
+        description?: string;
+        inputSchema?: unknown;
+      }>;
+      responseFormat?: unknown;
+    },
+    restartThread: boolean,
+  ): StartMessage => {
+    const message = {
+      type: "start" as const,
+      prompt: extractUserText(turnInput.prompt),
+      ...(input.settings.warmAgent ? { warmWorkDir: input.workDir, nativeMcpServers: input.settings.nativeMcpServers ?? {} } : {}),
+      tools: turnInput.tools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+      })),
+      model:
+        turnInput.model || input.settings.model || DEFAULT_CODEX_APPSERVER_MODEL,
+      ...(turnInput.instructions
+        ? { instructions: turnInput.instructions }
+        : {}),
+      ...(turnInput.responseFormat
+        ? { responseFormat: turnInput.responseFormat }
+        : {}),
+      ...(input.settings.reasoningEffort
+        ? { reasoningEffort: input.settings.reasoningEffort }
+        : {}),
+      ...(input.settings.webSearch ? { webSearch: true } : {}),
+      ...(input.settings.nativeMcpServers ? { nativeMcpServers: input.settings.nativeMcpServers } : {}),
+      ...(input.settings.codexConfig
+        ? { codexConfig: input.settings.codexConfig }
+        : {}),
+      ...(input.permissionMode ? { permissionMode: input.permissionMode } : {}),
+      ...(input.settings.sandboxPolicy
+        ? { sandboxPolicy: { ...input.settings.sandboxPolicy, writableRoots: [...input.settings.sandboxPolicy.writableRoots] } }
+        : {}),
+      ...(pendingResumeThreadId
+        ? { resumeThreadId: pendingResumeThreadId }
+        : {}),
+      ...(restartThread ? { restartThread: true } : {}),
+      ...(input.debug ? { debug: input.debug } : {}),
+    } as StartMessage;
+    pendingResumeThreadId = undefined;
+    return message;
+  };
+
+  const lifecycleData = (
+    includeBridge: {
+      port: number;
+      token: string;
+      lastSeenEventId: number;
+    } | null,
+  ) => ({
+    ...(latestThreadId ? { threadId: latestThreadId } : {}),
+    ...(latestFingerprint
+      ? { turnConfigurationFingerprint: latestFingerprint }
+      : {}),
+    ...(input.sandboxCredentialEnvironment
+      ? { sandboxCredentialEnvironment: input.sandboxCredentialEnvironment }
+      : {}),
+    ...(includeBridge
+      ? {
+          bridge: {
+            ...includeBridge,
+            ...(input.sandboxId ? { sandboxId: input.sandboxId } : {}),
+          },
+        }
+      : {}),
+  });
+
+  return {
+    sessionId,
+    isResume: input.isResume,
+
+    doPromptTurn: async (promptOpts) => {
+      const { restartThread } = await synchronizeTurnConfiguration({
+        skills: promptOpts.skills,
+        instructions: promptOpts.instructions,
+        tools: promptOpts.tools ?? [],
+        abortSignal: promptOpts.abortSignal,
+      });
+      const turn = wireTurn({
+        emit: promptOpts.emit,
+        abortSignal: promptOpts.abortSignal,
+      });
+      const start = buildStart(
+        {
+          prompt: promptOpts.prompt,
+          instructions: promptOpts.instructions,
+          model: promptOpts.model,
+          tools: promptOpts.tools ?? [],
+          responseFormat: promptOpts.responseFormat,
+        },
+        restartThread,
+      );
+      turn.sendStart(() => channel.send(start));
+      return turn.control;
+    },
+
+    doContinueTurn: async (continueOpts) => {
+      const { restartThread } = await synchronizeTurnConfiguration({
+        skills: continueOpts.skills,
+        instructions: continueOpts.instructions,
+        tools: continueOpts.tools ?? [],
+        abortSignal: continueOpts.abortSignal,
+      });
+      const turn = wireTurn({
+        emit: continueOpts.emit,
+        abortSignal: continueOpts.abortSignal,
+      });
+
+      /*
+       * ATTACH / REPLAY: the still-running (or disk-replayed) turn streams into
+       * the listeners just wired — `doStart` opened the channel with
+       * `{ resume: true }`, so the bridge replays everything past the cursor,
+       * including a `finish` if the turn ended during the gap. Sending a
+       * `start` here would clear that log and begin a NEW turn, losing the work
+       * the user is waiting on.
+       *
+       * RERUN is the bridge-died fallback: there is nothing to attach to, so
+       * the thread is re-driven from its id. Lossy by nature, and the reason a
+       * pending approval does not survive a bridge death.
+       */
+      if (input.rerunContinue) {
+        const start = buildStart(
+          {
+            // A continuation NUDGE, not an empty prompt. `resumeThreadId`
+            // rehydrates the prior thread and this is the user turn that drives
+            // it forward; an empty user message is a shape some runtimes
+            // reject outright.
+            prompt: "Continue.",
+            instructions: continueOpts.instructions,
+            model: continueOpts.model,
+            tools: continueOpts.tools ?? [],
+            responseFormat: continueOpts.responseFormat,
+          },
+          restartThread,
+        );
+        turn.sendStart(() =>
+          channel.send({
+            ...start,
+            ...(latestThreadId ? { resumeThreadId: latestThreadId } : {}),
+          }),
+        );
+      }
+      return turn.control;
+    },
+
+    doCompact: async () => {
+      /*
+       * `codex app-server` DOES expose manual compaction
+       * (`thread/compact/start`), so this is a framework limit rather than a
+       * Codex one: the shared bridge runtime routes inbound frames through a
+       * fixed switch with no default branch, so a custom `compact` command is
+       * silently DROPPED. A frame that looks like it worked and does nothing is
+       * worse than an honest refusal.
+       *
+       * Codex's automatic compaction is unaffected, and the bridge reports it
+       * as a `compaction` stream part.
+       */
+      throw new HarnessCapabilityUnsupportedError({
+        message:
+          `Harness '${input.harnessId}' cannot trigger manual compaction.`,
+        harnessId: input.harnessId,
+      });
+    },
+
+    doSuspendTurn: async () => {
+      if (stopped) {
+        throw new Error(
+          `${input.harnessId} session ${sessionId} is stopped; cannot suspend.`,
+        );
+      }
+      stopped = true;
+      // Freeze the host at a precise cursor WITHOUT stopping the model turn:
+      // the bridge keeps running and accumulates events for the next slice.
+      // This is what lets a turn pause on a human approval for as long as the
+      // human takes.
+      const lastSeenEventId = await channel.suspend();
+      const payload: HarnessV1ContinueTurnState = {
+        type: "continue-turn",
+        harnessId: input.harnessId,
+        specificationVersion: "harness-v1",
+        data: lifecycleData({
+          port: input.bridgePort,
+          token: input.bridgeToken,
+          lastSeenEventId,
+        }) as HarnessV1ContinueTurnState["data"],
+      };
+      return payload;
+    },
+
+    doDetach: async () => {
+      if (stopped) {
+        throw new Error(
+          `${input.harnessId} session ${sessionId} is already stopped; cannot detach.`,
+        );
+      }
+      stopped = true;
+      const lastSeenEventId = await channel.suspend();
+      const payload: HarnessV1ResumeSessionState = {
+        type: "resume-session",
+        harnessId: input.harnessId,
+        specificationVersion: "harness-v1",
+        data: lifecycleData({
+          port: input.bridgePort,
+          token: input.bridgeToken,
+          lastSeenEventId,
+        }) as HarnessV1ResumeSessionState["data"],
+      };
+      return payload;
+    },
+
+    doStop: async () => {
+      if (stopped) {
+        throw new Error(
+          `${input.harnessId} session ${sessionId} is already stopped; cannot stop.`,
+        );
+      }
+      stopped = true;
+      // Tell the channel we are tearing down, so the bridge's post-stop socket
+      // close finalises instead of looking like a drop worth reconnecting to.
+      channel.beginClose();
+      /*
+       * NEVER throws out of the stop reply, on any of the three ways the
+       * handshake can fail to happen: a channel already closed, a `stop` that
+       * goes unanswered, and a send that fails outright.
+       *
+       * `stopped` was latched above, so `doDestroy` returns early and cannot
+       * recover the process or the socket — a rejection here would leave both
+       * alive on a box the detach path deliberately keeps running, with no
+       * second handle to clean up with. A lossy payload beats that. The loss is
+       * the bridge's own state; `threadId` comes from `lifecycleData` and
+       * survives either way.
+       *
+       * But NOT THROWING IS NOT THE SAME AS SUCCEEDING, and the payload cannot
+       * carry the difference — every arm produces the same shape. So record
+       * which arm ran and log it: without that, a session whose bridge never
+       * acknowledged the stop is indistinguishable from a clean one, right up
+       * until someone wonders why the next turn started a fresh thread.
+       */
+      let handshake:
+        "acknowledged" | "channel-closed" | "timed-out" | "send-failed" =
+        "acknowledged";
+      const data: unknown = channel.isClosed()
+        ? ((handshake = "channel-closed"), {})
+        : await new Promise<unknown>((resolve) => {
+            const timer = setTimeout(() => {
+              handshake = "timed-out";
+              unsubscribe();
+              resolve({});
+            }, 5_000);
+            timer.unref?.();
+            const unsubscribe = channel.on("bridge-stop", (message) => {
+              clearTimeout(timer);
+              unsubscribe();
+              resolve(message.data);
+            });
+            try {
+              channel.send({ type: "stop" } as InboundMessage);
+            } catch {
+              handshake = "send-failed";
+              clearTimeout(timer);
+              unsubscribe();
+              resolve({});
+            }
+          });
+      if (handshake !== "acknowledged") {
+        logger.warn(
+          "[codex-appserver] stop handshake did not complete; bridge state lost",
+          { sessionId, reason: handshake },
+        );
+      }
+      await settleProcess();
+      channel.close();
+      const merged =
+        data != null && typeof data === "object" && !Array.isArray(data)
+          ? (data as Record<string, unknown>)
+          : {};
+      const payload: HarnessV1ResumeSessionState = {
+        type: "resume-session",
+        harnessId: input.harnessId,
+        specificationVersion: "harness-v1",
+        data: {
+          ...merged,
+          ...lifecycleData(null),
+        } as HarnessV1ResumeSessionState["data"],
+      };
+      return payload;
+    },
+
+    doDestroy: async () => {
+      if (stopped) return;
+      stopped = true;
+      channel.beginClose();
+      try {
+        if (!channel.isClosed()) {
+          channel.send({ type: "destroy" } as InboundMessage);
+        }
+      } catch {
+        // Best-effort: the box is torn down after this either way.
+      }
+      await settleProcess();
+      channel.close();
+    },
+  };
+}
