@@ -27,7 +27,7 @@
   "dependencies": {
     "@modelcontextprotocol/ext-apps": "^2.0.3",
     "@modelcontextprotocol/sdk": "^1.32.1",
-    "@workos-inc/node": "^11.0.0",
+    "@workos-inc/node": "^12.2.0",
     "convex": "^1.31.4",
     "jose": "^6.1.0",
     "react": "^19.2.0",
